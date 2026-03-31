@@ -1,0 +1,256 @@
+/* OB Screen Styles */
+
+.ob-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: #000;
+  color: #fff;
+  padding-bottom: 100px;
+}
+
+.ob-header {
+  padding: 24px;
+  border-bottom: 1px solid #1f1f1f;
+  background: #0a0a0a;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.ob-header h1 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}
+
+/* Form Section */
+.ob-form-section {
+  padding: 24px;
+  background: #0a0a0a;
+  border-bottom: 1px solid #1f1f1f;
+  margin-bottom: 24px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.form-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: #999;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.form-textarea {
+  padding: 12px 16px;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 14px;
+  font-family: inherit;
+  resize: vertical;
+  min-height: 100px;
+  transition: all 0.2s ease;
+}
+
+.form-textarea::placeholder {
+  color: #666;
+}
+
+.form-textarea:focus {
+  outline: none;
+  border-color: #666;
+  background: #222;
+}
+
+.form-textarea:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.error-message {
+  padding: 12px;
+  background: #3d0000;
+  border: 1px solid #dc2626;
+  border-radius: 4px;
+  color: #ff6b6b;
+  font-size: 13px;
+  margin-bottom: 16px;
+  text-align: center;
+}
+
+.success-message {
+  padding: 12px;
+  background: #003d00;
+  border: 1px solid #22c55e;
+  border-radius: 4px;
+  color: #86efac;
+  font-size: 13px;
+  margin-bottom: 16px;
+  text-align: center;
+}
+
+.button-save {
+  width: 100%;
+  padding: 12px 16px;
+  background: #dc2626;
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  min-height: 44px;
+}
+
+.button-save:hover:not(:disabled) {
+  background: #991b1b;
+}
+
+.button-save:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* List Section */
+.ob-list-section {
+  flex: 1;
+  padding: 0 24px;
+}
+
+.ob-list-section h2 {
+  margin: 0 0 16px 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.loading-message,
+.empty-message {
+  padding: 32px 16px;
+  text-align: center;
+  color: #666;
+  font-size: 14px;
+}
+
+.entries-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.entry-card {
+  padding: 16px;
+  background: #0a0a0a;
+  border: 1px solid #1f1f1f;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.entry-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.entry-serial {
+  font-size: 13px;
+  font-weight: 600;
+  color: #dc2626;
+  font-family: 'Courier New', monospace;
+}
+
+.entry-datetime {
+  font-size: 12px;
+  color: #999;
+}
+
+.entry-nature {
+  font-size: 14px;
+  color: #ccc;
+  line-height: 1.5;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+/* Footer (Export Button) */
+.ob-footer {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 16px 24px;
+  background: #0a0a0a;
+  border-top: 1px solid #1f1f1f;
+  display: flex;
+  gap: 12px;
+  z-index: 20;
+}
+
+.button-export {
+  flex: 1;
+  padding: 12px 16px;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  min-height: 44px;
+}
+
+.button-export:hover:not(:disabled) {
+  background: #2a2a2a;
+  border-color: #555;
+}
+
+.button-export:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Mobile Responsive */
+@media (max-width: 768px) {
+  .ob-container {
+    padding-bottom: 120px;
+  }
+
+  .ob-header {
+    padding: 16px;
+  }
+
+  .ob-header h1 {
+    font-size: 24px;
+  }
+
+  .ob-form-section {
+    padding: 16px;
+  }
+
+  .ob-list-section {
+    padding: 0 16px;
+  }
+
+  .ob-footer {
+    padding: 12px 16px;
+  }
+
+  .form-textarea,
+  .button-save,
+  .button-export {
+    font-size: 16px;
+  }
+}

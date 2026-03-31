@@ -2,16 +2,13 @@ import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
-
-const STATUS_COLORS = {
-  completed: '#10b981',
-  in_progress: '#f59e0b',
-  pending: '#6b7280',
-};
+import './screens.css';
+import { getPatrols } from '../services/api';
 
 export default function PatrolsScreen() {
   const [patrols, setPatrols] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const { logout } = useAuth();
   const navigate = useNavigate();
 
@@ -20,14 +17,22 @@ export default function PatrolsScreen() {
   }, []);
 
   const fetchPatrols = async () => {
+    setLoading(true);
     try {
-      const res = await api.get('/guard/patrols');
-      setPatrols(res.data);
-    } catch (err) {
-      console.error('Failed to load patrols:', err.message);
+      const data = await getPatrols();
+      setPatrols(data || []);
+    } catch (error) {
+      console.error('Failed to load patrols:', error);
+      setPatrols([]);
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
+  };
+
+  const onRefresh = () => {
+    setRefreshing(true);
+    fetchPatrols();
   };
 
   const handleLogout = () => {
@@ -35,65 +40,54 @@ export default function PatrolsScreen() {
     navigate('/login');
   };
 
+  const handlePatrolClick = (patrol) => {
+    navigate(`/patrol/${patrol.id}`, { state: { patrol } });
+  };
+
+  
+
   if (loading) {
-    return <div style={styles.center}>Loading...</div>;
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', backgroundColor: '#000' }}>
+        <div className="loading-spinner"></div>
+      </div>
+    );
   }
 
   return (
-    <div style={styles.container}>
-      <div style={styles.header}>
-        <h2 style={styles.heading}>Active Patrols</h2>
-        <button onClick={handleLogout} style={styles.logoutBtn}>Logout</button>
+    <div className="screen-container">
+      <div className="patrols-header">
+        <h1 className="patrols-title">My Patrols</h1>
+        <button className="logout-button" onClick={handleLogout}>Logout</button>
       </div>
-      <div style={styles.list}>
-        {patrols.map((patrol) => {
-          const color = STATUS_COLORS[patrol.status] || '#6b7280';
-          const progress = patrol.total_checkpoints > 0
-            ? patrol.checkpoints_completed / patrol.total_checkpoints
-            : 0;
-          return (
+      <button
+        onClick={onRefresh}
+        disabled={refreshing}
+        style={{ marginBottom: '20px', padding: '10px 20px', backgroundColor: '#333', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}
+      >
+        {refreshing ? 'Refreshing...' : 'Refresh'}
+      </button>
+      {patrols.length === 0 ? (
+        <p className="empty-message">No active patrols</p>
+      ) : (
+        <div className="patrols-list">
+          {patrols.map((patrol) => (
             <div
               key={patrol.id}
-              style={styles.card}
-              onClick={() => navigate(/patrol/)}
+              className="patrol-card"
+              onClick={() => handlePatrolClick(patrol)}
             >
-              <div style={styles.cardHeader}>
-                <span style={styles.patrolName}>{patrol.patrol_name}</span>
-                <span style={{ ...styles.badge, backgroundColor: color + '22', color }}>
-                  {patrol.status.replace('_', ' ')}
-                </span>
-              </div>
-              <div style={styles.progressRow}>
-                <span style={styles.progressText}>
-                  {patrol.checkpoints_completed} / {patrol.total_checkpoints} checkpoints
-                </span>
-              </div>
-              <div style={styles.progressBarBg}>
-                // FIXED
-<div style={{ width: `${progress * 100}%`, backgroundColor: color, height: '4px', borderRadius: '2px' }} />
+              <div>
+                <div className="patrol-name">{patrol.patrol_name}</div>
+                <div className="patrol-status">Status: {patrol.status}</div>
+                <div className="patrol-progress">
+                  Checkpoints: {patrol.checkpoints_completed}/{patrol.total_checkpoints}
+                </div>
               </div>
             </div>
-          );
-        })}
-        {patrols.length === 0 && <p style={styles.empty}>No patrols assigned</p>}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
-
-const styles = {
-  container: { backgroundColor: '#000000', minHeight: '100vh', padding: '20px' },
-  center: { display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', backgroundColor: '#000000', color: '#fff' },
-  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' },
-  heading: { color: '#ffffff', fontSize: '22px', fontWeight: 'bold', margin: 0 },
-  logoutBtn: { backgroundColor: '#dc2626', color: '#fff', border: 'none', padding: '8px 16px', borderRadius: '6px', cursor: 'pointer' },
-  list: { display: 'flex', flexDirection: 'column', gap: '12px' },
-  card: { backgroundColor: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: '10px', padding: '16px', cursor: 'pointer' },
-  cardHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' },
-  patrolName: { color: '#ffffff', fontSize: '16px', fontWeight: '600' },
-  badge: { padding: '4px 10px', borderRadius: '20px', fontSize: '12px', fontWeight: '600', textTransform: 'capitalize' },
-  progressRow: { marginBottom: '6px' },
-  progressText: { color: '#888888', fontSize: '13px' },
-  progressBarBg: { height: '4px', backgroundColor: '#2a2a2a', borderRadius: '2px', overflow: 'hidden' },
-  empty: { color: '#666666', textAlign: 'center', marginTop: '40px' },
-};

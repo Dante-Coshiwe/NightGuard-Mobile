@@ -1,40 +1,39 @@
-import React, { createContext, useState, useEffect, useContext } from 'react';
-import api from '../services/api';
+import React, { createContext, useState, useContext, useEffect } from 'react';
+import { login as apiLogin, logout as apiLogout, getCurrentUser } from '../services/api';
 
-const AuthContext = createContext(null);
+const AuthContext = createContext();
 
-export function AuthProvider({ children }) {
+export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    restoreSession();
+    const token = localStorage.getItem('token');
+    if (token) {
+      // Fetch current user if token exists
+      getCurrentUser().then(response => {
+        setUser(response.data);
+        setLoading(false);
+      }).catch((error) => {
+        console.error('Failed to fetch current user:', error);
+        localStorage.removeItem('token');
+        setLoading(false);
+      });
+    } else {
+      setLoading(false);
+    }
   }, []);
 
-  const restoreSession = async () => {
-    const token = localStorage.getItem('authToken');
-    if (token) {
-      try {
-        const response = await api.get('/auth/me');
-        setUser(response.data);
-      } catch (err) {
-        console.warn('Session restore failed:', err.message);
-        localStorage.removeItem('authToken');
-      }
-    }
-    setLoading(false);
-  };
-
   const login = async (email, password) => {
-    const response = await api.post('/auth/login', { email, password });
+    const response = await apiLogin({ email, password });
     const { token, user: userData } = response.data;
-    localStorage.setItem('authToken', token);
+    localStorage.setItem('token', token);
     setUser(userData);
     return userData;
   };
 
   const logout = async () => {
-    localStorage.removeItem('authToken');
+    await apiLogout();
     setUser(null);
   };
 
@@ -43,10 +42,6 @@ export function AuthProvider({ children }) {
       {children}
     </AuthContext.Provider>
   );
-}
-
-export const useAuth = () => {
-  const ctx = useContext(AuthContext);
-  if (!ctx) throw new Error('useAuth must be used inside AuthProvider');
-  return ctx;
 };
+
+export const useAuth = () => useContext(AuthContext);

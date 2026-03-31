@@ -1,77 +1,76 @@
-import React, { useState } from 'react';
+﻿import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api from '../services/api';
+import './screens.css';
 
 export default function ReportIncidentScreen() {
-  const navigate = useNavigate();
-  const [form, setForm] = useState({
-    incident_type: '',
-    description: '',
-    severity: 'medium',
-  });
+  const [incidentType, setIncidentType] = useState('');
+  const [description, setDescription] = useState('');
+  const [severity, setSeverity] = useState('medium');
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const navigate = useNavigate();
 
-  const handleChange = (e) => {
-    setForm({ ...form, [e.target.name]: e.target.value });
-  };
-
-  const handleSubmit = async (e) => {
+  const submitIncident = async (e) => {
     e.preventDefault();
-    if (!form.incident_type || !form.description) {
-      alert('Incident type and description are required');
+    if (!incidentType || !description) {
+      setError('Please fill in type and description');
       return;
     }
+    setError('');
     setLoading(true);
     try {
-      await api.post('/incidents/report', form);
-      alert('Incident reported');
-      navigate('/');
+      await api.post('/incidents/report', { incident_type: incidentType, description, severity });
+      alert('Incident reported successfully');
+      navigate(-1);
     } catch (err) {
-      alert(err.message);
+      setError(err.response?.data?.error || 'Failed to report');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div style={styles.container}>
-      <button onClick={() => navigate(-1)} style={styles.backBtn}>← Back</button>
-      <h2 style={styles.title}>Report Incident</h2>
-      <form onSubmit={handleSubmit} style={styles.form}>
-        <div style={styles.field}>
-          <label style={styles.label}>Incident Type *</label>
-          <input type="text" name="incident_type" value={form.incident_type} onChange={handleChange} style={styles.input} />
-        </div>
-        <div style={styles.field}>
-          <label style={styles.label}>Description *</label>
-          <textarea name="description" value={form.description} onChange={handleChange} style={styles.textarea} rows="4" />
-        </div>
-        <div style={styles.field}>
-          <label style={styles.label}>Severity</label>
-          <select name="severity" value={form.severity} onChange={handleChange} style={styles.select}>
+    <div className="form-container">
+      <h1 className="form-title">Report Incident</h1>
+      {error && <div style={{ color: '#ef4444', marginBottom: '16px', textAlign: 'center' }}>{error}</div>}
+      <form onSubmit={submitIncident}>
+        <input
+          type="text"
+          className="form-input"
+          placeholder="Incident Type"
+          value={incidentType}
+          onChange={(e) => setIncidentType(e.target.value)}
+          required
+          disabled={loading}
+        />
+        <textarea
+          className="form-textarea"
+          placeholder="Description"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          rows="4"
+          required
+          disabled={loading}
+        />
+        <div className="form-group">
+          <label className="form-label">Severity:</label>
+          <select
+            className="form-select"
+            value={severity}
+            onChange={(e) => setSeverity(e.target.value)}
+            disabled={loading}
+          >
             <option value="low">Low</option>
             <option value="medium">Medium</option>
             <option value="high">High</option>
             <option value="critical">Critical</option>
           </select>
         </div>
-        <button type="submit" disabled={loading} style={styles.button}>
-          {loading ? 'Reporting...' : 'Report Incident'}
+        <button type="submit" className="button-submit" disabled={loading}>
+          {loading ? <span className="loading-spinner"></span> : 'Submit Report'}
         </button>
       </form>
     </div>
   );
 }
-
-const styles = {
-  container: { backgroundColor: '#000000', minHeight: '100vh', padding: '20px' },
-  backBtn: { background: 'none', border: 'none', color: '#dc2626', fontSize: '15px', cursor: 'pointer', marginBottom: '16px' },
-  title: { color: '#ffffff', fontSize: '22px', fontWeight: 'bold', marginBottom: '20px' },
-  form: { maxWidth: '500px', margin: '0 auto' },
-  field: { marginBottom: '16px' },
-  label: { display: 'block', color: '#999999', fontSize: '13px', marginBottom: '6px' },
-  input: { width: '100%', padding: '12px', backgroundColor: '#1a1a1a', color: '#ffffff', border: '1px solid #2a2a2a', borderRadius: '8px', fontSize: '16px', outline: 'none' },
-  textarea: { width: '100%', padding: '12px', backgroundColor: '#1a1a1a', color: '#ffffff', border: '1px solid #2a2a2a', borderRadius: '8px', fontSize: '16px', fontFamily: 'inherit', outline: 'none' },
-  select: { width: '100%', padding: '12px', backgroundColor: '#1a1a1a', color: '#ffffff', border: '1px solid #2a2a2a', borderRadius: '8px', fontSize: '16px', outline: 'none' },
-  button: { width: '100%', padding: '12px', backgroundColor: '#dc2626', color: '#ffffff', border: 'none', borderRadius: '8px', fontSize: '16px', fontWeight: 'bold', cursor: 'pointer', marginTop: '8px' },
-};

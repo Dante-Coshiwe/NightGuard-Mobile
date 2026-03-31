@@ -36,9 +36,9 @@ const ProtectedRoute = ({ children }) => {
 
 const SidebarLayout = () => {
   return (
-    <div style={{ display: 'flex' }}>
+    <div style={{ display: 'flex', position: 'relative' }}>
       <Sidebar />
-      <div style={{ marginLeft: '280px', flex: 1, minHeight: '100vh', backgroundColor: '#000' }}>
+      <div style={{ flex: 1, minHeight: '100vh', backgroundColor: '#000', width: '100%' }}>
         <Outlet />
       </div>
     </div>

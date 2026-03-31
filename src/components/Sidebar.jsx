@@ -45,7 +45,10 @@ const Sidebar = () => {
       <button onClick={toggleSidebar} style={styles.toggleBtn}>
         {isOpen ? <X size={24} /> : <Menu size={24} />}
       </button>
-      <div style={{ ...styles.sidebar, width: isOpen ? '280px' : '0px', overflow: isOpen ? 'visible' : 'hidden' }}>
+      {/* Overlay backdrop */}
+      {isOpen && <div style={styles.backdrop} onClick={toggleSidebar} />}
+      {/* Sidebar */}
+      <div style={{ ...styles.sidebar, transform: isOpen ? 'translateX(0)' : 'translateX(-100%)' }}>
         <div style={styles.logo}>
           <span style={styles.logoText}>NightGuard</span>
         </div>
@@ -86,8 +89,8 @@ const styles = {
     position: 'fixed',
     top: '20px',
     left: '20px',
-    zIndex: 1001,
-    background: '#0a0a0a',
+    zIndex: 1002,
+    background: 'rgba(220, 38, 38, 0.9)',
     border: 'none',
     color: '#fff',
     cursor: 'pointer',
@@ -96,21 +99,37 @@ const styles = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
+    backdropFilter: 'blur(10px)',
+    transition: 'all 0.3s ease',
+  },
+  backdrop: {
+    position: 'fixed',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    background: 'rgba(0, 0, 0, 0.4)',
+    zIndex: 999,
+    animation: 'fadeIn 0.3s ease',
   },
   sidebar: {
     position: 'fixed',
     top: 0,
     left: 0,
     height: '100vh',
-    background: '#0a0a0a',
-    transition: 'width 0.3s',
+    width: '280px',
+    background: 'rgba(10, 10, 10, 0.85)',
+    backdropFilter: 'blur(10px)',
+    WebkitBackdropFilter: 'blur(10px)',
+    borderRight: '1px solid rgba(255, 255, 255, 0.1)',
+    transition: 'transform 0.3s ease',
     overflowX: 'hidden',
+    overflowY: 'auto',
     zIndex: 1000,
-    borderRight: '1px solid #1f1f1f',
   },
   logo: {
     padding: '24px 20px',
-    borderBottom: '1px solid #1f1f1f',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
   },
   logoText: {
     color: '#fff',
