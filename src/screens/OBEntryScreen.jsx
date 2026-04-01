@@ -1,6 +1,6 @@
 ﻿import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import api from '../services/api';
+import { createOBEntry } from '../services/api';
 import './screens.css';
 
 export default function OBEntryScreen() {
@@ -19,7 +19,7 @@ export default function OBEntryScreen() {
     setError('');
     setLoading(true);
     try {
-      await api.post('/obentries', { serial_number: serialNumber, nature_of_occurrence: nature });
+      await createOBEntry({ serial_number: serialNumber, nature_of_occurrence: nature });
       alert('OB entry recorded successfully');
       navigate(-1);
     } catch (err) {

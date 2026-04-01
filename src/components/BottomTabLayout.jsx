@@ -221,17 +221,18 @@ const styles = {
     transition: 'background-color 0.2s ease'
   },
   tabBar: {
-    position: 'fixed',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    display: 'flex',
-    justifyContent: 'space-around',
-    alignItems: 'center',
-    backgroundColor: '#0a0a0a',
-    borderTop: '1px solid #1f1f1f',
-    padding: '12px 0 16px', // Increased padding for better touch targets
-    zIndex: 100
+  position: 'fixed',
+  bottom: 0,
+  left: 20,
+  right: 0,
+  display: 'flex',
+  justifyContent: 'space-around',
+  alignItems: 'center',
+  backgroundColor: '#0a0a0a',
+  borderTop: '1px solid #1f1f1f',
+  padding: '12px 0 16px',
+  zIndex: 9999, // Increased to ensure it's above the sidebar
+
   },
   tab: {
     display: 'flex',

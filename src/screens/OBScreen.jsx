@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { getAllOBEntries, saveOBEntry } from '../services/api';
+import { getRecentOBEntries, createOBEntry } from '../services/api';
 import jsPDF from 'jspdf';
 import 'jspdf-autotable';
 import './OBScreen.css';
@@ -20,7 +20,7 @@ export default function OBScreen() {
   const loadEntries = async () => {
     setLoading(true);
     try {
-      const result = await getAllOBEntries();
+      const result = await getRecentOBEntries();
       if (result.success) {
         setEntries(result.data || []);
       } else {
@@ -48,7 +48,7 @@ export default function OBScreen() {
     setSubmitting(true);
 
     try {
-      const result = await saveOBEntry(newEntry.trim());
+      const result = await createOBEntry(newEntry.trim());
       if (result.success) {
         // Add new entry to top of list
         setEntries([result.data, ...entries]);

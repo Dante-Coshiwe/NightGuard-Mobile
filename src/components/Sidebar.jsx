@@ -1,13 +1,11 @@
 ﻿import React, { useState } from 'react';
 import { NavLink } from 'react-router-dom';
-import { Menu, X, Home, BookOpen, AlertTriangle, MessageCircle, Info, FileText, Settings, Users, Shield, ChevronDown, ChevronRight } from 'lucide-react';
+import { Menu, X, Home, BookOpen, AlertTriangle, MessageCircle, Info, FileText, Settings, ChevronDown, ChevronRight } from 'lucide-react';
 
-const Sidebar = () => {
-  const [isOpen, setIsOpen] = useState(true);
+const Sidebar = ({ isOpen, toggleSidebar }) => {
   const [openReports, setOpenReports] = useState(false);
   const [openConfig, setOpenConfig] = useState(false);
 
-  const toggleSidebar = () => setIsOpen(!isOpen);
   const toggleReports = () => setOpenReports(!openReports);
   const toggleConfig = () => setOpenConfig(!openConfig);
 
@@ -41,147 +39,115 @@ const Sidebar = () => {
   ];
 
   return (
-    <>
-      <button onClick={toggleSidebar} style={styles.toggleBtn}>
-        {isOpen ? <X size={24} /> : <Menu size={24} />}
-      </button>
-      {/* Overlay backdrop */}
-      {isOpen && <div style={styles.backdrop} onClick={toggleSidebar} />}
-      {/* Sidebar */}
-      <div style={{ ...styles.sidebar, transform: isOpen ? 'translateX(0)' : 'translateX(-100%)' }}>
-        <div style={styles.logo}>
-          <span style={styles.logoText}>NightGuard</span>
-        </div>
-        <nav style={styles.nav}>
-          {menuItems.map((item, idx) => (
-            <div key={idx}>
-              {item.subItems ? (
-                <div>
-                  <button onClick={item.label === 'Reports' ? toggleReports : toggleConfig} style={styles.menuButton}>
-                    <item.icon size={20} />
-                    <span style={styles.menuLabel}>{item.label}</span>
-                    {item.label === 'Reports' ? (openReports ? <ChevronDown size={16} /> : <ChevronRight size={16} />) : (openConfig ? <ChevronDown size={16} /> : <ChevronRight size={16} />)}
-                  </button>
-                  <div style={{ ...styles.subMenu, display: (item.label === 'Reports' ? openReports : openConfig) ? 'block' : 'none' }}>
-                    {item.subItems.map((sub, subIdx) => (
-                      <NavLink key={subIdx} to={sub.to} style={({ isActive }) => ({ ...styles.subLink, backgroundColor: isActive ? '#dc2626' : 'transparent' })}>
-                        {sub.label}
-                      </NavLink>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <NavLink to={item.to} style={({ isActive }) => ({ ...styles.link, backgroundColor: isActive ? '#dc2626' : 'transparent' })}>
-                  <item.icon size={20} />
-                  <span style={styles.menuLabel}>{item.label}</span>
-                </NavLink>
-              )}
-            </div>
-          ))}
-        </nav>
+    <aside
+      style={{
+        width: isOpen ? 280 : 70,
+        background: 'rgba(10, 10, 10, 0.85)',
+        backdropFilter: 'blur(10px)',
+        borderRight: '1px solid rgba(255, 255, 255, 0.1)',
+        transition: 'width 0.3s ease',
+        overflowX: 'hidden',
+        overflowY: 'auto',
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        height: '100vh',
+        zIndex: 100,
+      }}
+    >
+      <div style={{ padding: '20px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
+        {isOpen && <span style={{ color: '#fff', fontSize: '20px', fontWeight: 'bold' }}>NightGuard</span>}
+        <button
+          onClick={toggleSidebar}
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: '#fff',
+            cursor: 'pointer',
+            padding: '4px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          {isOpen ? <X size={24} /> : <Menu size={24} />}
+        </button>
       </div>
-    </>
-  );
-};
 
-const styles = {
-  toggleBtn: {
-    position: 'fixed',
-    top: '20px',
-    left: '20px',
-    zIndex: 1002,
-    background: 'rgba(220, 38, 38, 0.9)',
-    border: 'none',
-    color: '#fff',
-    cursor: 'pointer',
-    padding: '8px',
-    borderRadius: '8px',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backdropFilter: 'blur(10px)',
-    transition: 'all 0.3s ease',
-  },
-  backdrop: {
-    position: 'fixed',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    background: 'rgba(0, 0, 0, 0.4)',
-    zIndex: 999,
-    animation: 'fadeIn 0.3s ease',
-  },
-  sidebar: {
-    position: 'fixed',
-    top: 0,
-    left: 0,
-    height: '100vh',
-    width: '280px',
-    background: 'rgba(10, 10, 10, 0.85)',
-    backdropFilter: 'blur(10px)',
-    WebkitBackdropFilter: 'blur(10px)',
-    borderRight: '1px solid rgba(255, 255, 255, 0.1)',
-    transition: 'transform 0.3s ease',
-    overflowX: 'hidden',
-    overflowY: 'auto',
-    zIndex: 1000,
-  },
-  logo: {
-    padding: '24px 20px',
-    borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
-  },
-  logoText: {
-    color: '#fff',
-    fontSize: '20px',
-    fontWeight: 'bold',
-  },
-  nav: {
-    padding: '20px 12px',
-  },
-  link: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '12px',
-    padding: '12px 16px',
-    marginBottom: '8px',
-    borderRadius: '8px',
-    color: '#fff',
-    textDecoration: 'none',
-    transition: 'background 0.2s',
-  },
-  menuButton: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    width: '100%',
-    padding: '12px 16px',
-    marginBottom: '8px',
-    background: 'transparent',
-    border: 'none',
-    borderRadius: '8px',
-    color: '#fff',
-    cursor: 'pointer',
-    fontSize: '16px',
-    textAlign: 'left',
-  },
-  menuLabel: {
-    flex: 1,
-    marginLeft: '12px',
-  },
-  subMenu: {
-    marginLeft: '36px',
-    marginBottom: '8px',
-  },
-  subLink: {
-    display: 'block',
-    padding: '8px 16px',
-    marginBottom: '4px',
-    borderRadius: '6px',
-    color: '#ccc',
-    textDecoration: 'none',
-    fontSize: '14px',
-  },
+      <nav style={{ padding: '20px 12px' }}>
+        {menuItems.map((item, idx) => (
+          <div key={idx}>
+            {item.subItems ? (
+              <div>
+                <button
+                  onClick={item.label === 'Reports' ? toggleReports : toggleConfig}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    width: '100%',
+                    padding: '12px 16px',
+                    marginBottom: '8px',
+                    background: 'transparent',
+                    border: 'none',
+                    borderRadius: '8px',
+                    color: '#fff',
+                    cursor: 'pointer',
+                    fontSize: '16px',
+                    textAlign: 'left',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <item.icon size={20} />
+                    {isOpen && <span>{item.label}</span>}
+                  </div>
+                  {isOpen && (item.label === 'Reports' ? (openReports ? <ChevronDown size={16} /> : <ChevronRight size={16} />) : (openConfig ? <ChevronDown size={16} /> : <ChevronRight size={16} />))}
+                </button>
+                <div style={{ marginLeft: isOpen ? '36px' : '0', display: (item.label === 'Reports' ? openReports : openConfig) ? 'block' : 'none' }}>
+                  {item.subItems.map((sub, subIdx) => (
+                    <NavLink
+                      key={subIdx}
+                      to={sub.to}
+                      style={({ isActive }) => ({
+                        display: 'block',
+                        padding: '8px 16px',
+                        marginBottom: '4px',
+                        borderRadius: '6px',
+                        color: '#ccc',
+                        textDecoration: 'none',
+                        fontSize: '14px',
+                        backgroundColor: isActive ? '#dc2626' : 'transparent',
+                      })}
+                    >
+                      {isOpen ? sub.label : sub.label.charAt(0)}
+                    </NavLink>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <NavLink
+                to={item.to}
+                style={({ isActive }) => ({
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '12px',
+                  padding: '12px 16px',
+                  marginBottom: '8px',
+                  borderRadius: '8px',
+                  color: '#fff',
+                  textDecoration: 'none',
+                  backgroundColor: isActive ? '#dc2626' : 'transparent',
+                })}
+              >
+                <item.icon size={20} />
+                {isOpen && <span>{item.label}</span>}
+              </NavLink>
+            )}
+          </div>
+        ))}
+      </nav>
+    </aside>
+  );
 };
 
 export default Sidebar;

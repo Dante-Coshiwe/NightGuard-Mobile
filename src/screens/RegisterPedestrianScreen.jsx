@@ -2,6 +2,7 @@
 import { useNavigate } from 'react-router-dom';
 import api from '../services/api';
 import './screens.css';
+import { registerPedestrian } from '../services/api';
 
 export default function RegisterPedestrianScreen() {
   const [photo, setPhoto] = useState(null);
@@ -26,34 +27,24 @@ export default function RegisterPedestrianScreen() {
     }
   };
 
-  const submitEntry = async (e) => {
-    e.preventDefault();
-    if (!name || !visitingUnit) {
-      setError('Please fill in name and visiting unit');
-      return;
-    }
-    setError('');
-    setLoading(true);
-    try {
-      const formData = new FormData();
-      formData.append('full_name', name);
-      formData.append('id_number', idNumber);
-      formData.append('contact_number', contact);
-      formData.append('visiting_unit', visitingUnit);
-      if (photoFile) {
-        formData.append('photo', photoFile);
-      }
-      await api.post('/pedestrians/entry', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
-      alert('Pedestrian registered successfully');
-      navigate(-1);
-    } catch (err) {
-      setError(err.response?.data?.error || 'Failed to register');
-    } finally {
-      setLoading(false);
-    }
-  };
+const submitEntry = async (e) => {
+  e.preventDefault();
+  setLoading(true);
+  setError('');
+  try {
+    await registerPedestrian({
+      full_name: name,          // was fullName (undefined)
+      id_number: idNumber,
+      contact_number: contact,  // was contactNumber (undefined)
+      visiting_unit: visitingUnit,
+    });
+    navigate('/');
+  } catch (err) {
+    setError(err.message || 'Failed to register');
+  } finally {
+    setLoading(false);
+  }
+};
 
   return (
     <div className="form-container">

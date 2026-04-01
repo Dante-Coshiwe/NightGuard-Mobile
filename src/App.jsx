@@ -26,6 +26,7 @@ import RegisterVehicleScreen from './screens/RegisterVehicleScreen';
 import ReportIncidentScreen from './screens/ReportIncidentScreen';
 import OBEntryScreen from './screens/OBEntryScreen';
 import ShiftManagementScreen from './screens/ShiftManagementScreen';
+import Layout from './components/Layout';
 
 const ProtectedRoute = ({ children }) => {
   const { user, loading } = useAuth();
@@ -34,7 +35,7 @@ const ProtectedRoute = ({ children }) => {
   return children;
 };
 
-const SidebarLayout = () => {
+/*const SidebarLayout = () => {
   return (
     <div style={{ display: 'flex', position: 'relative' }}>
       <Sidebar />
@@ -43,7 +44,7 @@ const SidebarLayout = () => {
       </div>
     </div>
   );
-};
+};*/
 
 function App() {
   return (
@@ -52,7 +53,8 @@ function App() {
         <AuthProvider>
           <Routes>
             <Route path="/login" element={<LoginScreen />} />
-            <Route element={<ProtectedRoute><SidebarLayout /></ProtectedRoute>}>
+            {/* Sidebar Layout for admin/report pages */}
+            <Route element={<ProtectedRoute><Layout><Outlet /></Layout></ProtectedRoute>}>
               <Route path="/" element={<HomeScreen />} />
               <Route path="ob" element={<OBScreen />} />
               <Route path="incident" element={<IncidentScreen />} />

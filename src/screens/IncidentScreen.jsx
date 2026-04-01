@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { saveIncident, getAllIncidents } from '../services/api';
+import { saveIncident, getRecentIncidents } from '../services/api';
 import './IncidentScreen.css';
 
 // Step 1: Basic Info
@@ -361,7 +361,7 @@ export default function IncidentScreen() {
   const loadIncidents = async () => {
     setLoading(true);
     try {
-      const result = await getAllIncidents();
+      const result = await getRecentIncidents();
       if (result.success) {
         setIncidents(result.data || []);
       }
