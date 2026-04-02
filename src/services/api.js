@@ -1,4 +1,4 @@
-import axios from 'axios';
+﻿import axios from 'axios';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 
@@ -17,8 +17,8 @@ api.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.response?.status === 401) {
-      localStorage.removeItem('token');
-      window.location.href = '/login';
+      //localStorage.removeItem('token');
+      //window.location.href = '/login';
     }
     return Promise.reject(error);
   }
@@ -48,7 +48,11 @@ export const reportIncident = (data) => api.post('/incidents/report', data).then
 // OB Entries
 export const getRecentOBEntries = () => api.get('/obentries/recent').then(res => res.data);
 export const createOBEntry = (data) => api.post('/obentries/create', data).then(res => res.data);
-
 export default api;
 
 export const saveIncident = (data) => api.post('/incidents/report', data).then(res => res.data);
+
+export const getActiveShift = () => api.get('/shifts/active').then(res => res.data);
+export const getGuardsList = () => api.get('/shifts/guards').then(res => res.data);
+export const startShift = (data) => api.post('/shifts/start', data).then(res => res.data);
+export const endShift = (data) => api.post('/shifts/end', data).then(res => res.data);

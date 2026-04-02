@@ -1,6 +1,6 @@
-﻿import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Outlet, NavLink } from 'react-router-dom';
-import { Shield, Car, Footprints, AlertTriangle, BookOpen, Menu, X } from 'lucide-react';
+import { Shield, Car, Footprints, AlertTriangle, BookOpen, Menu, X, Clock } from 'lucide-react';
 
 export default function BottomTabLayout() {
   const [isMobile, setIsMobile] = useState(false);

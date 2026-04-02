@@ -20,10 +20,14 @@ export default function LoginScreen() {
       await login(email, password);
       navigate('/');
     } catch (err) {
-      setError(err.message || 'Login failed');
-    } finally {
+  console.error('Full error:', err);
+  console.error('Response:', err.response?.data);
+  console.error('Status:', err.response?.status);
+  setError(err.response?.data?.error || err.message || 'Login failed');
+} finally {
       setLoading(false);
     }
+    
   };
 
   return (

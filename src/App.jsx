@@ -27,6 +27,7 @@ import ReportIncidentScreen from './screens/ReportIncidentScreen';
 import OBEntryScreen from './screens/OBEntryScreen';
 import ShiftManagementScreen from './screens/ShiftManagementScreen';
 import Layout from './components/Layout';
+import ShiftScreen from './screens/ShiftScreen';
 
 const ProtectedRoute = ({ children }) => {
   const { user, loading } = useAuth();
@@ -56,6 +57,9 @@ function App() {
             {/* Sidebar Layout for admin/report pages */}
             <Route element={<ProtectedRoute><Layout><Outlet /></Layout></ProtectedRoute>}>
               <Route path="/" element={<HomeScreen />} />
+              {/* Shift Management */}
+              <Route path="shift" element={<ShiftManagementScreen />} />
+              <Route path="guardshift" element={<ShiftScreen />} />
               <Route path="ob" element={<OBScreen />} />
               <Route path="incident" element={<IncidentScreen />} />
               <Route path="whatsapp" element={<WhatsAppScreen />} />
@@ -72,7 +76,6 @@ function App() {
               <Route path="config/settings" element={<SettingsConfig />} />
               <Route path="config/lookup-data" element={<LookupDataConfig />} />
               {/* Shift Management */}
-              <Route path="shift" element={<ShiftManagementScreen />} />
             </Route>
             {/* Bottom Tab Layout for core guard functions */}
             <Route element={<ProtectedRoute><BottomTabLayout /></ProtectedRoute>}>
@@ -82,6 +85,7 @@ function App() {
               <Route path="vehicle" element={<RegisterVehicleScreen />} />
               <Route path="incident" element={<ReportIncidentScreen />} />
               <Route path="obentry" element={<OBEntryScreen />} />
+              <Route path="shift" element={<ShiftScreen />} />
             </Route>
           </Routes>
         </AuthProvider>

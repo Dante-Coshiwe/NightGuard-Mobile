@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import api from '../../services/api';
 import './home-styles.css';
 
@@ -26,6 +26,24 @@ export default function PedestrianTab() {
   const [formErrors, setFormErrors] = useState({});
   const [error, setError] = useState('');
 
+  useEffect(() => {
+  const loadPedestrians = async () => {
+    try {
+      const response = await api.get('/pedestrians/recent');
+      setPedestrians(response.data.map(p => ({
+        id: p.id,
+        name: p.full_name,
+        contact: p.contact_number,
+        visitorType: p.purpose_of_visit,
+        facePhoto: null,
+      })));
+    } catch (err) {
+      console.error('Failed to load pedestrians:', err);
+    }
+  };
+  loadPedestrians();
+  }, []);
+
   const handlePhotoSelect = (type, e) => {
     const file = e.target.files?.[0];
     if (file) {
@@ -44,70 +62,74 @@ export default function PedestrianTab() {
   };
 
   const validateForm = () => {
-    const errors = {};
-    if (!name.trim()) errors.name = 'Name is required';
-    if (!contact.trim()) errors.contact = 'Contact is required';
-    if (!unitVisiting.trim()) errors.unitVisiting = 'Unit Visiting is required';
-    if (!facePhotoFile) errors.facePhoto = 'Face photo is required';
-    if (!idPhotoFile) errors.idPhoto = 'ID document photo is required';
-    setFormErrors(errors);
-    return Object.keys(errors).length === 0;
+  const errors = {};
+  if (!name.trim()) errors.name = 'Name is required';
+  if (!contact.trim()) errors.contact = 'Contact is required';
+  if (!unitVisiting.trim()) errors.unitVisiting = 'Unit Visiting is required';
+  console.log('Validation errors:', errors);
+  setFormErrors(errors);
+  return Object.keys(errors).length === 0;
   };
 
   const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!validateForm()) return;
+  e.preventDefault();
+  if (!validateForm()) return;
 
-    setError('');
-    setLoading(true);
-    try {
-      const formData = new FormData();
-      formData.append('full_name', name);
-      formData.append('id_number', idNumber);
-      formData.append('id_card_number', idCardNumber);
-      formData.append('contact_number', contact);
-      formData.append('visitor_type', visitorType);
-      formData.append('unit_visiting', unitVisiting);
-      formData.append('person_being_visited', personVisited);
-      if (facePhotoFile) formData.append('face_photo', facePhotoFile);
-      if (idPhotoFile) formData.append('id_photo', idPhotoFile);
+  setError('');
+  setLoading(true);
 
-      await api.post('/pedestrians/entry', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
+  try {
+    const response = await api.post('/pedestrians/entry', {
+      full_name: name,
+      id_number: idNumber,
+      contact_number: contact,
+      visiting_unit: unitVisiting,
+      host_name: personVisited,
+      purpose_of_visit: visitorType,
+    });
 
-      // Add to local list
-      setPedestrians([
-        ...pedestrians,
-        {
-          id: Date.now(),
-          name,
-          contact,
-          visitorType,
-          facePhoto,
-        },
-      ]);
+    console.log('Success:', response);
+    console.log('Response data:', response.data);
 
-      // Reset form
-      setName('');
-      setIdNumber('');
-      setIdCardNumber('');
-      setContact('');
-      setVisitorType('Visitor');
-      setUnitVisiting('');
-      setPersonVisited('');
-      setFacePhoto(null);
-      setFacePhotoFile(null);
-      setIdPhoto(null);
-      setIdPhotoFile(null);
-      setShowForm(false);
-      setFormErrors({});
-    } catch (err) {
-      setError(err.message || 'Failed to register pedestrian');
-    } finally {
-      setLoading(false);
-    }
-  };
+    setPedestrians([
+      ...pedestrians,
+      {
+        id: response.data.id,
+        name: response.data.full_name,
+        contact: response.data.contact_number,
+        visitorType: response.data.purpose_of_visit,
+        facePhoto,
+      }
+    ]);
+
+    setName('');
+    setIdNumber('');
+    setIdCardNumber('');
+    setContact('');
+    setVisitorType('Visitor');
+    setUnitVisiting('');
+    setPersonVisited('');
+    setFacePhoto(null);
+    setFacePhotoFile(null);
+    setIdPhoto(null);
+    setIdPhotoFile(null);
+    setShowForm(false);
+    setFormErrors({});
+
+  } catch (err) {
+    console.error('Pedestrian submit error:', err);
+    console.error('Response data:', err.response?.data);
+    console.error('Status:', err.response?.status);
+
+    setError(
+      err.response?.data?.error ||
+      err.message ||
+      'Failed to register pedestrian'
+    );
+  } finally {
+    setLoading(false);
+  }
+};
 
   if (showForm) {
     return (

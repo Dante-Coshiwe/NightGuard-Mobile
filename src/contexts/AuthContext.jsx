@@ -25,12 +25,12 @@ export const AuthProvider = ({ children }) => {
   }, []);
 
   const login = async (email, password) => {
-    const response = await apiLogin({ email, password });
-    const { token, user: userData } = response.data;
-    localStorage.setItem('token', token);
-    setUser(userData);
-    return userData;
-  };
+  const response = await apiLogin({ email, password });
+  const { token, user: userData } = response.data;
+  localStorage.setItem('token', token);
+  setUser(userData);
+  return userData;
+};
 
   const logout = async () => {
     await apiLogout();

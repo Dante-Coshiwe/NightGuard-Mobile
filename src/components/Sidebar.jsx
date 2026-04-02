@@ -1,6 +1,6 @@
 ﻿import React, { useState } from 'react';
 import { NavLink } from 'react-router-dom';
-import { Menu, X, Home, BookOpen, AlertTriangle, MessageCircle, Info, FileText, Settings, ChevronDown, ChevronRight } from 'lucide-react';
+import { Menu, X, Home, BookOpen, AlertTriangle, MessageCircle, Info, FileText, Settings, ChevronDown, ChevronRight, Clock } from 'lucide-react';
 
 const Sidebar = ({ isOpen, toggleSidebar }) => {
   const [openReports, setOpenReports] = useState(false);
@@ -11,6 +11,7 @@ const Sidebar = ({ isOpen, toggleSidebar }) => {
 
   const menuItems = [
     { to: '/', label: 'Home', icon: Home },
+    { to: '/guardshift', label: 'Shift', icon: Clock },
     { to: '/ob', label: 'OB', icon: BookOpen },
     { to: '/incident', label: 'Incident', icon: AlertTriangle },
     { to: '/whatsapp', label: 'WhatsApp', icon: MessageCircle },
