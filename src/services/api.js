@@ -56,3 +56,5 @@ export const getActiveShift = () => api.get('/shifts/active').then(res => res.da
 export const getGuardsList = () => api.get('/shifts/guards').then(res => res.data);
 export const startShift = (data) => api.post('/shifts/start', data).then(res => res.data);
 export const endShift = (data) => api.post('/shifts/end', data).then(res => res.data);
+
+export const addGuard = (data) => api.post('/shifts/guards/add', data).then(res => res.data);
