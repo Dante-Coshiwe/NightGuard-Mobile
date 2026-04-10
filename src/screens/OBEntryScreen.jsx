@@ -1,7 +1,8 @@
-﻿import React, { useState } from 'react';
+import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { createOBEntry } from '../services/api';
 import './screens.css';
+import { useOfflineApi } from '../hooks/useOfflineApi';
 
 export default function OBEntryScreen() {
   const [serialNumber, setSerialNumber] = useState('');
@@ -9,6 +10,8 @@ export default function OBEntryScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const navigate = useNavigate();
+  const { post, isOnline } = useOfflineApi();
+
 
   const submitEntry = async (e) => {
     e.preventDefault();
@@ -19,7 +22,15 @@ export default function OBEntryScreen() {
     setError('');
     setLoading(true);
     try {
-      await createOBEntry({ serial_number: serialNumber, nature_of_occurrence: nature });
+      const response = await post('/ob-entries', { serial_number: serialNumber, nature_of_occurrence: nature });
+      
+      // Handle offline response:
+      if (response._offline) {
+        alert('OB entry recorded successfully (offline)');
+        navigate(-1);
+        return;
+      }
+
       alert('OB entry recorded successfully');
       navigate(-1);
     } catch (err) {

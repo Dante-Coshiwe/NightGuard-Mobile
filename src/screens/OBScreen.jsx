@@ -18,12 +18,29 @@ export default function OBScreen() {
 
   const loadEntries = async () => {
     setLoading(true);
+
     try {
+      if (!navigator.onLine) {
+        // Load from cache if offline
+        const cached = localStorage.getItem('cached_ob_entries');
+        if (cached) setEntries(JSON.parse(cached));
+        return;
+      }
+
       const result = await getRecentOBEntries();
-      setEntries(result || []);
+      const data = result || [];
+
+      setEntries(data);
+      localStorage.setItem('cached_ob_entries', JSON.stringify(data));
+
     } catch (err) {
       setError('Error loading entries');
       console.error(err);
+
+      // Fallback to cache on error
+      const cached = localStorage.getItem('cached_ob_entries');
+      if (cached) setEntries(JSON.parse(cached));
+
     } finally {
       setLoading(false);
     }

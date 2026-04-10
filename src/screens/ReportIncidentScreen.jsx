@@ -1,7 +1,8 @@
-﻿import React, { useState } from 'react';
+import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api from '../services/api';
 import './screens.css';
+import { useOfflineApi } from '../hooks/useOfflineApi';
 
 export default function ReportIncidentScreen() {
   const [incidentType, setIncidentType] = useState('');
@@ -10,6 +11,7 @@ export default function ReportIncidentScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const navigate = useNavigate();
+  const { post, isOnline } = useOfflineApi();
 
   const submitIncident = async (e) => {
     e.preventDefault();
@@ -17,12 +19,27 @@ export default function ReportIncidentScreen() {
       setError('Please fill in type and description');
       return;
     }
+
     setError('');
     setLoading(true);
+
     try {
-      await api.post('/incidents/report', { incident_type: incidentType, description, severity });
+      const response = await post('/incidents/report', {
+        incident_type: incidentType,
+        description,
+        severity
+      });
+
+      // Handle offline response
+      if (response._offline) {
+        alert('Incident saved offline and will sync when online');
+        navigate(-1);
+        return;
+      }
+
       alert('Incident reported successfully');
       navigate(-1);
+
     } catch (err) {
       setError(err.response?.data?.error || 'Failed to report');
     } finally {

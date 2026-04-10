@@ -2,6 +2,8 @@ import React, { useState, useEffect } from "react";
 import api from "../../services/api";
 import "./home-styles.css";
 import { markVehicleExit } from '../../services/api';
+import { useOfflineApi } from '../../hooks/useOfflineApi';
+import { useOfflineQueue } from '../../hooks/useOfflineQueue';
 
 export default function VehicleTab() {
   const [vehicles, setVehicles] = useState([]);
@@ -18,12 +20,16 @@ export default function VehicleTab() {
   const [vehicleErrors, setVehicleErrors] = useState({});
   const [error, setError] = useState("");
   const [search, setSearch] = useState('');
+  const { post, isOnline } = useOfflineApi();
+  const { addToQueue } = useOfflineQueue();
 
   useEffect(() => {
     const loadVehicles = async () => {
+      setLoading(true);
       try {
         const response = await api.get('/vehicles/recent');
-        setVehicles(response.data.map(v => ({
+
+        const mapped = response.data.map(v => ({
           id: v.id,
           licensePlate: v.license_plate,
           makeModel: v.vehicle_make || v.vehicle_type,
@@ -32,17 +38,41 @@ export default function VehicleTab() {
           enteredAt: v.entered_at,
           exitedAt: v.exited_at,
           hasLeft: !!v.exited_at,
-        })));
+        }));
+
+        setVehicles(mapped);
+        localStorage.setItem('cached_vehicles', JSON.stringify(mapped));
+
       } catch (err) {
-        console.error("Failed to load vehicles:", err);
+        // ✅ Always fall back to cache (offline OR 401 OR server error)
+        const cached = localStorage.getItem('cached_vehicles');
+        if (cached) {
+          setVehicles(JSON.parse(cached));
+        }
       } finally {
         setLoading(false);
       }
     };
+
     loadVehicles();
   }, []);
 
   const handleMarkExit = async (id) => {
+    if (id.startsWith('offline_')) {
+      setVehicles(prev => prev.map(v =>
+        v.id === id ? { ...v, hasLeft: true, exitedAt: new Date().toISOString() } : v
+      ));
+      return;
+    }
+
+    if (!navigator.onLine) {
+      addToQueue('patch', `/vehicles/${id}/exit`, {});
+      setVehicles(prev => prev.map(v =>
+        v.id === id ? { ...v, hasLeft: true, exitedAt: new Date().toISOString() } : v
+      ));
+      return;
+    }
+
     try {
       await markVehicleExit(id);
       setVehicles(prev => prev.map(v =>
@@ -68,7 +98,8 @@ export default function VehicleTab() {
     setError("");
     setSubmitting(true);
     try {
-      const response = await api.post("/vehicles/entry", {
+
+      const response = await post('/vehicles/entry', {
         license_plate: licensePlate,
         vehicle_make: makeModel,
         vehicle_color: colour,
@@ -77,6 +108,34 @@ export default function VehicleTab() {
         visiting_unit: personVisiting,
         vehicle_type: visitorType,
       });
+
+      // Handle offline response:
+      if (response._offline) {
+        setVehicles([{
+          id: response.id,
+          licensePlate,
+          makeModel,
+          colour,
+          driverName,
+          contact,
+          personVisiting,
+          visitorType,
+          entryTime: new Date().toISOString(),
+          exitTime: null,
+          hasLeft: false,
+          _offline: true,
+        }, ...vehicles]);
+
+        setShowForm(false);
+        setLicensePlate('');
+        setMakeModel('');
+        setColour('');
+        setDriverName('');
+        setContact('');
+        setPersonVisiting('');
+        return;
+      }
+
       setVehicles([{
         id: response.data.id,
         licensePlate: response.data.license_plate,

@@ -30,7 +30,7 @@ import Layout from './components/Layout';
 import ShiftScreen from './screens/ShiftScreen';
 
 const ProtectedRoute = ({ children }) => {
-  const { user, loading } = useAuth();
+  const { user, loading } = useAuth() || {};
   if (loading) return <div style={{ background: '#000', color: '#fff', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>Loading...</div>;
   if (!user) return <Navigate to="/login" />;
   return children;

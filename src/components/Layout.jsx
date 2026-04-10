@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import Sidebar from './Sidebar';
-
+import OfflineBanner from './OfflineBanner';
+<OfflineBanner />
 const Layout = ({ children }) => {
   const [sidebarOpen, setSidebarOpen] = useState(true);
 

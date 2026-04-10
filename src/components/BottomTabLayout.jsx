@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Outlet, NavLink } from 'react-router-dom';
 import { Shield, Car, Footprints, AlertTriangle, BookOpen, Menu, X, Clock } from 'lucide-react';
+import OfflineBanner from './OfflineBanner';
 
 export default function BottomTabLayout() {
   const [isMobile, setIsMobile] = useState(false);
@@ -27,6 +28,7 @@ export default function BottomTabLayout() {
     { to: '/obentry', label: 'OB', icon: BookOpen },
   ];
 
+  <OfflineBanner />
   return (
     <div style={styles.container}>
       {/* Mobile Sidebar Overlay */}

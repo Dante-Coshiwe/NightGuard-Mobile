@@ -44,11 +44,28 @@ export default function IncidentScreen() {
 
   const loadIncidents = async () => {
     setLoading(true);
+
     try {
+      if (!navigator.onLine) {
+        // Load from cache if offline
+        const cached = localStorage.getItem('cached_incidents');
+        if (cached) setIncidents(JSON.parse(cached));
+        return;
+      }
+
       const result = await getRecentIncidents();
-      setIncidents(result || []);
+      const data = result || [];
+
+      setIncidents(data);
+      localStorage.setItem('cached_incidents', JSON.stringify(data));
+
     } catch (err) {
       console.error('Failed to load incidents:', err);
+
+      // Fallback to cache
+      const cached = localStorage.getItem('cached_incidents');
+      if (cached) setIncidents(JSON.parse(cached));
+
     } finally {
       setLoading(false);
     }

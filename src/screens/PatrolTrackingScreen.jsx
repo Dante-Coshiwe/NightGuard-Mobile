@@ -1,92 +1,158 @@
 ﻿import React, { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { CheckCircle, Circle, Zap } from 'lucide-react';
-import { mockApi } from '../services/mockApi';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { useNFC } from '../hooks/useNFC';
+import { logNFCScan, getNFCCheckpoints } from '../services/api';
+import './screens.css';
 
 export default function PatrolTrackingScreen() {
-  const { id } = useParams();
+  const { state } = useLocation();
   const navigate = useNavigate();
-  const [patrol, setPatrol] = useState(null);
+  const patrol = state?.patrol;
+
   const [checkpoints, setCheckpoints] = useState([]);
-  const [scanning, setScanning] = useState(false);
+  const [scans, setScans] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [scanFeedback, setScanFeedback] = useState(null);
+
+  const { isSupported, scanning, error: nfcError, startScan, stopScan } = useNFC();
 
   useEffect(() => {
-    const loadPatrol = async () => {
-      const patrols = await mockApi.getPatrols();
-      const found = patrols.find(p => p.id === parseInt(id));
-      setPatrol(found);
-      setCheckpoints(found ? found.patrol_checkpoints : []);
-    };
-    loadPatrol();
-  }, [id]);
+    loadCheckpoints();
+    return () => stopScan();
+  }, []);
 
-  if (!patrol) return <div style={styles.center}>Loading...</div>;
-
-  const completed = checkpoints.filter(c => c.status === 'completed').length;
-  const total = checkpoints.length;
-
-  const simulateScan = () => {
-    const pendingIndex = checkpoints.findIndex(c => c.status !== 'completed');
-    if (pendingIndex === -1) {
-      alert('All checkpoints have been completed!');
-      return;
+  const loadCheckpoints = async () => {
+    setLoading(true);
+    try {
+      const data = await getNFCCheckpoints();
+      setCheckpoints(data);
+    } catch (err) {
+      console.error('Failed to load checkpoints:', err);
+    } finally {
+      setLoading(false);
     }
-    const updated = [...checkpoints];
-    updated[pendingIndex] = { ...updated[pendingIndex], status: 'completed' };
-    setCheckpoints(updated);
-    alert('✓ marked complete');
+  };
+
+  const handleNFCScan = async (tagUid) => {
+    try {
+      const result = await logNFCScan({
+        tag_uid: tagUid,
+        patrol_id: patrol?.id || null,
+      });
+      setScanFeedback({ success: true, message: `✓ ${result.checkpoint_name}` });
+      setScans(prev => [result.scan, ...prev]);
+      setTimeout(() => setScanFeedback(null), 3000);
+    } catch (err) {
+      setScanFeedback({ success: false, message: err.response?.data?.error || 'Unknown tag' });
+      setTimeout(() => setScanFeedback(null), 3000);
+    }
+  };
+
+  const handleStartScanning = () => {
+    startScan(handleNFCScan);
   };
 
   return (
-    <div style={styles.container}>
-      <button onClick={() => navigate('/patrols')} style={styles.backBtn}>← Back to Patrols</button>
-      <h2 style={styles.title}>{patrol.patrol_name}</h2>
-      <div style={styles.progressBox}>
-        <div style={styles.progressLabel}>Progress</div>
-        <div style={styles.progressCount}>{completed} / {total}</div>
-        <div style={styles.progressBarBg}>
-          <div style={{ width: `${(completed / total) * 100}%`, height: '6px', backgroundColor: '#dc2626', borderRadius: '3px' }} />
-        </div>
+    <div className="screen-container">
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
+        <button onClick={() => navigate(-1)}
+          style={{ background: 'none', border: 'none', color: '#dc2626', fontSize: 14, cursor: 'pointer' }}>
+          ← Back
+        </button>
+        <h1 className="patrols-title" style={{ margin: 0 }}>
+          {patrol?.patrol_name || 'Patrol'}
+        </h1>
       </div>
-      <div style={styles.list}>
-        {checkpoints.map((cp, idx) => (
-          <div key={idx} style={styles.checkpoint}>
-            {cp.status === 'completed' ? (
-              <CheckCircle size={20} color="#10b981" />
-            ) : (
-              <Circle size={20} color="#555" />
-            )}
-            <div style={styles.checkpointText}>
-              <div style={{ ...styles.checkpointName, color: cp.status === 'completed' ? '#888' : '#fff' }}>
-                {cp.checkpoint_name}
-              </div>
-              <div style={{ fontSize: '12px', marginTop: '2px', color: cp.status === 'completed' ? '#10b981' : '#f59e0b' }}>
-                {cp.status === 'completed' ? 'Completed' : 'Pending'}
-              </div>
-            </div>
+
+      {/* NFC Status */}
+      <div style={{ background: '#0a0a0a', border: `1px solid ${scanning ? '#22c55e' : '#1f1f1f'}`, borderRadius: 12, padding: 20, marginBottom: 20, textAlign: 'center' }}>
+        {!isSupported ? (
+          <div>
+            <div style={{ fontSize: 32, marginBottom: 8 }}>📵</div>
+            <div style={{ color: '#f87171', fontSize: 14 }}>NFC not supported</div>
+            <div style={{ color: '#555', fontSize: 12, marginTop: 4 }}>Use Chrome on Android to scan NFC tags</div>
           </div>
-        ))}
+        ) : scanning ? (
+          <div>
+            <div style={{ fontSize: 32, marginBottom: 8 }}>📡</div>
+            <div style={{ color: '#22c55e', fontSize: 16, fontWeight: 600 }}>Ready to scan</div>
+            <div style={{ color: '#555', fontSize: 12, marginTop: 4 }}>Hold phone near NFC tag</div>
+            <button onClick={stopScan}
+              style={{ marginTop: 12, padding: '8px 20px', background: '#7f1d1d', color: '#fff', border: 'none', borderRadius: 8, fontSize: 13, cursor: 'pointer' }}>
+              Stop Scanning
+            </button>
+          </div>
+        ) : (
+          <div>
+            <div style={{ fontSize: 32, marginBottom: 8 }}>🏷️</div>
+            <div style={{ color: '#fff', fontSize: 14, marginBottom: 12 }}>Tap to start scanning checkpoints</div>
+            <button onClick={handleStartScanning}
+              style={{ padding: '10px 24px', background: '#dc2626', color: '#fff', border: 'none', borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
+              Start Scanning
+            </button>
+          </div>
+        )}
+        {nfcError && <div style={{ color: '#f87171', fontSize: 12, marginTop: 8 }}>{nfcError}</div>}
       </div>
-      <button onClick={simulateScan} style={styles.scanBtn}>
-        <Zap size={20} color="#fff" style={{ marginRight: '8px' }} />
-        {completed === total ? 'All Complete ✓' : 'Scan Next Checkpoint'}
-      </button>
+
+      {/* Scan Feedback */}
+      {scanFeedback && (
+        <div style={{
+          position: 'fixed', top: 80, left: '50%', transform: 'translateX(-50%)',
+          background: scanFeedback.success ? '#166534' : '#7f1d1d',
+          color: scanFeedback.success ? '#86efac' : '#fca5a5',
+          padding: '12px 24px', borderRadius: 12, fontSize: 15, fontWeight: 600,
+          zIndex: 1000, boxShadow: '0 4px 20px rgba(0,0,0,0.5)'
+        }}>
+          {scanFeedback.message}
+        </div>
+      )}
+
+      {/* Checkpoints */}
+      <div style={{ marginBottom: 20 }}>
+        <h2 style={{ fontSize: 15, color: '#fff', marginBottom: 12 }}>
+          Checkpoints ({checkpoints.length})
+        </h2>
+        {loading ? (
+          <div style={{ color: '#666', textAlign: 'center', padding: 20 }}>Loading...</div>
+        ) : checkpoints.length === 0 ? (
+          <div style={{ color: '#666', textAlign: 'center', padding: 20 }}>No checkpoints registered for this site</div>
+        ) : (
+          checkpoints.map((cp, i) => {
+            const scanned = scans.some(s => s.checkpoint_id === cp.id);
+            return (
+              <div key={cp.id} style={{
+                background: scanned ? '#0a1a0a' : '#0a0a0a',
+                border: `1px solid ${scanned ? '#166534' : '#1f1f1f'}`,
+                borderRadius: 8, padding: '12px 16px', marginBottom: 8,
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center'
+              }}>
+                <div>
+                  <div style={{ color: '#fff', fontWeight: 600 }}>{cp.checkpoint_name}</div>
+                  <div style={{ color: '#555', fontSize: 12 }}>Order: {cp.checkpoint_order}</div>
+                </div>
+                {scanned
+                  ? <span style={{ color: '#22c55e', fontSize: 13, fontWeight: 600 }}>✓ Scanned</span>
+                  : <span style={{ color: '#555', fontSize: 13 }}>Pending</span>
+                }
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* Recent Scans */}
+      {scans.length > 0 && (
+        <div>
+          <h2 style={{ fontSize: 15, color: '#fff', marginBottom: 12 }}>Recent Scans</h2>
+          {scans.map((scan, i) => (
+            <div key={i} style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 8, padding: '10px 16px', marginBottom: 6 }}>
+              <div style={{ color: '#fff', fontWeight: 600 }}>{scan.checkpoint_name}</div>
+              <div style={{ color: '#555', fontSize: 12 }}>{new Date(scan.scanned_at).toLocaleTimeString()}</div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
-
-const styles = {
-  container: { backgroundColor: '#000000', minHeight: '100vh', padding: '20px' },
-  center: { display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', backgroundColor: '#000000', color: '#fff' },
-  backBtn: { background: 'none', border: 'none', color: '#dc2626', fontSize: '15px', cursor: 'pointer', marginBottom: '16px' },
-  title: { color: '#ffffff', fontSize: '22px', fontWeight: 'bold', marginBottom: '16px' },
-  progressBox: { backgroundColor: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: '10px', padding: '16px', marginBottom: '20px' },
-  progressLabel: { color: '#888', fontSize: '12px', marginBottom: '4px' },
-  progressCount: { color: '#fff', fontSize: '28px', fontWeight: 'bold', marginBottom: '8px' },
-  progressBarBg: { height: '6px', backgroundColor: '#2a2a2a', borderRadius: '3px' },
-  list: { display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '20px' },
-  checkpoint: { display: 'flex', alignItems: 'center', backgroundColor: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: '8px', padding: '14px' },
-  checkpointText: { marginLeft: '12px' },
-  checkpointName: { fontSize: '15px', fontWeight: '500' },
-  scanBtn: { backgroundColor: '#dc2626', color: '#fff', border: 'none', borderRadius: '10px', padding: '14px', fontSize: '16px', fontWeight: 'bold', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', width: '100%' },
-};

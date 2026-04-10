@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react';
 import api from '../../services/api';
 import { markPedestrianExit } from '../../services/api';
 import './home-styles.css';
+import { useOfflineApi } from '../../hooks/useOfflineApi';
+import { useOfflineQueue } from '../../hooks/useOfflineQueue';
 
 export default function PedestrianTab() {
   const [pedestrians, setPedestrians] = useState([]);
@@ -9,7 +11,7 @@ export default function PedestrianTab() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [search, setSearch] = useState('');
-
+  const { post, isOnline } = useOfflineApi();
   const [name, setName] = useState('');
   const [idNumber, setIdNumber] = useState('');
   const [contact, setContact] = useState('');
@@ -18,16 +20,20 @@ export default function PedestrianTab() {
   const [personVisited, setPersonVisited] = useState('');
   const [formErrors, setFormErrors] = useState({});
   const [error, setError] = useState('');
+  const { addToQueue } = useOfflineQueue();
 
   useEffect(() => {
     loadPedestrians();
+    const handleSync = () => loadPedestrians();
+    window.addEventListener('nightguard_sync_complete', handleSync);
+    return () => window.removeEventListener('nightguard_sync_complete', handleSync);
   }, []);
 
   const loadPedestrians = async () => {
     setLoading(true);
     try {
       const response = await api.get('/pedestrians/recent');
-      setPedestrians(response.data.map(p => ({
+      const mapped = response.data.map(p => ({
         id: p.id,
         name: p.full_name,
         contact: p.contact_number,
@@ -36,15 +42,38 @@ export default function PedestrianTab() {
         entryTime: p.entry_time,
         exitTime: p.exit_time,
         hasLeft: !!p.exit_time,
-      })));
+      }));
+      setPedestrians(mapped);
+      localStorage.setItem('cached_pedestrians', JSON.stringify(mapped));
     } catch (err) {
-      console.error('Failed to load pedestrians:', err);
+      // Always fall back to cache on any error including 401
+      const cached = localStorage.getItem('cached_pedestrians');
+      if (cached) {
+        setPedestrians(JSON.parse(cached));
+      }
     } finally {
       setLoading(false);
     }
   };
 
   const handleMarkExit = async (id) => {
+    // If offline ID, just mark locally
+    if (id.startsWith('offline_')) {
+      setPedestrians(prev => prev.map(p =>
+        p.id === id ? { ...p, hasLeft: true, exitTime: new Date().toISOString() } : p
+      ));
+      return;
+    }
+
+    if (!navigator.onLine) {
+      // Queue the exit and mark locally
+      addToQueue('patch', `/pedestrians/${id}/exit`, {});
+      setPedestrians(prev => prev.map(p =>
+        p.id === id ? { ...p, hasLeft: true, exitTime: new Date().toISOString() } : p
+      ));
+      return;
+    }
+
     try {
       await markPedestrianExit(id);
       setPedestrians(prev => prev.map(p =>
@@ -70,7 +99,7 @@ export default function PedestrianTab() {
     setError('');
     setSubmitting(true);
     try {
-      const response = await api.post('/pedestrians/entry', {
+      const response = await post('/pedestrians/entry', {
         full_name: name,
         id_number: idNumber,
         contact_number: contact,
@@ -78,6 +107,25 @@ export default function PedestrianTab() {
         host_name: personVisited,
         purpose_of_visit: visitorType,
       });
+
+      //offline response
+      if (response._offline) {
+        setPedestrians([{
+          id: response.id,
+          name,
+          contact,
+          visitorType,
+          unitVisiting,
+          entryTime: new Date().toISOString(),
+          exitTime: null,
+          hasLeft: false,
+          _offline: true,
+        }, ...pedestrians]);
+        setShowForm(false);
+        setName(''); setContact(''); setUnitVisiting('');
+        return;
+      }
+
       setPedestrians([{
         id: response.data.id,
         name: response.data.full_name,
