@@ -57,7 +57,7 @@ export default function SettingsConfig() {
 
   const Section = ({ title, children }) => (
     <div style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: 24, marginBottom: 20 }}>
-      <h2 style={{ color: '#fff', fontSize: 15, fontWeight: 700, margin: '0 0 16px', textTransform: 'uppercase', letterSpacing: 1, color: '#666' }}>{title}</h2>
+      <h2 style={{ color: '#666', fontSize: 15, fontWeight: 700, margin: '0 0 16px', textTransform: 'uppercase', letterSpacing: 1 }}>{title}</h2>
       {children}
     </div>
   );

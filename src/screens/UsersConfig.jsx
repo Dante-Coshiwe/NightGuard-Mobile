@@ -1,5 +1,14 @@
-﻿import React, { useState, useEffect } from 'react';
-import { getGuards, addGuardUser, updateGuardPin, toggleGuardActive } from '../services/api';
+import React, { useEffect, useState } from 'react';
+import { addGuardUser, getGuards, toggleGuardActive, updateGuardPin } from '../services/api';
+import { getCachedGuards, getQuickSwitchEnabled, saveCachedGuards, saveQuickSwitchEnabled } from '../lib/deviceStore';
+
+const pageStyles = {
+  page: { padding: '24px 32px', color: '#fff', background: '#000', minHeight: '100vh' },
+  card: { background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 14, padding: 20, marginBottom: 18 },
+  input: { width: '100%', padding: '10px 12px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 10, color: '#fff', boxSizing: 'border-box' },
+  button: { padding: '10px 16px', background: '#dc2626', border: 'none', borderRadius: 10, color: '#fff', fontWeight: 600, cursor: 'pointer' },
+  subtleButton: { padding: '8px 12px', background: '#151515', border: '1px solid #333', borderRadius: 10, color: '#d4d4d4', cursor: 'pointer' },
+};
 
 export default function UsersConfig() {
   const [guards, setGuards] = useState([]);
@@ -10,144 +19,156 @@ export default function UsersConfig() {
   const [newName, setNewName] = useState('');
   const [newPhone, setNewPhone] = useState('');
   const [newPin, setNewPin] = useState('1234');
-  const [adding, setAdding] = useState(false);
-  const [editingPin, setEditingPin] = useState(null);
-  const [newPinValue, setNewPinValue] = useState('');
+  const [quickSwitchEnabled, setQuickSwitch] = useState(getQuickSwitchEnabled());
 
-  useEffect(() => { loadGuards(); }, []);
+  useEffect(() => {
+    loadGuards();
+  }, []);
 
   const loadGuards = async () => {
     setLoading(true);
+    setError('');
     try {
       const data = await getGuards();
       setGuards(data);
+      saveCachedGuards(data);
     } catch {
-      setError('Failed to load guards');
+      const cached = getCachedGuards();
+      setGuards(cached);
+      if (!cached.length) {
+        setError('Unable to load guards right now');
+      }
     } finally {
       setLoading(false);
     }
   };
 
   const handleAddGuard = async () => {
-    if (!newName.trim()) { setError('Name is required'); return; }
-    setAdding(true);
-    setError('');
+    if (!newName.trim()) {
+      setError('Name is required');
+      return;
+    }
+
     try {
       const guard = await addGuardUser({ full_name: newName, phone: newPhone, pin: newPin });
-      setGuards([...guards, guard]);
-      setNewName(''); setNewPhone(''); setNewPin('1234');
+      const updated = [...guards, guard];
+      setGuards(updated);
+      saveCachedGuards(updated);
+      setNewName('');
+      setNewPhone('');
+      setNewPin('1234');
       setShowAddForm(false);
-      setSuccess(`${guard.full_name} added with PIN: ${newPin}`);
-      setTimeout(() => setSuccess(''), 5000);
+      setSuccess(`${guard.full_name} added`);
     } catch (err) {
       setError(err.response?.data?.error || 'Failed to add guard');
-    } finally {
-      setAdding(false);
     }
   };
 
-  const handleUpdatePin = async (id) => {
-    if (!newPinValue.trim()) return;
+  const handlePinUpdate = async (guardId, pin) => {
     try {
-      await updateGuardPin(id, newPinValue);
-      setEditingPin(null);
-      setNewPinValue('');
-      setSuccess('PIN updated');
-      setTimeout(() => setSuccess(''), 3000);
+      await updateGuardPin(guardId, pin);
+      const updated = guards.map((guard) => (
+        guard.id === guardId ? { ...guard, pin } : guard
+      ));
+      setGuards(updated);
+      saveCachedGuards(updated);
+      setSuccess('Guard PIN updated');
     } catch {
-      setError('Failed to update PIN');
+      setError('Failed to update guard PIN');
     }
   };
 
-  const handleToggle = async (id, currentStatus) => {
+  const handleToggle = async (guardId, isActive) => {
     try {
-      const updated = await toggleGuardActive(id, !currentStatus);
-      setGuards(guards.map(g => g.id === id ? { ...g, is_active: updated.is_active } : g));
+      await toggleGuardActive(guardId, !isActive);
+      const updated = guards.map((guard) => (
+        guard.id === guardId ? { ...guard, is_active: !isActive } : guard
+      ));
+      setGuards(updated);
+      saveCachedGuards(updated);
     } catch {
       setError('Failed to update guard status');
     }
   };
 
+  const handleQuickSwitchToggle = () => {
+    const nextValue = !quickSwitchEnabled;
+    setQuickSwitch(nextValue);
+    saveQuickSwitchEnabled(nextValue);
+    setSuccess(`Quick guard switching ${nextValue ? 'enabled' : 'disabled'}`);
+  };
+
   return (
-    <div style={{ padding: '24px 32px', color: '#fff', background: '#000', minHeight: '100vh' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
-        <h1 style={{ margin: 0, fontSize: 22 }}>Users</h1>
-        <button onClick={() => setShowAddForm(!showAddForm)}
-          style={{ padding: '10px 20px', background: '#dc2626', color: '#fff', border: 'none', borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
-          {showAddForm ? 'Cancel' : '+ Add Guard'}
+    <div style={pageStyles.page}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 24, flexWrap: 'wrap' }}>
+        <div>
+          <h1 style={{ margin: 0, fontSize: 24 }}>Users Configuration</h1>
+          <p style={{ margin: '6px 0 0', color: '#8b8b8b' }}>Admin view includes guard PINs and device quick-switch control.</p>
+        </div>
+        <button style={pageStyles.button} onClick={() => setShowAddForm(!showAddForm)}>
+          {showAddForm ? 'Close' : 'Add Guard'}
         </button>
       </div>
 
-      {error && <div style={{ background: '#2a1515', border: '1px solid #5a2020', borderRadius: 8, padding: '10px 16px', color: '#ff6b6b', marginBottom: 16 }}>{error}</div>}
-      {success && <div style={{ background: '#0f2a1a', border: '1px solid #166534', borderRadius: 8, padding: '10px 16px', color: '#86efac', marginBottom: 16 }}>{success}</div>}
+      {error && <div style={{ ...pageStyles.card, color: '#fca5a5', borderColor: '#7f1d1d' }}>{error}</div>}
+      {success && <div style={{ ...pageStyles.card, color: '#86efac', borderColor: '#166534' }}>{success}</div>}
 
-      {showAddForm && (
-        <div style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: 20, marginBottom: 24 }}>
-          <h2 style={{ margin: '0 0 16px', fontSize: 16 }}>New Guard</h2>
-          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
-            <input type="text" placeholder="Full Name *" value={newName} onChange={e => setNewName(e.target.value)}
-              style={{ flex: 1, minWidth: 150, padding: '10px 12px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, color: '#fff', fontSize: 14 }} />
-            <input type="tel" placeholder="Phone (optional)" value={newPhone} onChange={e => setNewPhone(e.target.value)}
-              style={{ flex: 1, minWidth: 150, padding: '10px 12px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, color: '#fff', fontSize: 14 }} />
-            <input type="text" placeholder="PIN" value={newPin} onChange={e => setNewPin(e.target.value)} maxLength={6}
-              style={{ width: 80, padding: '10px 12px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, color: '#fff', fontSize: 14 }} />
+      <div style={pageStyles.card}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <div>
+            <h2 style={{ margin: '0 0 6px', fontSize: 18 }}>Quick guard switching</h2>
+            <p style={{ margin: 0, color: '#8b8b8b', fontSize: 14 }}>Lets guards hand over the shared device without ending the shift.</p>
           </div>
-          <button onClick={handleAddGuard} disabled={adding}
-            style={{ padding: '10px 24px', background: '#dc2626', color: '#fff', border: 'none', borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
-            {adding ? 'Adding...' : 'Add Guard'}
+          <button style={pageStyles.subtleButton} onClick={handleQuickSwitchToggle}>
+            {quickSwitchEnabled ? 'Disable' : 'Enable'}
           </button>
         </div>
-      )}
+      </div>
 
-      {loading ? (
-        <div style={{ textAlign: 'center', padding: 40, color: '#666' }}>Loading guards...</div>
-      ) : guards.length === 0 ? (
-        <div style={{ textAlign: 'center', padding: 40, color: '#666' }}>No guards added yet</div>
-      ) : (
-        <div>
-          {guards.map(guard => (
-            <div key={guard.id} style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: '16px 20px', marginBottom: 12, opacity: guard.is_active ? 1 : 0.5 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12 }}>
-                <div>
-                  <div style={{ color: '#fff', fontSize: 16, fontWeight: 700 }}>{guard.full_name}</div>
-                  {guard.phone && <div style={{ color: '#666', fontSize: 13, marginTop: 2 }}>{guard.phone}</div>}
-                  <div style={{ color: '#444', fontSize: 11, marginTop: 4 }}>{guard.email}</div>
-                </div>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                  {editingPin === guard.id ? (
-                    <>
-                      <input type="text" placeholder="New PIN" value={newPinValue} onChange={e => setNewPinValue(e.target.value)} maxLength={6} autoFocus
-                        style={{ width: 80, padding: '6px 10px', background: '#111', border: '1px solid #333', borderRadius: 6, color: '#fff', fontSize: 13 }} />
-                      <button onClick={() => handleUpdatePin(guard.id)}
-                        style={{ padding: '6px 12px', background: '#166534', border: 'none', borderRadius: 6, color: '#86efac', fontSize: 12, cursor: 'pointer' }}>
-                        Save
-                      </button>
-                      <button onClick={() => { setEditingPin(null); setNewPinValue(''); }}
-                        style={{ padding: '6px 12px', background: '#1a1a1a', border: '1px solid #333', borderRadius: 6, color: '#999', fontSize: 12, cursor: 'pointer' }}>
-                        Cancel
-                      </button>
-                    </>
-                  ) : (
-                    <button onClick={() => { setEditingPin(guard.id); setNewPinValue(''); }}
-                      style={{ padding: '6px 12px', background: '#1a1a1a', border: '1px solid #333', borderRadius: 6, color: '#ccc', fontSize: 12, cursor: 'pointer' }}>
-                      Change PIN
-                    </button>
-                  )}
-                  <button onClick={() => handleToggle(guard.id, guard.is_active)}
-                    style={{ padding: '6px 12px', background: guard.is_active ? '#1a1a1a' : '#166534', border: `1px solid ${guard.is_active ? '#333' : '#166534'}`, borderRadius: 6, color: guard.is_active ? '#ef4444' : '#86efac', fontSize: 12, cursor: 'pointer' }}>
-                    {guard.is_active ? 'Deactivate' : 'Activate'}
-                  </button>
-                </div>
-              </div>
-              <div style={{ marginTop: 8 }}>
-                <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, background: guard.is_active ? '#166534' : '#333', color: guard.is_active ? '#86efac' : '#666' }}>
-                  {guard.is_active ? 'Active' : 'Inactive'}
-                </span>
-              </div>
-            </div>
-          ))}
+      {showAddForm && (
+        <div style={pageStyles.card}>
+          <h2 style={{ marginTop: 0 }}>Add Guard</h2>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+            <input style={pageStyles.input} value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Full name" />
+            <input style={pageStyles.input} value={newPhone} onChange={(e) => setNewPhone(e.target.value)} placeholder="Phone number" />
+            <input style={pageStyles.input} value={newPin} onChange={(e) => setNewPin(e.target.value)} placeholder="PIN" maxLength={6} />
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <button style={pageStyles.button} onClick={handleAddGuard}>Save Guard</button>
+          </div>
         </div>
       )}
+
+      <div style={pageStyles.card}>
+        <h2 style={{ marginTop: 0 }}>Guards</h2>
+        {loading ? (
+          <p style={{ color: '#8b8b8b' }}>Loading guards...</p>
+        ) : guards.length === 0 ? (
+          <p style={{ color: '#8b8b8b' }}>No guards available yet.</p>
+        ) : (
+          <div style={{ display: 'grid', gap: 12 }}>
+            {guards.map((guard) => (
+              <div key={guard.id} style={{ border: '1px solid #1f1f1f', borderRadius: 12, padding: 14, background: '#111' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'start', flexWrap: 'wrap' }}>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: 16 }}>{guard.full_name}</div>
+                    <div style={{ color: '#8b8b8b', fontSize: 13, marginTop: 4 }}>{guard.phone || 'No phone saved'}</div>
+                    <div style={{ color: '#fca5a5', fontSize: 13, marginTop: 6 }}>PIN: {guard.pin || guard.guard_pin || '1234'}</div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button style={pageStyles.subtleButton} onClick={() => handlePinUpdate(guard.id, prompt('New guard PIN', guard.pin || guard.guard_pin || '1234') || guard.pin)}>
+                      Change PIN
+                    </button>
+                    <button style={pageStyles.subtleButton} onClick={() => handleToggle(guard.id, guard.is_active)}>
+                      {guard.is_active === false ? 'Activate' : 'Deactivate'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

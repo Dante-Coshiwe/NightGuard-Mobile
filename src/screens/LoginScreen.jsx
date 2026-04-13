@@ -1,45 +1,32 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { getGuardsBySite } from '../services/api';
+import { getLookupData } from '../lib/deviceStore';
 import './screens.css';
 
-const SITE_ID = import.meta.env.VITE_SITE_ID;
-
 export default function LoginScreen() {
-  const [mode, setMode] = useState('select'); // 'select', 'admin', 'guard'
+  const [mode, setMode] = useState('select');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [guards, setGuards] = useState([]);
   const [selectedGuard, setSelectedGuard] = useState('');
+  const [selectedShift, setSelectedShift] = useState('');
   const [pin, setPin] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const { login, guardLogin } = useAuth();
+  const { login, startShiftLogin, loadGuards, guards } = useAuth();
   const navigate = useNavigate();
 
-  const loadGuards = async () => {
-    // Try cache first if offline
-    if (!navigator.onLine) {
-      const cached = localStorage.getItem('nightguard_cached_guards');
-      if (cached) { setGuards(JSON.parse(cached)); setMode('guard'); return; }
-      setError('No internet and no cached guard list'); return;
-    }
+  const lookupData = useMemo(() => getLookupData(), []);
+
+  const handleLoadShiftMode = async () => {
     setLoading(true);
+    setError('');
     try {
-      const data = await getGuardsBySite(SITE_ID);
-      setGuards(data);
-      localStorage.setItem('nightguard_cached_guards', JSON.stringify(data));
-      setMode('guard');
+      await loadGuards();
+      setMode('shift');
+      setSelectedShift(lookupData.shiftOptions[0] || 'Day Shift');
     } catch (err) {
-      // Server unreachable - fall back to cache
-      const cached = localStorage.getItem('nightguard_cached_guards');
-      if (cached) {
-        setGuards(JSON.parse(cached));
-        setMode('guard');
-      } else {
-        setError('Cannot reach server and no cached data. Connect to internet first.');
-      }
+      setError('Unable to load guards for this site');
     } finally {
       setLoading(false);
     }
@@ -47,32 +34,45 @@ export default function LoginScreen() {
 
   const handleAdminLogin = async (e) => {
     e.preventDefault();
-    setError('');
     setLoading(true);
+    setError('');
     try {
-      const user = await login(email, password);
+      await login(email, password);
       navigate('/');
     } catch (err) {
-      if (!navigator.onLine || err.message?.includes('Network')) {
-        setError('No internet connection. Guard login available offline if previously logged in.');
-      } else {
-        setError('Invalid email or password');
-      }
+      setError(err.message || 'Invalid email or password');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleGuardLogin = async () => {
-    if (!selectedGuard) { setError('Please select your name'); return; }
-    if (!pin) { setError('Please enter your PIN'); return; }
-    setError('');
+  const handleShiftLogin = async (e) => {
+    e.preventDefault();
+    if (!selectedShift) {
+      setError('Please select a shift');
+      return;
+    }
+    if (!selectedGuard) {
+      setError('Please select the active guard');
+      return;
+    }
+    if (!pin.trim()) {
+      setError('Please enter the guard PIN');
+      return;
+    }
+
     setLoading(true);
+    setError('');
+
     try {
-      await guardLogin(selectedGuard, pin);
+      await startShiftLogin({
+        guardId: selectedGuard,
+        pin,
+        shiftLabel: selectedShift,
+      });
       navigate('/');
     } catch (err) {
-      setError(err.response?.data?.error || 'Invalid PIN');
+      setError(err.response?.data?.error || err.message || 'Unable to start shift');
     } finally {
       setLoading(false);
     }
@@ -81,74 +81,91 @@ export default function LoginScreen() {
   return (
     <div className="login-container">
       <div className="login-inner">
-        <div style={{ textAlign: 'center', marginBottom: 24 }}>
-          <div style={{ width: 56, height: 56, background: '#dc2626', borderRadius: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 12px', fontSize: 28 }}></div>
-          <h1 style={{ color: '#fff', margin: 0, fontSize: 22, fontWeight: 600 }}>NightGuard</h1>
-          <p style={{ color: '#666', margin: '6px 0 0', fontSize: 14 }}>Security Management</p>
+        <div className="login-brand">
+          <div className="login-brand-mark">NG</div>
+          <h1 className="login-brand-title">NightGuard</h1>
+          <p className="login-brand-copy">Secure site logging, patrol tracking, and shift-based access.</p>
         </div>
 
-        {error && <div style={{ background: '#2a1515', border: '1px solid #5a2020', borderRadius: 8, padding: '10px 12px', color: '#ff6b6b', fontSize: 13, marginBottom: 16 }}>{error}</div>}
+        {error && <div className="status-banner error">{error}</div>}
 
-        {/* Mode Selection */}
         {mode === 'select' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            <button onClick={() => setMode('admin')}
-              style={{ width: '100%', padding: 14, background: '#dc2626', color: '#fff', border: 'none', borderRadius: 8, fontSize: 15, fontWeight: 600, cursor: 'pointer' }}>
-              Admin Login
+          <div className="login-stack">
+            <button className="button-submit primary" onClick={handleLoadShiftMode} disabled={loading}>
+              {loading ? 'Loading guards...' : 'Shift Login'}
             </button>
-            <button onClick={loadGuards} disabled={loading}
-              style={{ width: '100%', padding: 14, background: '#1a1a1a', color: '#fff', border: '1px solid #333', borderRadius: 8, fontSize: 15, fontWeight: 600, cursor: 'pointer' }}>
-              {loading ? 'Loading...' : 'Guard Login'}
+            <button className="button-submit" onClick={() => setMode('admin')} disabled={loading}>
+              Admin Login
             </button>
           </div>
         )}
 
-        {/* Admin Login */}
         {mode === 'admin' && (
-          <form onSubmit={handleAdminLogin}>
-            <div style={{ marginBottom: 16 }}>
-              <label style={{ color: '#999', fontSize: 13, display: 'block', marginBottom: 6 }}>Email</label>
-              <input type="email" value={email} onChange={e => setEmail(e.target.value)} required
-                style={{ width: '100%', padding: '10px 12px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, color: '#fff', fontSize: 14, boxSizing: 'border-box' }} />
+          <form onSubmit={handleAdminLogin} className="login-stack">
+            <div>
+              <label className="login-label">Email</label>
+              <input className="form-input" type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
             </div>
-            <div style={{ marginBottom: 24 }}>
-              <label style={{ color: '#999', fontSize: 13, display: 'block', marginBottom: 6 }}>Password</label>
-              <input type="password" value={password} onChange={e => setPassword(e.target.value)} required
-                style={{ width: '100%', padding: '10px 12px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, color: '#fff', fontSize: 14, boxSizing: 'border-box' }} />
+            <div>
+              <label className="login-label">Password</label>
+              <input className="form-input" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
             </div>
-            <button type="submit" disabled={loading}
-              style={{ width: '100%', padding: 12, background: '#dc2626', color: '#fff', border: 'none', borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
+            <button className="button-submit primary" type="submit" disabled={loading}>
               {loading ? 'Signing in...' : 'Sign In'}
             </button>
-            <button type="button" onClick={() => { setMode('select'); setError(''); }}
-              style={{ width: '100%', padding: 10, background: 'none', border: 'none', color: '#666', fontSize: 13, cursor: 'pointer', marginTop: 8 }}>
-              ? Back
+            <button className="button-text" type="button" onClick={() => { setMode('select'); setError(''); }}>
+              Back
             </button>
           </form>
         )}
 
-        {/* Guard Login */}
-        {mode === 'guard' && (
-          <div>
-            <label style={{ color: '#999', fontSize: 13, display: 'block', marginBottom: 6 }}>Select Your Name</label>
-            <select value={selectedGuard} onChange={e => setSelectedGuard(e.target.value)}
-              style={{ width: '100%', padding: '10px 12px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, color: '#fff', fontSize: 14, marginBottom: 16, boxSizing: 'border-box' }}>
-              <option value="">-- Select Guard --</option>
-              {guards.map(g => <option key={g.id} value={g.id}>{g.full_name}</option>)}
-            </select>
-            <label style={{ color: '#999', fontSize: 13, display: 'block', marginBottom: 6 }}>PIN</label>
-            <input type="password" value={pin} onChange={e => setPin(e.target.value)} placeholder="Enter PIN"
-              style={{ width: '100%', padding: '10px 12px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, color: '#fff', fontSize: 14, marginBottom: 24, boxSizing: 'border-box' }}
-              inputMode="numeric" maxLength={6} />
-            <button onClick={handleGuardLogin} disabled={loading}
-              style={{ width: '100%', padding: 12, background: '#dc2626', color: '#fff', border: 'none', borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
-              {loading ? 'Logging in...' : 'Start Shift & Login'}
+        {mode === 'shift' && (
+          <form onSubmit={handleShiftLogin} className="login-stack">
+            <div className="status-banner neutral">
+              All guards use the same device. Start the shift once, then switch guards quickly from the home screen.
+            </div>
+
+            <div>
+              <label className="login-label">Shift</label>
+              <select className="form-input" value={selectedShift} onChange={(e) => setSelectedShift(e.target.value)}>
+                {lookupData.shiftOptions.map((shift) => (
+                  <option key={shift} value={shift}>{shift}</option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="login-label">Active Guard</label>
+              <select className="form-input" value={selectedGuard} onChange={(e) => setSelectedGuard(e.target.value)}>
+                <option value="">Select guard</option>
+                {guards.map((guard) => (
+                  <option key={guard.id} value={guard.id}>
+                    {guard.full_name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="login-label">Guard PIN</label>
+              <input
+                className="form-input"
+                type="password"
+                value={pin}
+                onChange={(e) => setPin(e.target.value)}
+                inputMode="numeric"
+                maxLength={6}
+                placeholder="Enter PIN"
+              />
+            </div>
+
+            <button className="button-submit primary" type="submit" disabled={loading}>
+              {loading ? 'Starting shift...' : 'Start Shift'}
             </button>
-            <button type="button" onClick={() => { setMode('select'); setError(''); setPin(''); setSelectedGuard(''); }}
-              style={{ width: '100%', padding: 10, background: 'none', border: 'none', color: '#666', fontSize: 13, cursor: 'pointer', marginTop: 8 }}>
-              ? Back
+            <button className="button-text" type="button" onClick={() => { setMode('select'); setError(''); }}>
+              Back
             </button>
-          </div>
+          </form>
         )}
       </div>
     </div>

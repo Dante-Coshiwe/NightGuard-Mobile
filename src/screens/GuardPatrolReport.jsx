@@ -3,6 +3,7 @@ import api from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import jsPDF from 'jspdf';
 import 'jspdf-autotable';
+import { getNfcScans } from '../lib/deviceStore';
 
 export default function GuardPatrolDashboard() {
   const { user } = useAuth();
@@ -20,12 +21,24 @@ export default function GuardPatrolDashboard() {
 
   const loadData = async () => {
     setLoading(true);
+    setError('');
     try {
-      const data = await api.get('/patrols/summary').then(res => res.data);
-      setPatrols(data || []);
-      setCheckpoints([]);
+      const [summary, scans] = await Promise.all([
+        api.get('/patrols/summary').then(res => res.data).catch(() => []),
+        api.get('/nfc/scans').then(res => res.data).catch(() => getNfcScans()),
+      ]);
+      setPatrols(summary || []);
+      setCheckpoints((scans || []).map(scan => ({
+        ...scan,
+        scanned: scan.scanned !== false,
+        status: scan.status || 'scanned',
+        checkpoint_name: scan.checkpoint_name || scan.point_name,
+        guard_name: scan.guard_name || scan.full_name,
+      })));
     } catch (err) {
-      setError('Failed to load patrol data');
+      setPatrols([]);
+      setCheckpoints(getNfcScans());
+      setError('Showing saved patrol scans from this device');
     } finally {
       setLoading(false);
     }

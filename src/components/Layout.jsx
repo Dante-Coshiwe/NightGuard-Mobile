@@ -1,12 +1,13 @@
 import React, { useState } from 'react';
 import Sidebar from './Sidebar';
 import OfflineBanner from './OfflineBanner';
-<OfflineBanner />
+
 const Layout = ({ children }) => {
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh' }}>
+    <div style={{ display: 'flex', minHeight: '100vh', backgroundColor: '#000' }}>
+      <OfflineBanner />
       <Sidebar isOpen={sidebarOpen} toggleSidebar={() => setSidebarOpen(!sidebarOpen)} />
       <main
         style={{
