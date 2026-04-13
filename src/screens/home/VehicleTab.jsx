@@ -28,8 +28,7 @@ export default function VehicleTab() {
       setLoading(true);
       try {
         const response = await api.get('/vehicles/recent');
-
-        const mapped = response.data.map(v => ({
+        const serverData = response.data.map(v => ({
           id: v.id,
           licensePlate: v.license_plate,
           makeModel: v.vehicle_make || v.vehicle_type,
@@ -40,34 +39,51 @@ export default function VehicleTab() {
           hasLeft: !!v.exited_at,
         }));
 
-        setVehicles(mapped);
-        localStorage.setItem('cached_vehicles', JSON.stringify(mapped));
+        const cached = localStorage.getItem('cached_vehicles');
+        let merged = serverData;
+        if (cached) {
+          const cachedData = JSON.parse(cached);
+          // Keep offline entries that are not yet on server (by ID)
+          const offlinePending = cachedData.filter(c => c._offline && !serverData.some(s => s.id === c.id));
+          // Also keep entries that were just synced but maybe not yet in serverData? Actually serverData should have them.
+          merged = [...serverData, ...offlinePending];
+        }
 
+        // Deduplicate by ID (keep first occurrence, which is server if conflict)
+        const unique = Array.from(new Map(merged.map(item => [item.id, item])).values());
+
+        setVehicles(unique);
+        localStorage.setItem('cached_vehicles', JSON.stringify(unique));
       } catch (err) {
-        // ✅ Always fall back to cache (offline OR 401 OR server error)
         const cached = localStorage.getItem('cached_vehicles');
         if (cached) {
-          setVehicles(JSON.parse(cached));
+          const parsed = JSON.parse(cached);
+          const unique = Array.from(new Map(parsed.map(item => [item.id, item])).values());
+          setVehicles(unique);
         }
       } finally {
         setLoading(false);
       }
     };
-
     loadVehicles();
   }, []);
 
   const handleMarkExit = async (id) => {
-    if (id.startsWith('offline_')) {
-      setVehicles(prev => prev.map(v =>
-        v.id === id ? { ...v, hasLeft: true, exitedAt: new Date().toISOString() } : v
-      ));
-      return;
-    }
+    const updateAndCache = (updater) => {
+      setVehicles(prev => {
+        const updated = updater(prev);
+        localStorage.setItem('cached_vehicles', JSON.stringify(updated));
+        return updated;
+      });
+    };
 
-    if (!navigator.onLine) {
-      addToQueue('patch', `/vehicles/${id}/exit`, {});
-      setVehicles(prev => prev.map(v =>
+    const isTempId = id.startsWith('offline_') || id.startsWith('temp_');
+
+    if (!navigator.onLine || isTempId) {
+      if (!isTempId) {
+        addToQueue('patch', `/vehicles/${id}/exit`, {});
+      }
+      updateAndCache(prev => prev.map(v =>
         v.id === id ? { ...v, hasLeft: true, exitedAt: new Date().toISOString() } : v
       ));
       return;
@@ -75,11 +91,14 @@ export default function VehicleTab() {
 
     try {
       await markVehicleExit(id);
-      setVehicles(prev => prev.map(v =>
+      updateAndCache(prev => prev.map(v =>
         v.id === id ? { ...v, hasLeft: true, exitedAt: new Date().toISOString() } : v
       ));
     } catch (err) {
       console.error('Failed to mark exit:', err);
+      updateAndCache(prev => prev.map(v =>
+        v.id === id ? { ...v, hasLeft: true, exitedAt: new Date().toISOString() } : v
+      ));
     }
   };
 
@@ -95,60 +114,59 @@ export default function VehicleTab() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!validateForm()) return;
-    setError("");
+    setError('');
     setSubmitting(true);
-    try {
 
-      const response = await post('/vehicles/entry', {
-        license_plate: licensePlate,
-        vehicle_make: makeModel,
-        vehicle_color: colour,
-        driver_name: driverName,
-        driver_contact: contact,
-        visiting_unit: personVisiting,
-        vehicle_type: visitorType,
+    const payload = {
+      license_plate: licensePlate,
+      vehicle_make: makeModel,
+      vehicle_color: colour,
+      driver_name: driverName,
+      contact_number: contact,
+      visiting_unit: personVisiting,
+      visitor_type: visitorType,
+    };
+
+    try {
+      const response = await post('/vehicles/entry', payload);
+
+      const newEntry = response && typeof response === 'object' ? response : {
+        ...payload,
+        id: `temp_${Date.now()}`,
+        entered_at: new Date().toISOString(),
+        _offline: true,
+      };
+
+      const localEntry = {
+        id: newEntry.id,
+        licensePlate: newEntry.license_plate || payload.license_plate,
+        makeModel: newEntry.vehicle_make || payload.vehicle_make,
+        driverName: newEntry.driver_name || payload.driver_name,
+        colour: newEntry.vehicle_color || payload.vehicle_color,
+        contact: newEntry.contact_number || payload.contact_number,
+        personVisiting: newEntry.visiting_unit || payload.visiting_unit,
+        visitorType: newEntry.visitor_type || payload.visitor_type,
+        entryTime: newEntry.entered_at || new Date().toISOString(),
+        exitTime: null,
+        hasLeft: false,
+        _offline: newEntry._offline || false,
+      };
+
+      setVehicles(prev => {
+        const updated = [localEntry, ...prev];
+        localStorage.setItem('cached_vehicles', JSON.stringify(updated));
+        return updated;
       });
 
-      // Handle offline response:
-      if (response._offline) {
-        setVehicles([{
-          id: response.id,
-          licensePlate,
-          makeModel,
-          colour,
-          driverName,
-          contact,
-          personVisiting,
-          visitorType,
-          entryTime: new Date().toISOString(),
-          exitTime: null,
-          hasLeft: false,
-          _offline: true,
-        }, ...vehicles]);
+      setLicensePlate(''); setMakeModel(''); setColour('');
+      setDriverName(''); setContact(''); setPersonVisiting('');
+      setVisitorType('Visitor');
+      setShowForm(false);
+      setVehicleErrors({});
 
-        setShowForm(false);
-        setLicensePlate('');
-        setMakeModel('');
-        setColour('');
-        setDriverName('');
-        setContact('');
-        setPersonVisiting('');
-        return;
-      }
-
-      setVehicles([{
-        id: response.data.id,
-        licensePlate: response.data.license_plate,
-        makeModel: response.data.vehicle_make,
-        driverName: response.data.driver_name,
-        colour: response.data.vehicle_color,
-        enteredAt: response.data.entered_at,
-      }, ...vehicles]);
-      setLicensePlate(""); setMakeModel(""); setColour("");
-      setDriverName(""); setContact(""); setVisitorType("Visitor");
-      setPersonVisiting(""); setShowForm(false); setVehicleErrors({});
     } catch (err) {
-      setError(err.response?.data?.error || "Failed to register vehicle");
+      console.error('Submit error:', err);
+      setError(err.response?.data?.error || err.message || 'Failed to register vehicle');
     } finally {
       setSubmitting(false);
     }

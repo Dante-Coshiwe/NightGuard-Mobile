@@ -22,52 +22,29 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
-    const originalRequest = error.config;
-
-    // If 401 and not already retrying
-    if (error.response?.status === 401 && !originalRequest._retry) {
-      originalRequest._retry = true;
-
-      try {
-        const refreshToken = localStorage.getItem('refresh_token');
-
-        // No refresh token available - logout
-        if (!refreshToken) {
-          localStorage.removeItem('token');
-          localStorage.removeItem('refresh_token');
-          window.location.href = '/login';
-          return Promise.reject(error);
-        }
-
-        // Attempt to refresh session
-        const { data } = await supabase.auth.refreshSession({
-          refresh_token: refreshToken
-        });
-
-        if (data?.session) {
-          // Save new tokens
-          localStorage.setItem('token', data.session.access_token);
-          localStorage.setItem('refresh_token', data.session.refresh_token);
-
-          // Update the failed request with new token and retry
-          originalRequest.headers.Authorization = `Bearer ${data.session.access_token}`;
-          return api(originalRequest);
-        }
-      } catch (refreshError) {
-        console.error('Token refresh failed:', refreshError);
-
-        // Clear all auth data and redirect to login
-        localStorage.removeItem('token');
-        localStorage.removeItem('refresh_token');
-        localStorage.removeItem('cached_user');
-        window.location.href = '/login';
-        return Promise.reject(refreshError);
-      }
+    // If we're offline, don't attempt refresh – just reject
+    if (!navigator.onLine) {
+      return Promise.reject(error);
     }
 
+    if (error.response?.status === 401 && !error.config._retry) {
+      error.config._retry = true;
+      try {
+        const { data } = await supabase.auth.refreshSession();
+        if (data?.session) {
+          const newToken = data.session.access_token;
+          localStorage.setItem('token', newToken);
+          error.config.headers.Authorization = `Bearer ${newToken}`;
+          return api(error.config);
+        }
+      } catch (refreshErr) {
+        console.error('Refresh failed:', refreshErr);
+      }
+    }
     return Promise.reject(error);
   }
 );
+
 // Auth
 export const login = (credentials) => api.post('/auth/login', credentials);
 export const logout = () => api.post('/auth/logout');

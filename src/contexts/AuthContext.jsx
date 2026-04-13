@@ -29,29 +29,42 @@ export const AuthProvider = ({ children }) => {
   useEffect(() => {
     const token = localStorage.getItem("token");
     if (token) {
-      if (navigator.onLine) {
-        getCurrentUser().then(response => {
-          setUser(response.data);
-          localStorage.setItem(CACHED_USER_KEY, JSON.stringify(response.data));
-          scheduleTokenRefresh();
-          setLoading(false);
-        }).catch(() => {
-          const cached = localStorage.getItem(CACHED_USER_KEY);
-          if (cached) setUser(JSON.parse(cached));
-          else localStorage.removeItem("token");
-          setLoading(false);
-        });
-      } else {
+      // If offline, immediately use cached user – don't try /auth/me
+      if (!navigator.onLine) {
         const cached = localStorage.getItem(CACHED_USER_KEY);
-        if (cached) setUser(JSON.parse(cached));
-        else localStorage.removeItem("token");
+        if (cached) {
+          setUser(JSON.parse(cached));
+        } else {
+          // No cache? Clear token and proceed as logged out
+          localStorage.removeItem("token");
+        }
         setLoading(false);
+        return;
       }
+
+      // Online: verify token with server
+      getCurrentUser().then(response => {
+        setUser(response.data);
+        localStorage.setItem(CACHED_USER_KEY, JSON.stringify(response.data));
+        scheduleTokenRefresh();
+        setLoading(false);
+      }).catch(() => {
+        // Server error – fall back to cache
+        const cached = localStorage.getItem(CACHED_USER_KEY);
+        if (cached) {
+          setUser(JSON.parse(cached));
+        } else {
+          localStorage.removeItem("token");
+        }
+        setLoading(false);
+      });
     } else {
       setLoading(false);
     }
 
-    return () => { if (refreshTimer.current) clearTimeout(refreshTimer.current); };
+    return () => {
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+    };
   }, []);
 
   const login = async (email, password) => {

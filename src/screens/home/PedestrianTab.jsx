@@ -23,64 +23,90 @@ export default function PedestrianTab() {
   const { addToQueue } = useOfflineQueue();
 
   useEffect(() => {
+    const loadPedestrians = async () => {
+      setLoading(true);
+      try {
+        const response = await api.get('/pedestrians/recent');
+        const serverData = response.data.map(p => ({
+          id: p.id,
+          name: p.full_name,
+          contact: p.contact_number,
+          visitorType: p.purpose_of_visit,
+          unitVisiting: p.visiting_unit,
+          entryTime: p.entry_time,
+          exitTime: p.exit_time,
+          hasLeft: !!p.exit_time,
+        }));
+
+        const cached = localStorage.getItem('cached_pedestrians');
+        let merged = serverData;
+        if (cached) {
+          const cachedData = JSON.parse(cached);
+          // Keep offline entries that are not yet on server (by ID)
+          const offlinePending = cachedData.filter(c => c._offline && !serverData.some(s => s.id === c.id));
+          // Also keep entries that were just synced but maybe not yet in serverData? Actually serverData should have them.
+          merged = [...serverData, ...offlinePending];
+        }
+
+        // Deduplicate by ID (keep first occurrence, which is server if conflict)
+        const unique = Array.from(new Map(merged.map(item => [item.id, item])).values());
+
+        setPedestrians(unique);
+        localStorage.setItem('cached_pedestrians', JSON.stringify(unique));
+      } catch (err) {
+        const cached = localStorage.getItem('cached_pedestrians');
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          const unique = Array.from(new Map(parsed.map(item => [item.id, item])).values());
+          setPedestrians(unique);
+        }
+      } finally {
+        setLoading(false);
+      }
+    };
+
     loadPedestrians();
     const handleSync = () => loadPedestrians();
     window.addEventListener('nightguard_sync_complete', handleSync);
     return () => window.removeEventListener('nightguard_sync_complete', handleSync);
   }, []);
 
-  const loadPedestrians = async () => {
-    setLoading(true);
-    try {
-      const response = await api.get('/pedestrians/recent');
-      const mapped = response.data.map(p => ({
-        id: p.id,
-        name: p.full_name,
-        contact: p.contact_number,
-        visitorType: p.purpose_of_visit,
-        unitVisiting: p.visiting_unit,
-        entryTime: p.entry_time,
-        exitTime: p.exit_time,
-        hasLeft: !!p.exit_time,
-      }));
-      setPedestrians(mapped);
-      localStorage.setItem('cached_pedestrians', JSON.stringify(mapped));
-    } catch (err) {
-      // Always fall back to cache on any error including 401
-      const cached = localStorage.getItem('cached_pedestrians');
-      if (cached) {
-        setPedestrians(JSON.parse(cached));
-      }
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const handleMarkExit = async (id) => {
-    // If offline ID, just mark locally
-    if (id.startsWith('offline_')) {
-      setPedestrians(prev => prev.map(p =>
+    // Helper to update state and then sync cache
+    const updateAndCache = (updater) => {
+      setPedestrians(prev => {
+        const updated = updater(prev);
+        localStorage.setItem('cached_pedestrians', JSON.stringify(updated));
+        return updated;
+      });
+    };
+
+    const isTempId = id.startsWith('offline_') || id.startsWith('temp_');
+
+    // Offline or temp ID – just mark locally, no API call
+    if (!navigator.onLine || isTempId) {
+      if (!isTempId) {
+        // Real ID but offline: queue the exit request for later sync
+        addToQueue('patch', `/pedestrians/${id}/exit`, {});
+      }
+      updateAndCache(prev => prev.map(p =>
         p.id === id ? { ...p, hasLeft: true, exitTime: new Date().toISOString() } : p
       ));
       return;
     }
 
-    if (!navigator.onLine) {
-      // Queue the exit and mark locally
-      addToQueue('patch', `/pedestrians/${id}/exit`, {});
-      setPedestrians(prev => prev.map(p =>
-        p.id === id ? { ...p, hasLeft: true, exitTime: new Date().toISOString() } : p
-      ));
-      return;
-    }
-
+    // Online + real ID: call API
     try {
       await markPedestrianExit(id);
-      setPedestrians(prev => prev.map(p =>
+      updateAndCache(prev => prev.map(p =>
         p.id === id ? { ...p, hasLeft: true, exitTime: new Date().toISOString() } : p
       ));
     } catch (err) {
       console.error('Failed to mark exit:', err);
+      // Fallback: still mark locally if API fails
+      updateAndCache(prev => prev.map(p =>
+        p.id === id ? { ...p, hasLeft: true, exitTime: new Date().toISOString() } : p
+      ));
     }
   };
 
@@ -98,48 +124,52 @@ export default function PedestrianTab() {
     if (!validateForm()) return;
     setError('');
     setSubmitting(true);
+
+    const payload = {
+      full_name: name,
+      id_number: idNumber,
+      contact_number: contact,
+      visiting_unit: unitVisiting,
+      host_name: personVisited,
+      purpose_of_visit: visitorType,
+    };
+
     try {
-      const response = await post('/pedestrians/entry', {
-        full_name: name,
-        id_number: idNumber,
-        contact_number: contact,
-        visiting_unit: unitVisiting,
-        host_name: personVisited,
-        purpose_of_visit: visitorType,
-      });
+      const response = await post('/pedestrians/entry', payload);
 
-      //offline response
-      if (response._offline) {
-        setPedestrians([{
-          id: response.id,
-          name,
-          contact,
-          visitorType,
-          unitVisiting,
-          entryTime: new Date().toISOString(),
-          exitTime: null,
-          hasLeft: false,
-          _offline: true,
-        }, ...pedestrians]);
-        setShowForm(false);
-        setName(''); setContact(''); setUnitVisiting('');
-        return;
-      }
+      const newEntry = response && typeof response === 'object' ? response : {
+        ...payload,
+        id: `temp_${Date.now()}`,
+        entry_time: new Date().toISOString(),
+        _offline: true,
+      };
 
-      setPedestrians([{
-        id: response.data.id,
-        name: response.data.full_name,
-        contact: response.data.contact_number,
-        visitorType: response.data.purpose_of_visit,
-        unitVisiting: response.data.visiting_unit,
-        entryTime: response.data.entry_time,
+      const localEntry = {
+        id: newEntry.id,
+        name: newEntry.full_name || payload.full_name,
+        contact: newEntry.contact_number || payload.contact_number,
+        visitorType: newEntry.purpose_of_visit || payload.purpose_of_visit,
+        unitVisiting: newEntry.visiting_unit || payload.visiting_unit,
+        entryTime: newEntry.entry_time || new Date().toISOString(),
         exitTime: null,
         hasLeft: false,
-      }, ...pedestrians]);
+        _offline: newEntry._offline || false,
+      };
+
+      setPedestrians(prev => {
+        const updated = [localEntry, ...prev];
+        localStorage.setItem('cached_pedestrians', JSON.stringify(updated));
+        return updated;
+      });
+
+      // Reset form
       setName(''); setIdNumber(''); setContact('');
       setVisitorType('Visitor'); setUnitVisiting(''); setPersonVisited('');
-      setShowForm(false); setFormErrors({});
+      setShowForm(false);
+      setFormErrors({});
+
     } catch (err) {
+      console.error('Submit error:', err);
       setError(err.response?.data?.error || err.message || 'Failed to register');
     } finally {
       setSubmitting(false);
