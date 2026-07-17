@@ -1,11 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { Outlet, NavLink } from 'react-router-dom';
-import { Shield, Car, Footprints, AlertTriangle, BookOpen, Menu, X } from 'lucide-react';
+import { Shield, Car, Footprints, AlertTriangle, BookOpen, Menu, X, Bell } from 'lucide-react';
 import OfflineBanner from './OfflineBanner';
+import NotificationService from '../services/notificationService';
 
 export default function BottomTabLayout() {
   const [isMobile, setIsMobile] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
 
   useEffect(() => {
     const checkMobile = () => {
@@ -20,12 +22,20 @@ export default function BottomTabLayout() {
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
 
+  useEffect(() => {
+    const refresh = () => NotificationService.getUnreadCount().then(setUnreadCount).catch(() => setUnreadCount(0));
+    refresh();
+    window.addEventListener('nightguard_notifications_updated', refresh);
+    return () => window.removeEventListener('nightguard_notifications_updated', refresh);
+  }, []);
+
   const navItems = [
     { to: '/patrols', label: 'Patrols', icon: Shield },
     { to: '/pedestrian', label: 'Person', icon: Footprints },
     { to: '/vehicle', label: 'Vehicle', icon: Car },
     { to: '/incident', label: 'Incident', icon: AlertTriangle },
     { to: '/obentry', label: 'OB', icon: BookOpen },
+    { to: '/notifications', label: 'Alerts', icon: Bell, badge: unreadCount },
   ];
 
   return (
@@ -34,8 +44,8 @@ export default function BottomTabLayout() {
 
       {isMobile && sidebarOpen && <div style={styles.overlay} onClick={() => setSidebarOpen(false)} />}
 
-      {isMobile && (
-        <div style={{ ...styles.mobileSidebar, transform: sidebarOpen ? 'translateX(0)' : 'translateX(-100%)' }}>
+      {isMobile && sidebarOpen && (
+        <div style={styles.mobileSidebar}>
           <div style={styles.sidebarHeader}>
             <h3 style={styles.sidebarTitle}>Navigation</h3>
             <button onClick={() => setSidebarOpen(false)} style={styles.closeButton}>
@@ -55,6 +65,7 @@ export default function BottomTabLayout() {
               >
                 <item.icon size={20} />
                 <span>{item.label}</span>
+                {item.badge > 0 && <span style={styles.badge}>{item.badge}</span>}
               </NavLink>
             ))}
           </div>
@@ -77,7 +88,7 @@ export default function BottomTabLayout() {
       </div>
 
       {!isMobile && (
-        <div style={styles.tabBar}>
+        <div className="bottom-tab-bar" style={styles.tabBar}>
           {navItems.map((item) => (
             <NavLink
               key={item.to}
@@ -88,6 +99,7 @@ export default function BottomTabLayout() {
               })}
             >
               <item.icon size={24} />
+              {item.badge > 0 && <span style={styles.tabBadge}>{item.badge}</span>}
               <span style={styles.tabLabel}>{item.label}</span>
             </NavLink>
           ))}
@@ -101,7 +113,7 @@ const styles = {
   container: {
     display: 'flex',
     flexDirection: 'column',
-    minHeight: '100vh',
+    minHeight: 'var(--app-viewport-height, 100dvh)',
     backgroundColor: '#000000',
   },
   mainContent: {
@@ -143,7 +155,7 @@ const styles = {
     maxWidth: '480px',
     margin: '0 auto',
     width: '100%',
-    paddingBottom: '90px',
+    paddingBottom: 'var(--bottom-nav-offset, 90px)',
   },
   overlay: {
     position: 'fixed',
@@ -156,11 +168,12 @@ const styles = {
     top: 0,
     left: 0,
     width: '280px',
-    height: '100vh',
+    height: 'var(--app-viewport-height, 100dvh)',
     backgroundColor: '#0a0a0a',
     borderRight: '1px solid #1f1f1f',
     zIndex: 300,
-    transition: 'transform 0.3s ease',
+    transition: 'none',
+    animation: 'none',
     display: 'flex',
     flexDirection: 'column',
   },
@@ -215,6 +228,7 @@ const styles = {
     zIndex: 9999,
   },
   tab: {
+    position: 'relative',
     display: 'flex',
     flexDirection: 'column',
     alignItems: 'center',
@@ -229,5 +243,27 @@ const styles = {
   tabLabel: {
     marginTop: '4px',
     fontSize: '12px',
+  },
+  badge: {
+    marginLeft: 'auto',
+    minWidth: 20,
+    padding: '2px 6px',
+    borderRadius: 999,
+    background: '#dc2626',
+    color: '#fff',
+    fontSize: 11,
+    textAlign: 'center',
+  },
+  tabBadge: {
+    position: 'absolute',
+    top: 4,
+    right: 8,
+    minWidth: 18,
+    padding: '1px 5px',
+    borderRadius: 999,
+    background: '#dc2626',
+    color: '#fff',
+    fontSize: 10,
+    textAlign: 'center',
   },
 };

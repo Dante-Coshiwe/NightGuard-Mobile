@@ -31,7 +31,7 @@ export default function PatrolDetailScreen() {
               <span
                 className={`checkpoint-status ${checkpoint.status === 'completed' ? 'completed' : ''}`}
               >
-                {checkpoint.status === 'completed' ? '✓ Completed' : '⏳ Pending'}
+                {checkpoint.status === 'completed' ? 'Completed' : 'Pending'}
               </span>
             </div>
           ))}

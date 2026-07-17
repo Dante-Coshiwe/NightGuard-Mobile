@@ -1,230 +1,435 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import api from '../../services/api';
-import { markPedestrianExit } from '../../services/api';
 import './home-styles.css';
 import { useOfflineApi } from '../../hooks/useOfflineApi';
-import { useOfflineQueue } from '../../hooks/useOfflineQueue';
+import { useScrollIntoView } from '../../hooks/useScrollIntoView';
+import { NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../../lib/connectivity';
+import {
+  getCachedPedestrians,
+  getCachedSiteSettings,
+  getLookupData,
+  getPreclearedPedestrians,
+  getShiftSession,
+  saveCachedPedestrians,
+  updateCachedPedestrian,
+} from '../../lib/deviceStore';
+import { useAuth } from '../../contexts/AuthContext';
+import { buildPendingPhoto, normaliseSelectedPhoto, uploadEntryPhoto } from '../../lib/photoCapture';
 
 export default function PedestrianTab() {
+  const { user, shiftSession } = useAuth();
+  const [lookupData, setLookupData] = useState(getLookupData());
   const [pedestrians, setPedestrians] = useState([]);
+  const [precleared, setPrecleared] = useState(getPreclearedPedestrians());
   const [showForm, setShowForm] = useState(false);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [searchInput, setSearchInput] = useState('');
   const [search, setSearch] = useState('');
-  const { post, isOnline } = useOfflineApi();
+  const [activeView, setActiveView] = useState('all');
+  const { post, patch, isOnline } = useOfflineApi();
+  const onFocus = useScrollIntoView();
+  const suppressCacheEvent = React.useRef(false);
   const [name, setName] = useState('');
   const [idNumber, setIdNumber] = useState('');
-  const [contact, setContact] = useState('');
-  const [visitorType, setVisitorType] = useState('Visitor');
+  const [visitorType, setVisitorType] = useState(lookupData.pedestrianTypes[0] || 'Visitor');
   const [unitVisiting, setUnitVisiting] = useState('');
-  const [personVisited, setPersonVisited] = useState('');
+  const [photo, setPhoto] = useState(null);
+  const [photoFile, setPhotoFile] = useState(null);
   const [formErrors, setFormErrors] = useState({});
   const [error, setError] = useState('');
-  const { addToQueue } = useOfflineQueue();
+
+  const PedestrianThumbnail = ({ photoUrl, label }) => (
+    <div className="entry-thumbnail" aria-label={`${label || 'Pedestrian'} photo`}>
+      {photoUrl ? (
+        <img src={photoUrl} alt="" loading="lazy" />
+      ) : (
+        <svg viewBox="0 0 40 40" role="img" aria-hidden="true">
+          <circle cx="20" cy="14" r="7" fill="#6b7280" />
+          <path d="M9 34c1.4-8 7-12 11-12s9.6 4 11 12" fill="#6b7280" />
+        </svg>
+      )}
+    </div>
+  );
+
+  const mergeWithCachedPendingExits = (serverData, cachedData) => {
+    const cachedById = new Map(cachedData.map((entry) => [String(entry.id), entry]));
+
+    const mergedServerRows = serverData.map((entry) => {
+      const cached = cachedById.get(String(entry.id));
+      if (!cached) return entry;
+      if ((cached._pendingExit || cached.hasLeft) && !entry.hasLeft) {
+        return {
+          ...entry,
+          hasLeft: true,
+          exitTime: cached.exitTime || new Date().toISOString(),
+          _offline: true,
+          _pendingExit: true,
+        };
+      }
+      return { ...entry, _offline: false, _pendingExit: false };
+    });
+
+    // ✅ Keep ALL cached entries not yet on server — includes temp IDs and
+    // recently confirmed entries that the server fetch may not have returned yet.
+    // Do NOT filter by _offline flag — a just-confirmed entry has _offline:false
+    // but a temp ID like "veh_..." that the server doesn't know about yet.
+    const offlinePending = cachedData.filter((entry) =>
+      !serverData.some((s) => String(s.id) === String(entry.id))
+    );
+
+    return [...mergedServerRows, ...offlinePending];
+  };
+
+  useEffect(() => {
+    const handleLookupUpdate = () => {
+      const next = getLookupData();
+      setLookupData(next);
+      setVisitorType((current) =>
+        next.pedestrianTypes.includes(current) ? current : next.pedestrianTypes[0] || 'Visitor'
+      );
+    };
+    window.addEventListener('nightguard_lookup_updated', handleLookupUpdate);
+    return () => window.removeEventListener('nightguard_lookup_updated', handleLookupUpdate);
+  }, []);
 
   useEffect(() => {
     const loadPedestrians = async () => {
-      setLoading(true);
+      const cached = getCachedPedestrians();
+      // NightGuard fix: hydrate cache before any network work so the tab renders instantly offline.
+      setPedestrians(cached);
+      setLoading(false);
+
+      if (!navigator.onLine) return;
+
+      // ✅ Always show cache immediately — guard never sees a blank screen
+      const freshCached = getCachedPedestrians();
+      if (freshCached.length > 0) {
+        setPedestrians(freshCached);
+      }
+
       try {
         const response = await api.get('/pedestrians/recent');
-        const serverData = response.data.map(p => ({
+        const serverData = response.data.map((p) => ({
           id: p.id,
           name: p.full_name,
           contact: p.contact_number,
           visitorType: p.purpose_of_visit,
           unitVisiting: p.visiting_unit,
+          hostName: p.host_name,
+          photoUrl: p.picture_url,
           entryTime: p.entry_time,
           exitTime: p.exit_time,
           hasLeft: !!p.exit_time,
+          isPrecleared: Boolean(p.is_precleared),
         }));
 
-        const cached = localStorage.getItem('cached_pedestrians');
-        let merged = serverData;
-        if (cached) {
-          const cachedData = JSON.parse(cached);
-          // Keep offline entries that are not yet on server (by ID)
-          const offlinePending = cachedData.filter(c => c._offline && !serverData.some(s => s.id === c.id));
-          // Also keep entries that were just synced but maybe not yet in serverData? Actually serverData should have them.
-          merged = [...serverData, ...offlinePending];
-        }
-
-        // Deduplicate by ID (keep first occurrence, which is server if conflict)
-        const unique = Array.from(new Map(merged.map(item => [item.id, item])).values());
-
-        setPedestrians(unique);
-        localStorage.setItem('cached_pedestrians', JSON.stringify(unique));
-      } catch (err) {
-        const cached = localStorage.getItem('cached_pedestrians');
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          const unique = Array.from(new Map(parsed.map(item => [item.id, item])).values());
-          setPedestrians(unique);
-        }
-      } finally {
-        setLoading(false);
+        const merged = mergeWithCachedPendingExits(serverData, getCachedPedestrians());
+        setPedestrians(merged);
+        saveCachedPedestrians(merged);
+      } catch {
+        // Already showing cache above — no extra action needed
+        // NightGuard fix: cache is truth; remote refresh failures stay silent for guards.
       }
     };
 
     loadPedestrians();
+
     const handleSync = () => loadPedestrians();
+    const handleCacheUpdate = () => {
+      if (suppressCacheEvent.current) return;
+      setPedestrians(getCachedPedestrians());
+    };
+    const handleOnline = () => {
+      console.log('[PedestrianTab] Coming online - reloading pedestrians from server');
+      loadPedestrians();
+    };
     window.addEventListener('nightguard_sync_complete', handleSync);
-    return () => window.removeEventListener('nightguard_sync_complete', handleSync);
+    window.addEventListener('nightguard_pedestrians_updated', handleCacheUpdate);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
+    return () => {
+      window.removeEventListener('nightguard_sync_complete', handleSync);
+      window.removeEventListener('nightguard_pedestrians_updated', handleCacheUpdate);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
+    };
   }, []);
 
+  useEffect(() => {
+    // NightGuard fix: debounce list filtering on slower guard devices.
+    const timer = setTimeout(() => setSearch(searchInput), 150);
+    return () => clearTimeout(timer);
+  }, [searchInput]);
+
   const handleMarkExit = async (id) => {
-    // Helper to update state and then sync cache
-    const updateAndCache = (updater) => {
-      setPedestrians(prev => {
-        const updated = updater(prev);
-        localStorage.setItem('cached_pedestrians', JSON.stringify(updated));
-        return updated;
-      });
-    };
+    const isTempId =
+      String(id).startsWith('offline_') ||
+      String(id).startsWith('temp_') ||
+      String(id).startsWith('ped_');
+    const exitTime = new Date().toISOString();
 
-    const isTempId = id.startsWith('offline_') || id.startsWith('temp_');
+    // ✅ Optimistic UI — guard sees exit immediately
+    setPedestrians((prev) =>
+      prev.map((p) =>
+        String(p.id) === String(id)
+          ? { ...p, hasLeft: true, exitTime, _offline: true, _pendingExit: true }
+          : p
+      )
+    );
 
-    // Offline or temp ID – just mark locally, no API call
-    if (!navigator.onLine || isTempId) {
-      if (!isTempId) {
-        // Real ID but offline: queue the exit request for later sync
-        addToQueue('patch', `/pedestrians/${id}/exit`, {});
-      }
-      updateAndCache(prev => prev.map(p =>
-        p.id === id ? { ...p, hasLeft: true, exitTime: new Date().toISOString() } : p
-      ));
-      return;
-    }
-
-    // Online + real ID: call API
     try {
-      await markPedestrianExit(id);
-      updateAndCache(prev => prev.map(p =>
-        p.id === id ? { ...p, hasLeft: true, exitTime: new Date().toISOString() } : p
-      ));
-    } catch (err) {
-      console.error('Failed to mark exit:', err);
-      // Fallback: still mark locally if API fails
-      updateAndCache(prev => prev.map(p =>
-        p.id === id ? { ...p, hasLeft: true, exitTime: new Date().toISOString() } : p
-      ));
+      const result = await patch(`/pedestrians/${id}/exit`, {}, {
+        clientTempId: `ped_exit_${id}`,
+        offlineResponse: { exit_time: exitTime, _offline: true },
+        forceQueue: isTempId,
+      });
+
+      const finalExitTime = result?.exit_time || exitTime;
+      const isOffline = Boolean(result?._offline);
+
+      suppressCacheEvent.current = true;
+      updateCachedPedestrian(id, {
+        hasLeft: true,
+        exitTime: finalExitTime,
+        _offline: isOffline,
+        _pendingExit: isOffline,
+      });
+      setPedestrians((prev) =>
+        prev.map((p) =>
+          String(p.id) === String(id)
+            ? { ...p, hasLeft: true, exitTime: finalExitTime, _offline: isOffline, _pendingExit: isOffline }
+            : p
+        )
+      );
+      suppressCacheEvent.current = false;
+    } catch {
+      suppressCacheEvent.current = true;
+      updateCachedPedestrian(id, {
+        hasLeft: true,
+        exitTime,
+        _offline: true,
+        _pendingExit: true,
+      });
+      suppressCacheEvent.current = false;
     }
   };
 
   const validateForm = () => {
     const errors = {};
     if (!name.trim()) errors.name = 'Name is required';
-    if (!contact.trim()) errors.contact = 'Contact is required';
-    if (!unitVisiting.trim()) errors.unitVisiting = 'Unit Visiting is required';
+    if (!unitVisiting.trim()) errors.unitVisiting = 'Unit visiting is required';
+    if (!visitorType) errors.visitorType = 'Visitor type is required';
+    if (!photoFile && !photo) errors.photo = 'A photo is required';
     setFormErrors(errors);
     return Object.keys(errors).length === 0;
+  };
+
+  const handlePhotoSelect = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    normaliseSelectedPhoto(file).then((selectedPhoto) => {
+      setPhotoFile(selectedPhoto);
+      setPhoto(selectedPhoto.dataUrl);
+    }).catch(() => setError('Could not load the selected photo'));
+  };
+
+  const openPhotoPicker = (inputId) => {
+    document.getElementById(inputId)?.click();
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!validateForm()) return;
+
     setError('');
     setSubmitting(true);
 
+    const tempId = `ped_${Date.now()}`;
+    const siteId = getCachedSiteSettings().id || null;
+    let pictureUrl = null;
+    try {
+      pictureUrl = navigator.onLine && photoFile
+        ? await uploadEntryPhoto({ photo: photoFile, type: 'pedestrians', tempId, siteId })
+        : null;
+    } catch (err) {
+      console.warn('[PedestrianTab] Photo upload failed, continuing without photo:', err.message);
+      pictureUrl = null; // continue without photo
+    }
+
+    // Offline (or a failed online upload): carry the photo through the offline queue so it
+    // uploads on sync. Without this the picture is lost the moment the entry syncs.
+    const pendingPhoto = !pictureUrl ? buildPendingPhoto(photoFile) : null;
+
     const payload = {
+      site_id: siteId,
+      shift_id: shiftSession?.id || getShiftSession()?.id || null,
+      guard_id: user?.id || null,
       full_name: name,
       id_number: idNumber,
-      contact_number: contact,
+      contact_number: null,
       visiting_unit: unitVisiting,
-      host_name: personVisited,
+      host_name: '',
       purpose_of_visit: visitorType,
+      is_precleared: false,
+      picture_url: pictureUrl,
+      ...(pendingPhoto ? { _pendingPhoto: pendingPhoto } : {}),
     };
 
+    // ✅ Build local entry FIRST — before any async call
+    const localEntry = {
+      id: tempId,
+      name: payload.full_name,
+      contact: payload.contact_number,
+      visitorType: payload.purpose_of_visit,
+      unitVisiting: payload.visiting_unit,
+      hostName: payload.host_name,
+      photoUrl: pictureUrl || photo || '',
+      entryTime: new Date().toISOString(),
+      exitTime: null,
+      hasLeft: false,
+      isPrecleared: false,
+      _offline: true,       // assume offline until server confirms
+      _pendingExit: false,
+    };
+
+    // ✅ Write to cache and show in UI immediately — guard sees it right now
+    // Step 1: Write to cache FIRST — this survives page switches
+    const existingPeds = getCachedPedestrians();
+    const dedupedWithNew = [localEntry, ...existingPeds.filter(p => String(p.id) !== String(tempId))];
+    saveCachedPedestrians(dedupedWithNew);
+
+    // Step 2: Update UI state directly
+    suppressCacheEvent.current = true;
+    setPedestrians((prev) => [localEntry, ...prev.filter(p => String(p.id) !== String(tempId))]);
+    setTimeout(() => { suppressCacheEvent.current = false; }, 50);
+
+    // Step 3: Reset form and close
+    setName('');
+    setIdNumber('');
+    setVisitorType(lookupData.pedestrianTypes[0] || 'Visitor');
+    setUnitVisiting('');
+    setPhoto(null);
+    setPhotoFile(null);
+    setShowForm(false);
+    setFormErrors({});
+    setSubmitting(false);
+
+    // Step 4: Attempt API in background — swap temp ID for real ID if server responds
     try {
-      const response = await post('/pedestrians/entry', payload);
-
-      const newEntry = response && typeof response === 'object' ? response : {
-        ...payload,
-        id: `temp_${Date.now()}`,
-        entry_time: new Date().toISOString(),
-        _offline: true,
-      };
-
-      const localEntry = {
-        id: newEntry.id,
-        name: newEntry.full_name || payload.full_name,
-        contact: newEntry.contact_number || payload.contact_number,
-        visitorType: newEntry.purpose_of_visit || payload.purpose_of_visit,
-        unitVisiting: newEntry.visiting_unit || payload.visiting_unit,
-        entryTime: newEntry.entry_time || new Date().toISOString(),
-        exitTime: null,
-        hasLeft: false,
-        _offline: newEntry._offline || false,
-      };
-
-      setPedestrians(prev => {
-        const updated = [localEntry, ...prev];
-        localStorage.setItem('cached_pedestrians', JSON.stringify(updated));
-        return updated;
+      const response = await post('/pedestrians/entry', payload, {
+        clientTempId: tempId,
       });
 
-      // Reset form
-      setName(''); setIdNumber(''); setContact('');
-      setVisitorType('Visitor'); setUnitVisiting(''); setPersonVisited('');
-      setShowForm(false);
-      setFormErrors({});
-
+      if (response && !response._offline && response.id) {
+        const confirmedEntry = {
+          ...localEntry,
+          id: response.id,
+          entryTime: response.entry_time || localEntry.entryTime,
+          _offline: false,
+        };
+        const currentPeds = getCachedPedestrians();
+        saveCachedPedestrians([confirmedEntry, ...currentPeds.filter(p => String(p.id) !== String(tempId))]);
+        suppressCacheEvent.current = true;
+        setPedestrians((prev) => [confirmedEntry, ...prev.filter(p => String(p.id) !== String(tempId))]);
+        setTimeout(() => { suppressCacheEvent.current = false; }, 50);
+      }
     } catch (err) {
-      console.error('Submit error:', err);
-      setError(err.response?.data?.error || err.message || 'Failed to register');
-    } finally {
-      setSubmitting(false);
+      console.warn('[PedestrianTab] Background post failed, entry remains in offline queue:', err.message);
     }
   };
 
-  const filtered = pedestrians.filter(p =>
-    p.name?.toLowerCase().includes(search.toLowerCase()) ||
-    p.contact?.includes(search) ||
-    p.unitVisiting?.toLowerCase().includes(search.toLowerCase())
-  );
+  const visiblePedestrians = useMemo(() => {
+    // NightGuard fix: memoize expensive list filtering and debounce search input upstream.
+    return pedestrians.filter((p) => {
+      const normalisedSearch = search.toLowerCase();
+      const matchesSearch =
+        p.name?.toLowerCase().includes(normalisedSearch) ||
+        p.contact?.includes(search) ||
+        p.unitVisiting?.toLowerCase().includes(normalisedSearch);
+      const matchesView =
+        activeView === 'all' ||
+        (activeView === 'precleared' ? p.isPrecleared : p.visitorType === activeView);
+      return matchesSearch && matchesView;
+    });
+  }, [pedestrians, search, activeView]);
 
-  const inside = filtered.filter(p => !p.hasLeft).length;
+  const inside = visiblePedestrians.filter((p) => !p.hasLeft).length;
 
   if (showForm) {
     return (
       <div className="tab-content">
         <div className="form-container">
           <div className="form-header">
-            <h2 className="form-title">Register Person</h2>
-            <button className="close-button" onClick={() => { setShowForm(false); setFormErrors({}); setError(''); }}>✕</button>
+            <h2 className="form-title">Register Pedestrian</h2>
+            <button className="close-button" onClick={() => { setShowForm(false); setFormErrors({}); setError(''); }}>x</button>
           </div>
-          {error && <div style={{ color: '#ef4444', textAlign: 'center', fontSize: '14px', marginBottom: 8 }}>{error}</div>}
+          {error && <div className="inline-error">{error}</div>}
           <form onSubmit={handleSubmit}>
             <div className="form-group">
               <label className="form-label required">Full Name</label>
-              <input type="text" className={`form-input ${formErrors.name ? 'error' : ''}`} placeholder="Full Name" value={name} onChange={e => setName(e.target.value)} disabled={submitting} />
+              {/* NightGuard fix: focused field scrolls itself into view without keyboard inset changes. */}
+              <input className={`form-input ${formErrors.name ? 'error' : ''}`} value={name} onFocus={onFocus} onChange={(e) => setName(e.target.value)} disabled={submitting} />
               {formErrors.name && <div className="form-error">{formErrors.name}</div>}
             </div>
             <div className="form-group">
               <label className="form-label">ID Number</label>
-              <input type="text" className="form-input" placeholder="ID Number (optional)" value={idNumber} onChange={e => setIdNumber(e.target.value)} disabled={submitting} />
+              <input className="form-input" value={idNumber} onFocus={onFocus} onChange={(e) => setIdNumber(e.target.value)} inputMode="numeric" disabled={submitting} />
             </div>
             <div className="form-group">
-              <label className="form-label required">Contact Number</label>
-              <input type="tel" className={`form-input ${formErrors.contact ? 'error' : ''}`} placeholder="Contact Number" value={contact} onChange={e => setContact(e.target.value)} disabled={submitting} />
-              {formErrors.contact && <div className="form-error">{formErrors.contact}</div>}
-            </div>
-            <div className="form-group">
-              <label className="form-label">Visitor Type</label>
-              <select className="form-select" value={visitorType} onChange={e => setVisitorType(e.target.value)} disabled={submitting}>
-                <option>Visitor</option>
-                <option>Contractor</option>
-                <option>Resident</option>
-                <option>Delivery</option>
+              <label className="form-label required">Visitor Type</label>
+              <select className={`form-select ${formErrors.visitorType ? 'error' : ''}`} value={visitorType} onFocus={onFocus} onChange={(e) => setVisitorType(e.target.value)} disabled={submitting}>
+                {lookupData.pedestrianTypes.map((type) => <option key={type}>{type}</option>)}
               </select>
+              {formErrors.visitorType && <div className="form-error">{formErrors.visitorType}</div>}
             </div>
             <div className="form-group">
               <label className="form-label required">Unit Visiting</label>
-              <input type="text" className={`form-input ${formErrors.unitVisiting ? 'error' : ''}`} placeholder="Unit Number or Name" value={unitVisiting} onChange={e => setUnitVisiting(e.target.value)} disabled={submitting} />
+              <input className={`form-input ${formErrors.unitVisiting ? 'error' : ''}`} list="pedestrian-units" value={unitVisiting} onFocus={onFocus} onChange={(e) => setUnitVisiting(e.target.value)} disabled={submitting} />
+              <datalist id="pedestrian-units">
+                {lookupData.units.map((unit) => <option key={unit} value={unit} />)}
+              </datalist>
               {formErrors.unitVisiting && <div className="form-error">{formErrors.unitVisiting}</div>}
             </div>
-            <div className="form-group">
-              <label className="form-label">Person Being Visited</label>
-              <input type="text" className="form-input" placeholder="Name of person being visited" value={personVisited} onChange={e => setPersonVisited(e.target.value)} disabled={submitting} />
+            {/* NightGuard fix: photo is required for fast visual verification at the gate. */}
+            <div className="photo-section">
+              {photo ? (
+                <img src={photo} alt="Pedestrian preview" className="photo-preview" />
+              ) : (
+                <p className="photo-placeholder">No photo taken</p>
+              )}
+              <div className="photo-buttons">
+                <button className="photo-button" type="button" onClick={() => openPhotoPicker('home-pedestrian-camera')} disabled={submitting}>
+                  Camera
+                </button>
+                <label className="photo-button browser-photo-button">
+                  <input
+                    id="home-pedestrian-camera"
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    onFocus={onFocus}
+                    onChange={handlePhotoSelect}
+                    style={{ display: 'none' }}
+                    disabled={submitting}
+                  />
+                </label>
+                <button className="photo-button" type="button" onClick={() => openPhotoPicker('home-pedestrian-gallery')} disabled={submitting}>
+                  Gallery
+                </button>
+                <label className="photo-button browser-photo-button">
+                  <input
+                    id="home-pedestrian-gallery"
+                    type="file"
+                    accept="image/*"
+                    onFocus={onFocus}
+                    onChange={handlePhotoSelect}
+                    style={{ display: 'none' }}
+                    disabled={submitting}
+                  />
+                </label>
+              </div>
+              {formErrors.photo && <div className="form-error">{formErrors.photo}</div>}
             </div>
             <div className="button-group" style={{ marginTop: '24px' }}>
               <button type="submit" className="button-add" disabled={submitting}>
@@ -239,50 +444,84 @@ export default function PedestrianTab() {
 
   return (
     <div className="tab-content">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-        <h2 style={{ fontSize: '16px', fontWeight: '600', margin: 0 }}>
-          Persons <span style={{ color: '#f87171', fontSize: 13 }}>({inside} inside)</span>
-        </h2>
-        <button className="button-add" onClick={() => setShowForm(true)} style={{ width: 'auto', padding: '8px 16px', minHeight: '40px' }}>+ Add</button>
+      <div className="panel-card">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
+          <h2 style={{ fontSize: '16px', fontWeight: 700, margin: 0 }}>
+            Pedestrians <span style={{ color: '#f87171', fontSize: 13 }}>({inside} inside)</span>
+          </h2>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {/* NightGuard fix: small offline cue without interrupting the guard's workflow. */}
+            {!isOnline && <span className="offline-dot-label"><span />Offline</span>}
+            <button className="button-add compact" onClick={() => setShowForm(true)}>+ Add</button>
+          </div>
+        </div>
+
+        <div className="chip-row">
+          <button className={`filter-chip ${activeView === 'all' ? 'active' : ''}`} onClick={() => setActiveView('all')}>All</button>
+          <button className={`filter-chip ${activeView === 'precleared' ? 'active' : ''}`} onClick={() => setActiveView('precleared')}>Pre-cleared</button>
+          {lookupData.pedestrianTypes.map((type) => (
+            <button key={type} className={`filter-chip ${activeView === type ? 'active' : ''}`} onClick={() => setActiveView(type)}>
+              {type}
+            </button>
+          ))}
+        </div>
       </div>
+
+      {precleared.length > 0 && (
+        <div className="panel-card">
+          <div className="section-heading">Pre-cleared visitors</div>
+          <div className="list-container">
+            {precleared.slice(0, 4).map((entry) => (
+              <div key={entry.id} className="list-item slim">
+                <div className="list-item-header">
+                  <div className="list-item-title">{entry.name}</div>
+                  <div className="list-item-badge">{entry.visitorType}</div>
+                </div>
+                <div className="list-item-meta">{entry.unitVisiting} • {entry.hostName || 'No host set'}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <input
         type="text"
-        placeholder="Search by name, contact or unit..."
-        value={search}
-        onChange={e => setSearch(e.target.value)}
-        style={{ width: '100%', padding: '8px 12px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, color: '#fff', fontSize: 13, marginBottom: 12, boxSizing: 'border-box' }}
+        placeholder="Search by name or unit..."
+        value={searchInput}
+        onFocus={onFocus}
+        onChange={(e) => setSearchInput(e.target.value)}
+        className="form-input"
+        style={{ marginBottom: 12 }}
       />
 
-      {loading ? (
-        <div style={{ textAlign: 'center', padding: 40, color: '#666' }}>Loading...</div>
-      ) : filtered.length === 0 ? (
-        <div className="list-empty">
-          <p>No persons found</p>
-        </div>
+      {visiblePedestrians.length === 0 ? (
+        <div className="list-empty"><p>No pedestrians found</p></div>
       ) : (
         <div className="list-container">
-          {filtered.map(ped => (
-            <div key={ped.id} className="list-item" style={{ opacity: ped.hasLeft ? 0.5 : 1, borderLeft: ped.hasLeft ? '3px solid #22c55e' : '3px solid #dc2626' }}>
+          {visiblePedestrians.map((ped) => (
+            <div key={ped.id} className="list-item" style={{ opacity: ped.hasLeft ? 0.55 : 1, borderLeft: ped.hasLeft ? '3px solid #22c55e' : '3px solid #dc2626' }}>
               <div className="list-item-header">
-                <div className="list-item-title" style={{ textDecoration: ped.hasLeft ? 'line-through' : 'none' }}>{ped.name}</div>
+                {/* NightGuard fix: fixed thumbnail space prevents list-card layout shifts. */}
+                <div className="entry-title-row">
+                  <PedestrianThumbnail photoUrl={ped.photoUrl} label={ped.name} />
+                  <div className="list-item-title">
+                    {ped.name}
+                    {ped._offline && <span style={{ fontSize: 9, color: '#f59e0b', marginLeft: 6, fontWeight: 400, letterSpacing: 0.2 }}>offline</span>}
+                  </div>
+                </div>
                 {!ped.hasLeft ? (
-                  <button
-                    onClick={() => handleMarkExit(ped.id)}
-                    style={{ padding: '4px 10px', background: '#166534', border: 'none', borderRadius: 6, color: '#86efac', fontSize: 12, cursor: 'pointer', fontWeight: 600 }}
-                  >
-                    ✓ Exit
-                  </button>
+                  <button onClick={() => handleMarkExit(ped.id)} className="list-action-button">Exit</button>
                 ) : (
-                  <span style={{ fontSize: 12, color: '#22c55e' }}>✓ Left</span>
+                  <span style={{ fontSize: 12, color: '#22c55e' }}>Left</span>
                 )}
               </div>
-              <div className="list-item-meta">Contact: {ped.contact}</div>
-              <div className="list-item-meta">Unit: {ped.unitVisiting} · {ped.visitorType}</div>
-              <div style={{ fontSize: 11, color: '#555', marginTop: 4 }}>
-                In: {ped.entryTime ? new Date(ped.entryTime).toLocaleTimeString() : '-'}
-                {ped.hasLeft && ped.exitTime && ` · Out: ${new Date(ped.exitTime).toLocaleTimeString()}`}
+              <div className="meta-row">
+                <span className="list-item-badge">{ped.visitorType || 'Unknown'}</span>
+                {ped.isPrecleared && <span className="soft-badge">Pre-cleared</span>}
               </div>
+              <div className="list-item-meta">Unit: {ped.unitVisiting || '-'} • Host: {ped.hostName || '-'}</div>
+              <div className="list-item-meta">Entry: {ped.entryTime ? new Date(ped.entryTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'}</div>
+              {ped.hasLeft && <div className="list-item-meta">Exit: {ped.exitTime ? new Date(ped.exitTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'}</div>}
             </div>
           ))}
         </div>

@@ -3,7 +3,12 @@ import api from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import jsPDF from 'jspdf';
 import 'jspdf-autotable';
-import { getNfcScans } from '../lib/deviceStore';
+import { getNfcScans, getPatrolConfig } from '../lib/deviceStore';
+import ReportEmailPanel from '../components/ReportEmailPanel';
+import CheckpointMap from '../components/CheckpointMap';
+import { NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
+import { buildDatedReportFileName, exportPdfDocument, getSiteDisplayName } from '../lib/reportUtils';
+import { logApiError, logApiAttempt, logOfflineUsage } from '../lib/apiErrorLogger';
 
 export default function GuardPatrolDashboard() {
   const { user } = useAuth();
@@ -14,19 +19,45 @@ export default function GuardPatrolDashboard() {
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
   const [viewMode, setViewMode] = useState('own'); // 'own' or 'all' (for admin)
+  const [exporting, setExporting] = useState(false);
 
   useEffect(() => { loadData(); }, [viewMode]);
 
   useEffect(() => { loadData(); }, []);
 
+  useEffect(() => {
+    const handleOnline = () => {
+      console.log('[GuardPatrolReport] Coming online - reloading patrol data from server');
+      loadData();
+    };
+    window.addEventListener('nightguard_sync_complete', handleOnline);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
+    return () => {
+      window.removeEventListener('nightguard_sync_complete', handleOnline);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
+    };
+  }, []);
+
   const loadData = async () => {
     setLoading(true);
     setError('');
     try {
+      logApiAttempt('GuardPatrolReport', 'GET', '/patrols/summary');
+      logApiAttempt('GuardPatrolReport', 'GET', '/nfc/scans');
+      
       const [summary, scans] = await Promise.all([
-        api.get('/patrols/summary').then(res => res.data).catch(() => []),
-        api.get('/nfc/scans').then(res => res.data).catch(() => getNfcScans()),
+        api.get('/patrols/summary').then(res => res.data).catch((err) => {
+          logApiError(navigator.onLine, err, 'GuardPatrolReport-summary');
+          return [];
+        }),
+        api.get('/nfc/scans').then(res => res.data).catch((err) => {
+          logApiError(navigator.onLine, err, 'GuardPatrolReport-scans');
+          return getNfcScans();
+        }),
       ]);
+      
       setPatrols(summary || []);
       setCheckpoints((scans || []).map(scan => ({
         ...scan,
@@ -35,9 +66,15 @@ export default function GuardPatrolDashboard() {
         checkpoint_name: scan.checkpoint_name || scan.point_name,
         guard_name: scan.guard_name || scan.full_name,
       })));
+      
+      if (!summary?.length) {
+        logOfflineUsage('GuardPatrolReport', 'local NFC scans');
+      }
     } catch (err) {
+      logApiError(navigator.onLine, err, 'GuardPatrolReport');
       setPatrols([]);
       setCheckpoints(getNfcScans());
+      console.warn('[GuardPatrolReport] Using cached NFC scans from device');
       setError('Showing saved patrol scans from this device');
     } finally {
       setLoading(false);
@@ -118,6 +155,10 @@ export default function GuardPatrolDashboard() {
   const missed = totalCheckpoints - scanned;
   const scanPercent = totalCheckpoints ? Math.round((scanned / totalCheckpoints) * 100) : 0;
   const missedPercent = totalCheckpoints ? Math.round((missed / totalCheckpoints) * 100) : 0;
+  const lastScan = filteredCheckpoints[0] || null;
+  const activeGuards = guardStats.filter((guard) => guard.total || guard.scanned).length;
+  const queuedScans = filteredCheckpoints.filter((checkpoint) => checkpoint.offline || checkpoint._offline).length;
+  const patrolCheckpoints = getPatrolConfig().checkpoints || [];
 
   // Donut Chart Component
   const DonutChart = ({ percentage, color, label, count, total, sublabel }) => {
@@ -179,9 +220,11 @@ export default function GuardPatrolDashboard() {
     );
   };
 
-  const handleExportPDF = () => {
+  const handleExportPDF = async (shareOptions = {}) => {
+    setExporting(true);
+    setError('');
     const doc = new jsPDF({ orientation: 'landscape' });
-    const siteName = import.meta.env.VITE_SITE_NAME || 'Site';
+    const siteName = getSiteDisplayName();
 
     doc.setFontSize(16);
     doc.text(`Guard Patrol Dashboard - ${siteName}`, 14, 20);
@@ -271,11 +314,30 @@ export default function GuardPatrolDashboard() {
       });
     }
 
-    doc.save(`GuardPatrol-${user?.username || 'report'}-${new Date().toISOString().split('T')[0]}.pdf`);
+    try {
+      await exportPdfDocument(doc, buildDatedReportFileName(`GuardPatrol-${user?.username || 'report'}`), {
+        shareTitle: 'Guard Patrol Report',
+        shareText: 'NightGuard guard patrol report PDF.',
+        ...shareOptions,
+      });
+    } catch (err) {
+      setError(err.message || 'Failed to export PDF');
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
     <div style={{ padding: '20px', color: '#fff', background: '#000', minHeight: '100vh', boxSizing: 'border-box' }}>
+      <ReportEmailPanel
+        reportKey="guard-patrol-report"
+        reportLabel="Guard Patrol Report"
+        onShareReport={({ recipients, subject, body, senderEmail }) => handleExportPDF({
+          preferShare: true,
+          shareTitle: subject,
+          shareText: `${body}\n\nRecipients: ${recipients}\nSender account: ${senderEmail}`,
+        })}
+      />
 
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
@@ -305,20 +367,20 @@ export default function GuardPatrolDashboard() {
             </select>
           )}
           <button
-            onClick={handleExportPDF}
-            disabled={loading || (filteredPatrols.length === 0 && filteredCheckpoints.length === 0)}
+            onClick={() => handleExportPDF()}
+            disabled={loading || exporting || (filteredPatrols.length === 0 && filteredCheckpoints.length === 0)}
             style={{
               padding: '10px 20px',
-              background: (loading || (filteredPatrols.length === 0 && filteredCheckpoints.length === 0)) ? '#444' : '#dc2626',
+              background: (loading || exporting || (filteredPatrols.length === 0 && filteredCheckpoints.length === 0)) ? '#444' : '#dc2626',
               color: '#fff',
               border: 'none',
               borderRadius: 8,
               fontSize: 14,
               fontWeight: 600,
-              cursor: (loading || (filteredPatrols.length === 0 && filteredCheckpoints.length === 0)) ? 'not-allowed' : 'pointer'
+              cursor: (loading || exporting || (filteredPatrols.length === 0 && filteredCheckpoints.length === 0)) ? 'not-allowed' : 'pointer'
             }}
           >
-            Export PDF
+            {exporting ? 'Preparing PDF...' : 'Export PDF'}
           </button>
         </div>
       </div>
@@ -360,6 +422,49 @@ export default function GuardPatrolDashboard() {
       </div>
 
       {error && <div style={{ color: '#ef4444', marginBottom: 16, fontSize: 14, padding: '10px 16px', background: '#450a0a', borderRadius: 8 }}>{error}</div>}
+
+      {!loading && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16, marginBottom: 24 }}>
+          {[
+            { label: 'Active Guards Seen', value: activeGuards || 0, hint: 'Guards with patrol or scan activity' },
+            { label: 'Latest Scan', value: lastScan ? new Date(lastScan.scanned_at || lastScan.created_at).toLocaleString() : 'No scans yet', hint: lastScan?.checkpoint_name || 'Waiting for patrol data' },
+            { label: 'Required Coverage', value: `${scanPercent}%`, hint: `${scanned} scanned of ${totalCheckpoints || 0} checkpoints` },
+            { label: 'Queued On Device', value: queuedScans, hint: 'Patrol scans waiting to sync' },
+          ].map((card) => (
+            <div key={card.label} style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: 18 }}>
+              <div style={{ color: '#888', fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8 }}>{card.label}</div>
+              <div style={{ color: '#fff', fontSize: 18, fontWeight: 700, marginBottom: 6 }}>{card.value}</div>
+              <div style={{ color: '#666', fontSize: 12 }}>{card.hint}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Checkpoint layout (GPS pins + NFC points) */}
+      {!loading && (
+        <div style={{ marginBottom: 28 }}>
+          <CheckpointMap checkpoints={patrolCheckpoints} scans={filteredCheckpoints} />
+        </div>
+      )}
+
+      {/* Patrol Times */}
+      {!loading && filteredCheckpoints.length > 0 && (
+        <div style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: 18, marginBottom: 28 }}>
+          <h2 style={{ fontSize: 15, margin: '0 0 12px' }}>Patrol Times</h2>
+          <div style={{ display: 'grid', gap: 8 }}>
+            {filteredCheckpoints.slice(0, 50).map((c, i) => (
+              <div key={c.id || i} style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', borderBottom: '1px solid #161616', paddingBottom: 6 }}>
+                <span style={{ color: '#d4d4d4', fontSize: 13 }}>
+                  {c.checkpoint_name || 'Checkpoint'} <span style={{ color: '#666' }}>· {c.method === 'gps' ? 'GPS' : 'NFC'}</span>
+                </span>
+                <span style={{ color: '#9ca3af', fontSize: 13 }}>
+                  {new Date(c.scanned_at || c.created_at).toLocaleString()} · {c.guard_name || 'Guard'}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Charts Grid */}
       {!loading && (

@@ -1,9 +1,43 @@
+import { Preferences } from '@capacitor/preferences';
+
 const LOOKUP_KEY = 'nightguard_lookup_data';
 const PATROL_CONFIG_KEY = 'nightguard_patrol_config';
 const NFC_SCANS_KEY = 'nightguard_nfc_scans';
 const SHIFT_SESSION_KEY = 'nightguard_shift_session';
 const QUICK_SWITCH_KEY = 'nightguard_quick_switch_enabled';
 const CACHED_GUARDS_KEY = 'nightguard_cached_guards';
+const PRECLEARED_PEDESTRIANS_KEY = 'nightguard_precleared_pedestrians';
+const BLACKLISTED_VEHICLES_KEY = 'nightguard_blacklisted_vehicles';
+const REPORT_EMAIL_SETTINGS_KEY = 'nightguard_report_email_settings';
+const LAST_SYNC_KEY = 'nightguard_last_sync_at';
+const DEVICE_ID_KEY = 'nightguard_device_id';
+const SITE_SETTINGS_KEY = 'nightguard_site_settings';
+const DEVICE_SETTINGS_KEY = 'nightguard_device_settings';
+const PENDING_SCHEMA_SYNC_KEY = 'nightguard_pending_schema_sync';
+const SYNC_LOGS_KEY = 'nightguard_sync_logs';
+const CACHED_PEDESTRIANS_KEY = 'cached_pedestrians';
+const CACHED_VEHICLES_KEY = 'cached_vehicles';
+const GENERAL_GUARD_SEEDED_KEY = 'general_guard_seeded';
+
+const ENV_LOCATION_NAME = import.meta.env.VITE_LOCATION_NAME || import.meta.env.VITE_SITE_NAME || 'Location';
+export const GENERAL_GUARD_ID = '00000000-0000-0000-0000-000000000000';
+export const LEGACY_GENERAL_GUARD_ID = 'general-guard';
+export const GENERAL_GUARD = {
+  id: GENERAL_GUARD_ID,
+  full_name: 'General Guard',
+  name: 'General Guard',
+  phone: '',
+  pin: '0000',
+  guard_pin: '0000',
+  badge_number: 'GG-0000',
+  is_active: true,
+  user_type: 'guard',
+  role: 'guard',
+  _localOnly: true,
+  _is_general_guard: true,
+  created_at: new Date().toISOString(),
+  updated_at: new Date().toISOString(),
+};
 
 export const DEFAULT_LOOKUP_DATA = {
   shiftOptions: ['Day Shift', 'Night Shift'],
@@ -15,27 +49,164 @@ export const DEFAULT_LOOKUP_DATA = {
 
 export const DEFAULT_PATROL_CONFIG = {
   patrolScheduleEnabled: true,
+  patrolTimes: ['06:00', '12:00', '18:00', '00:00'],
   patrolIntervalMinutes: 60,
   minimumTagCount: 3,
+  // GPS-primary: seeded points carry no NFC tag. A guard drops a GPS pin per point,
+  // and can optionally link a real NFC tag later. Seeding fake tag_uids caused the
+  // global patrol_checkpoints_tag_uid_key unique violation when the same defaults
+  // were saved from more than one site/device.
   checkpoints: [
-    { id: 'cp-1', name: 'Main Gate', tag_uid: 'NG-MAIN-001', zone: 'Perimeter', required: true },
-    { id: 'cp-2', name: 'Parking Gate', tag_uid: 'NG-PARK-002', zone: 'Parking', required: true },
-    { id: 'cp-3', name: 'Reception Door', tag_uid: 'NG-REC-003', zone: 'Lobby', required: true },
+    { id: 'cp-1', name: 'Main Gate', tag_uid: '', zone: 'Perimeter', required: true },
+    { id: 'cp-2', name: 'Parking Gate', tag_uid: '', zone: 'Parking', required: true },
+    { id: 'cp-3', name: 'Reception Door', tag_uid: '', zone: 'Lobby', required: true },
   ],
+};
+
+const CACHED_PATROLS_KEY = 'nightguard_cached_patrols';
+
+function normalisePatrolTimes(times) {
+  const values = Array.isArray(times) ? times : [];
+  return Array.from(new Set(
+    values
+      .map((time) => String(time || '').trim())
+      .filter((time) => /^([01]\d|2[0-3]):[0-5]\d$/.test(time))
+  )).sort();
+}
+
+export const DEFAULT_SITE_SETTINGS = {
+  id: import.meta.env.VITE_SITE_ID || '',
+  site_name: ENV_LOCATION_NAME,
+  location_name: ENV_LOCATION_NAME,
+  address: '',
+  contact_person: '',
+  contact_phone: '',
+  organizations: { org_name: '' },
+  devices: [],
+};
+
+export const DEFAULT_DEVICE_SETTINGS = {
+  autoExit: false,
+  allowQuickGuardSwitch: false,
+  allow_quick_guard_switch: false,
+  deviceDescription: '',
 };
 
 function readJson(key, fallback) {
   try {
     const stored = localStorage.getItem(key);
-    return stored ? JSON.parse(stored) : fallback;
-  } catch {
+    const result = stored ? JSON.parse(stored) : fallback;
+    if (stored) {
+      console.log(`[DeviceStore] READ "${key}":`, result);
+    }
+    return result;
+  } catch (err) {
+    console.error(`[DeviceStore] READ ERROR for "${key}":`, err.message);
     return fallback;
   }
 }
 
 function writeJson(key, value) {
-  localStorage.setItem(key, JSON.stringify(value));
-  return value;
+  try {
+    const jsonStr = JSON.stringify(value);
+    localStorage.setItem(key, jsonStr);
+    console.log(`[DeviceStore] WRITE "${key}": count=${Array.isArray(value) ? value.length : 'object'}, size=${jsonStr.length}bytes`, value);
+    return value;
+  } catch (err) {
+    console.error(`[DeviceStore] WRITE ERROR for "${key}":`, err.message);
+    return value;
+  }
+}
+
+function dispatchStoreEvent(name) {
+  console.log(`[DeviceStore] DISPATCH EVENT "${name}"`);
+  window.dispatchEvent(new Event(name));
+}
+
+function dedupeById(entries = []) {
+  const map = new Map();
+  entries.forEach((entry) => {
+    if (!entry?.id) return;
+    map.set(String(entry.id), entry);
+  });
+  return Array.from(map.values());
+}
+
+function normaliseGuard(guard) {
+  const isGeneralGuard = String(guard?.id) === GENERAL_GUARD_ID ||
+    String(guard?.id) === LEGACY_GENERAL_GUARD_ID ||
+    guard?._is_general_guard === true;
+  if (isGeneralGuard) {
+    return {
+      ...GENERAL_GUARD,
+      ...guard,
+      id: GENERAL_GUARD_ID,
+      full_name: 'General Guard',
+      name: 'General Guard',
+      pin: '0000',
+      guard_pin: '0000',
+      badge_number: 'GG-0000',
+      is_active: true,
+      _localOnly: true,
+      _is_general_guard: true,
+    };
+  }
+
+  return {
+    ...GENERAL_GUARD,
+    ...guard,
+    id: guard.id,
+    full_name: guard.full_name || guard.name || 'Unnamed Guard',
+    name: guard.name || guard.full_name || 'Unnamed Guard',
+    pin: String(guard.pin || guard.guard_pin || '1234'),
+    guard_pin: String(guard.guard_pin || guard.pin || '1234'),
+    is_active: guard.is_active !== false,
+    user_type: guard.user_type || 'guard',
+    role: guard.role || guard.user_type || 'guard',
+    _localOnly: guard._localOnly !== false,
+  };
+}
+
+function mergeWithGeneralGuard(guards = []) {
+  const existingGeneralGuard = (guards || [])
+    .map(normaliseGuard)
+    .find((guard) => isGeneralGuardId(guard?.id));
+
+  return [
+    {
+      ...GENERAL_GUARD,
+      ...(existingGeneralGuard || {}),
+      id: GENERAL_GUARD_ID,
+      full_name: GENERAL_GUARD.full_name,
+      name: GENERAL_GUARD.name,
+      pin: GENERAL_GUARD.pin,
+      guard_pin: GENERAL_GUARD.guard_pin,
+      is_active: true,
+      _localOnly: true,
+      _is_general_guard: true,
+    },
+  ];
+}
+
+export function isGeneralGuardId(id) {
+  return String(id) === GENERAL_GUARD_ID || String(id) === LEGACY_GENERAL_GUARD_ID;
+}
+
+export async function seedGeneralGuard(siteSettings = getCachedSiteSettings()) {
+  const stampedGeneralGuard = {
+    ...GENERAL_GUARD,
+    site_id: siteSettings?.id || GENERAL_GUARD.site_id || null,
+    organization_id: siteSettings?.organization_id || siteSettings?.org_id || siteSettings?.organizations?.id || null,
+    updated_at: new Date().toISOString(),
+  };
+  const saved = saveCachedGuards([stampedGeneralGuard, ...readJson(CACHED_GUARDS_KEY, [])]);
+  localStorage.setItem(GENERAL_GUARD_SEEDED_KEY, 'true');
+  try {
+    await Preferences.set({ key: GENERAL_GUARD_SEEDED_KEY, value: 'true' });
+  } catch (err) {
+    console.warn('[DeviceStore] Unable to persist general_guard_seeded:', err?.message || err);
+  }
+  return saved;
 }
 
 export function getLookupData() {
@@ -46,20 +217,43 @@ export function getLookupData() {
 }
 
 export function saveLookupData(data) {
-  return writeJson(LOOKUP_KEY, data);
+  const saved = writeJson(LOOKUP_KEY, data);
+  dispatchStoreEvent('nightguard_lookup_updated');
+  return saved;
 }
 
 export function getPatrolConfig() {
   const stored = readJson(PATROL_CONFIG_KEY, {});
+  const patrolTimes = normalisePatrolTimes(stored.patrolTimes || stored.patrol_times);
   return {
     ...DEFAULT_PATROL_CONFIG,
     ...stored,
+    patrolTimes: patrolTimes.length ? patrolTimes : DEFAULT_PATROL_CONFIG.patrolTimes,
     checkpoints: stored.checkpoints?.length ? stored.checkpoints : DEFAULT_PATROL_CONFIG.checkpoints,
   };
 }
 
 export function savePatrolConfig(data) {
-  return writeJson(PATROL_CONFIG_KEY, data);
+  const saved = writeJson(PATROL_CONFIG_KEY, {
+    ...data,
+    patrolTimes: normalisePatrolTimes(data?.patrolTimes || data?.patrol_times),
+  });
+  dispatchStoreEvent('nightguard_patrol_config_updated');
+  return saved;
+}
+
+export function getCachedPatrols() {
+  return readJson(CACHED_PATROLS_KEY, []);
+}
+
+export function saveCachedPatrols(entries) {
+  const saved = writeJson(CACHED_PATROLS_KEY, dedupeById(entries));
+  dispatchStoreEvent('nightguard_patrols_updated');
+  return saved;
+}
+
+export function upsertCachedPatrol(entry) {
+  return saveCachedPatrols([entry, ...getCachedPatrols()]);
 }
 
 export function getNfcScans() {
@@ -71,8 +265,7 @@ export function saveNfcScans(scans) {
 }
 
 export function appendNfcScan(scan) {
-  const existing = getNfcScans();
-  const updated = [scan, ...existing];
+  const updated = [scan, ...getNfcScans()];
   saveNfcScans(updated);
   return updated;
 }
@@ -90,19 +283,333 @@ export function clearShiftSession() {
 }
 
 export function getQuickSwitchEnabled() {
-  const stored = localStorage.getItem(QUICK_SWITCH_KEY);
-  return stored === null ? true : stored === 'true';
+  return false;
 }
 
-export function saveQuickSwitchEnabled(enabled) {
-  localStorage.setItem(QUICK_SWITCH_KEY, String(Boolean(enabled)));
-  return enabled;
+export function saveQuickSwitchEnabled() {
+  const next = false;
+  localStorage.setItem(QUICK_SWITCH_KEY, String(next));
+  writeJson(DEVICE_SETTINGS_KEY, {
+    ...getDeviceSettings(),
+    allowQuickGuardSwitch: next,
+    allow_quick_guard_switch: next,
+  });
+  dispatchStoreEvent('nightguard_device_settings_updated');
+  return next;
 }
 
 export function getCachedGuards() {
-  return readJson(CACHED_GUARDS_KEY, []);
+  const result = mergeWithGeneralGuard(readJson(CACHED_GUARDS_KEY, []).map(normaliseGuard));
+  console.log(`[DeviceStore] getCachedGuards(): ${result.length} entries`);
+  return result;
 }
 
 export function saveCachedGuards(guards) {
-  return writeJson(CACHED_GUARDS_KEY, guards);
+  const merged = mergeWithGeneralGuard((guards || []).map(normaliseGuard));
+  const saved = writeJson(CACHED_GUARDS_KEY, merged);
+  console.log(`[DeviceStore] saveCachedGuards(): saved ${merged.length} entries`);
+  return saved;
+}
+
+export function upsertCachedGuard(guard) {
+  console.log(`[DeviceStore] upsertCachedGuard(): id="${guard.id}", name="${guard.full_name || guard.name}"`);
+  const nextGuard = normaliseGuard(guard);
+  const existing = getCachedGuards();
+  const next = existing.some((item) => String(item.id) === String(nextGuard.id))
+    ? existing.map((item) => (String(item.id) === String(nextGuard.id) ? { ...item, ...nextGuard } : item))
+    : [...existing, nextGuard];
+  return saveCachedGuards(next);
+}
+
+export function updateCachedGuard(guardId, updates) {
+  console.log(`[DeviceStore] updateCachedGuard(): id="${guardId}", updates=`, updates);
+  const next = getCachedGuards().map((guard) => (
+    String(guard.id) === String(guardId) ? normaliseGuard({ ...guard, ...updates }) : guard
+  ));
+  return saveCachedGuards(next);
+}
+
+export function getCachedSiteSettings() {
+  const stored = readJson(SITE_SETTINGS_KEY, {});
+  return {
+    ...DEFAULT_SITE_SETTINGS,
+    ...stored,
+    location_name: stored.location_name || stored.site_name || DEFAULT_SITE_SETTINGS.location_name,
+    site_name: stored.site_name || stored.location_name || DEFAULT_SITE_SETTINGS.site_name,
+    organizations: stored.organizations || DEFAULT_SITE_SETTINGS.organizations,
+    devices: Array.isArray(stored.devices) ? stored.devices : DEFAULT_SITE_SETTINGS.devices,
+  };
+}
+
+export function saveCachedSiteSettings(settings) {
+  const next = {
+    ...getCachedSiteSettings(),
+    ...settings,
+    site_name: settings?.site_name || settings?.location_name || getCachedSiteSettings().site_name,
+    location_name: settings?.location_name || settings?.site_name || getCachedSiteSettings().location_name,
+  };
+  const saved = writeJson(SITE_SETTINGS_KEY, next);
+  dispatchStoreEvent('nightguard_site_settings_updated');
+  return saved;
+}
+
+export function getLocationName() {
+  const cached = getCachedSiteSettings();
+  return cached.location_name || cached.site_name || ENV_LOCATION_NAME;
+}
+
+export function getDeviceSettings() {
+  return {
+    ...DEFAULT_DEVICE_SETTINGS,
+    ...readJson(DEVICE_SETTINGS_KEY, {}),
+  };
+}
+
+export function saveDeviceSettings(settings) {
+  const saved = writeJson(DEVICE_SETTINGS_KEY, {
+    ...getDeviceSettings(),
+    ...settings,
+  });
+  dispatchStoreEvent('nightguard_device_settings_updated');
+  return saved;
+}
+
+export function getPreclearedPedestrians() {
+  return readJson(PRECLEARED_PEDESTRIANS_KEY, []);
+}
+
+export function savePreclearedPedestrians(entries) {
+  return writeJson(PRECLEARED_PEDESTRIANS_KEY, entries);
+}
+
+export function appendPreclearedPedestrian(entry) {
+  const updated = [entry, ...getPreclearedPedestrians()];
+  savePreclearedPedestrians(updated);
+  return updated;
+}
+
+export function getBlacklistedVehicles() {
+  return readJson(BLACKLISTED_VEHICLES_KEY, []);
+}
+
+export function saveBlacklistedVehicles(entries) {
+  return writeJson(BLACKLISTED_VEHICLES_KEY, entries);
+}
+
+export function appendBlacklistedVehicle(entry) {
+  const updated = [entry, ...getBlacklistedVehicles()];
+  saveBlacklistedVehicles(updated);
+  return updated;
+}
+
+export function removeBlacklistedVehicle(licensePlate) {
+  const updated = getBlacklistedVehicles().filter(
+    (entry) => entry.licensePlate?.toLowerCase() !== String(licensePlate).toLowerCase()
+  );
+  saveBlacklistedVehicles(updated);
+  return updated;
+}
+
+export function getCachedPedestrians() {
+  const result = readJson(CACHED_PEDESTRIANS_KEY, []);
+  console.log(`[DeviceStore] getCachedPedestrians(): ${result.length} entries`);
+  return result;
+}
+
+export function saveCachedPedestrians(entries) {
+  const deduped = dedupeById(entries);
+  const saved = writeJson(CACHED_PEDESTRIANS_KEY, deduped);
+  console.log(`[DeviceStore] saveCachedPedestrians(): saved ${deduped.length} entries`);
+  dispatchStoreEvent('nightguard_pedestrians_updated');
+  return saved;
+}
+
+export function upsertCachedPedestrian(entry) {
+  console.log(`[DeviceStore] upsertCachedPedestrian(): adding/updating id="${entry.id}", name="${entry.name}"`);
+  return saveCachedPedestrians([entry, ...getCachedPedestrians()]);
+}
+
+export function updateCachedPedestrian(id, updates) {
+  console.log(`[DeviceStore] updateCachedPedestrian(): id="${id}", updates=`, updates);
+  return saveCachedPedestrians(
+    getCachedPedestrians().map((entry) => (
+      String(entry.id) === String(id) ? { ...entry, ...updates } : entry
+    ))
+  );
+}
+
+export function getCachedVehicles() {
+  const result = readJson(CACHED_VEHICLES_KEY, []);
+  console.log(`[DeviceStore] getCachedVehicles(): ${result.length} entries`);
+  return result;
+}
+
+export function saveCachedVehicles(entries) {
+  const deduped = dedupeById(entries);
+  const saved = writeJson(CACHED_VEHICLES_KEY, deduped);
+  console.log(`[DeviceStore] saveCachedVehicles(): saved ${deduped.length} entries`);
+  dispatchStoreEvent('nightguard_vehicles_updated');
+  return saved;
+}
+
+export function upsertCachedVehicle(entry) {
+  console.log(`[DeviceStore] upsertCachedVehicle(): adding/updating id="${entry.id}", plate="${entry.licensePlate}"`);
+  return saveCachedVehicles([entry, ...getCachedVehicles()]);
+}
+
+export function updateCachedVehicle(id, updates) {
+  console.log(`[DeviceStore] updateCachedVehicle(): id="${id}", updates=`, updates);
+  return saveCachedVehicles(
+    getCachedVehicles().map((entry) => (
+      String(entry.id) === String(id) ? { ...entry, ...updates } : entry
+    ))
+  );
+}
+
+export function getReportEmailSettings() {
+  return readJson(REPORT_EMAIL_SETTINGS_KEY, {});
+}
+
+export function saveReportEmailSettings(settings) {
+  const saved = writeJson(REPORT_EMAIL_SETTINGS_KEY, settings);
+  dispatchStoreEvent('nightguard_report_schedules_updated');
+  return saved;
+}
+
+export function getReportEmailSetting(reportKey) {
+  const settings = getReportEmailSettings();
+  return settings[reportKey] || {
+    enabled: false,
+    time: '06:00',
+    subject: '',
+    recipients: '',
+  };
+}
+
+export function saveReportEmailSetting(reportKey, value) {
+  return saveReportEmailSettings({
+    ...getReportEmailSettings(),
+    [reportKey]: value,
+  });
+}
+
+export function getLastSyncAt() {
+  return localStorage.getItem(LAST_SYNC_KEY);
+}
+
+export function saveLastSyncAt(value = new Date().toISOString()) {
+  localStorage.setItem(LAST_SYNC_KEY, value);
+  const currentLogs = readJson(SYNC_LOGS_KEY, []);
+  writeJson(SYNC_LOGS_KEY, [
+    {
+      id: `sync_${Date.now()}`,
+      sync_status: 'completed',
+      completed_at: value,
+      created_at: value,
+    },
+    ...currentLogs,
+  ].slice(0, 25));
+  return value;
+}
+
+export function getSyncLogs() {
+  return readJson(SYNC_LOGS_KEY, []);
+}
+
+export function getDeviceId() {
+  return localStorage.getItem(DEVICE_ID_KEY) || null;
+}
+export function setDeviceId(id) {
+  localStorage.setItem(DEVICE_ID_KEY, id);
+  dispatchStoreEvent('nightguard_device_settings_updated');
+  return id;
+}
+// Resolve this device's PERMANENT id. On Android the id is derived from the
+// hardware identity (Settings.Secure.ANDROID_ID via @capacitor/device): it is
+// unique per device, survives app uninstall/reinstall, and only changes on a
+// factory reset — so one physical device is always ONE device in the logs.
+// The old scheme (random string in localStorage) minted a brand-new "device"
+// on every reinstall, which is how two test phones became 13 devices.
+// Web / old shells without the Device plugin keep the random-id fallback.
+export async function initDeviceId() {
+  try {
+    if (window.Capacitor?.isNativePlatform?.()) {
+      const { Device } = await import('@capacitor/device');
+      const { identifier } = await Device.getId();
+      if (identifier) {
+        const hardwareId = `NG-${String(identifier).toUpperCase()}`;
+        if (getDeviceId() !== hardwareId) setDeviceId(hardwareId);
+        return hardwareId;
+      }
+    }
+  } catch (err) {
+    console.warn('[DeviceStore] hardware device id unavailable:', err?.message || err);
+  }
+  const existing = getDeviceId();
+  if (existing) return existing;
+  const generated = `NG-${Math.random().toString(36).slice(2, 8).toUpperCase()}-${Date.now().toString(36).slice(-4).toUpperCase()}`;
+  return setDeviceId(generated);
+}
+
+export function getPendingSchemaSync() {
+  return readJson(PENDING_SCHEMA_SYNC_KEY, {});
+}
+
+export function markPendingSchemaSync(key, value = true) {
+  const next = {
+    ...getPendingSchemaSync(),
+    [key]: value,
+  };
+  return writeJson(PENDING_SCHEMA_SYNC_KEY, next);
+}
+
+export function clearPendingSchemaSync(key) {
+  const current = { ...getPendingSchemaSync() };
+  delete current[key];
+  return writeJson(PENDING_SCHEMA_SYNC_KEY, current);
+}
+
+export function buildLocalDataExport() {
+  const exportKeys = [
+    LOOKUP_KEY,
+    PATROL_CONFIG_KEY,
+    NFC_SCANS_KEY,
+    SHIFT_SESSION_KEY,
+    PRECLEARED_PEDESTRIANS_KEY,
+    BLACKLISTED_VEHICLES_KEY,
+    REPORT_EMAIL_SETTINGS_KEY,
+    LAST_SYNC_KEY,
+    DEVICE_ID_KEY,
+    SITE_SETTINGS_KEY,
+    DEVICE_SETTINGS_KEY,
+    GENERAL_GUARD_SEEDED_KEY,
+    PENDING_SCHEMA_SYNC_KEY,
+    CACHED_PATROLS_KEY,
+    'nightguard_offline_queue',
+    'cached_pedestrians',
+    'cached_vehicles',
+    'cached_incidents',
+    'cached_ob_entries',
+  ];
+
+  return exportKeys.reduce((acc, key) => {
+    const raw = localStorage.getItem(key);
+    if (raw !== null) {
+      try {
+        acc[key] = JSON.parse(raw);
+      } catch {
+        acc[key] = raw;
+      }
+    }
+    return acc;
+  }, {
+    exported_at: new Date().toISOString(),
+    location_name: getLocationName(),
+    device_id: getDeviceId(),
+    guard: {
+      id: GENERAL_GUARD_ID,
+      name: GENERAL_GUARD.full_name,
+      mode: 'single_general_guard',
+    },
+  });
 }

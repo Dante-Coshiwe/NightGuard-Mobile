@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
-import { getLookupData, saveLookupData } from '../lib/deviceStore';
+import React, { useEffect, useState } from 'react';
+import { getCachedSiteSettings, getLookupData } from '../lib/deviceStore';
+import { loadSiteLookupData, saveSiteLookupData } from '../services/schemaData';
 
 const styles = {
-  page: { padding: '24px 32px', color: '#fff', background: '#000', minHeight: '100vh' },
+  page: { padding: '24px 32px', color: '#fff', background: '#000', minHeight: 'var(--app-viewport-height, 100dvh)' },
   card: { background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 14, padding: 20, marginBottom: 18 },
   textarea: { width: '100%', minHeight: 96, padding: '10px 12px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 10, color: '#fff', boxSizing: 'border-box', resize: 'vertical' },
 };
@@ -24,16 +25,61 @@ export default function LookupDataConfig() {
     incidentTypes: initial.incidentTypes.join('\n'),
   });
   const [success, setSuccess] = useState('');
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
 
-  const handleSave = () => {
-    saveLookupData({
-      shiftOptions: serialiseList(fields.shiftOptions),
-      pedestrianTypes: serialiseList(fields.pedestrianTypes),
-      vehicleTypes: serialiseList(fields.vehicleTypes),
-      units: serialiseList(fields.units),
-      incidentTypes: serialiseList(fields.incidentTypes),
-    });
-    setSuccess('Lookup data saved');
+  useEffect(() => {
+    const loadData = async () => {
+      try {
+        const data = await loadSiteLookupData(getCachedSiteSettings());
+        console.log('[LookupData] fetched from service:', data);
+        setFields({
+          shiftOptions: data.shiftOptions.join('\n'),
+          pedestrianTypes: data.pedestrianTypes.join('\n'),
+          vehicleTypes: data.vehicleTypes.join('\n'),
+          units: data.units.join('\n'),
+          incidentTypes: data.incidentTypes.join('\n'),
+        });
+      } catch (err) {
+        setError(err.message || 'Unable to load lookup data');
+      }
+    };
+
+    loadData();
+
+    const handleLookupUpdate = () => {
+      const data = getLookupData();
+      setFields({
+        shiftOptions: data.shiftOptions.join('\n'),
+        pedestrianTypes: data.pedestrianTypes.join('\n'),
+        vehicleTypes: data.vehicleTypes.join('\n'),
+        units: data.units.join('\n'),
+        incidentTypes: data.incidentTypes.join('\n'),
+      });
+    };
+
+    window.addEventListener('nightguard_lookup_updated', handleLookupUpdate);
+    return () => window.removeEventListener('nightguard_lookup_updated', handleLookupUpdate);
+  }, []);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setSuccess('');
+    setError('');
+    try {
+      const result = await saveSiteLookupData({
+        shiftOptions: serialiseList(fields.shiftOptions),
+        pedestrianTypes: serialiseList(fields.pedestrianTypes),
+        vehicleTypes: serialiseList(fields.vehicleTypes),
+        units: serialiseList(fields.units),
+        incidentTypes: serialiseList(fields.incidentTypes),
+      }, getCachedSiteSettings());
+      setSuccess(result?._offline ? 'Lookup data saved locally and will sync later' : 'Lookup data saved');
+    } catch (err) {
+      setError(err.message || 'Failed to save lookup data');
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -44,6 +90,7 @@ export default function LookupDataConfig() {
       </div>
 
       {success && <div style={{ ...styles.card, borderColor: '#166534', color: '#86efac' }}>{success}</div>}
+      {error && <div style={{ ...styles.card, borderColor: '#7f1d1d', color: '#fca5a5' }}>{error}</div>}
 
       {[
         ['shiftOptions', 'Shift options'],
@@ -63,8 +110,8 @@ export default function LookupDataConfig() {
         </div>
       ))}
 
-      <button onClick={handleSave} style={{ padding: '12px 18px', background: '#dc2626', border: 'none', borderRadius: 12, color: '#fff', fontWeight: 700, cursor: 'pointer' }}>
-        Save Lookup Data
+      <button onClick={handleSave} disabled={saving} style={{ padding: '12px 18px', background: '#dc2626', border: 'none', borderRadius: 12, color: '#fff', fontWeight: 700, cursor: 'pointer', opacity: saving ? 0.7 : 1 }}>
+        {saving ? 'Saving...' : 'Save Lookup Data'}
       </button>
     </div>
   );

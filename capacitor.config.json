@@ -1,0 +1,26 @@
+{
+  "appId": "com.nightguard.nightguardtrack",
+  "appName": "NightGuard Track",
+  "webDir": "dist",
+  "plugins": {
+    "Keyboard": {
+      "resize": "body",
+      "resizeOnFullScreen": true
+    },
+    "CapacitorUpdater": {
+      "autoUpdate": false,
+      "directUpdate": false,
+      "resetWhenUpdate": true,
+      "autoDeleteFailed": true,
+      "autoDeletePrevious": true,
+      "appReadyTimeout": 20000,
+      "statsUrl": ""
+    }
+  },
+  "android": {
+    "adjustMarginsForEdgeToEdge": "force"
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}

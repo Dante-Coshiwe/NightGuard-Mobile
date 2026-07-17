@@ -1,12 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { saveIncident, getRecentIncidents } from '../services/api';
+import { getRecentIncidents } from '../services/api';
 import './IncidentScreen.css';
-
-const CATEGORIES = [
-  'Noise', 'Parking', 'Domestic', 'Security', 'Maintenance',
-  'Visitor', 'Resident Emergency', 'Accident', 'Damage to Property',
-  'Suspicious Activity', 'General'
-];
+import { useOfflineApi } from '../hooks/useOfflineApi';
+import { NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
+import { getCachedSiteSettings, getLookupData, getShiftSession } from '../lib/deviceStore';
+import { getCachedIncidents, setCachedIncidents } from '../lib/reportCache';
+import { useAuth } from '../contexts/AuthContext';
 
 const EMPTY_FORM = {
   dateTime: new Date().toISOString().slice(0, 16),
@@ -28,6 +27,7 @@ const EMPTY_FORM = {
 };
 
 export default function IncidentScreen() {
+  const { user, shiftSession } = useAuth();
   const [view, setView] = useState('list');
   const [incidents, setIncidents] = useState([]);
   const [currentStep, setCurrentStep] = useState(1);
@@ -37,9 +37,17 @@ export default function IncidentScreen() {
   const [success, setSuccess] = useState('');
   const [errors, setErrors] = useState({});
   const [formData, setFormData] = useState(EMPTY_FORM);
+  const [lookupData, setLookupData] = useState(getLookupData());
+  const { post } = useOfflineApi();
 
   useEffect(() => {
     loadIncidents();
+  }, []);
+
+  useEffect(() => {
+    const handleLookupUpdate = () => setLookupData(getLookupData());
+    window.addEventListener('nightguard_lookup_updated', handleLookupUpdate);
+    return () => window.removeEventListener('nightguard_lookup_updated', handleLookupUpdate);
   }, []);
 
   const loadIncidents = async () => {
@@ -48,28 +56,55 @@ export default function IncidentScreen() {
     try {
       if (!navigator.onLine) {
         // Load from cache if offline
-        const cached = localStorage.getItem('cached_incidents');
-        if (cached) setIncidents(JSON.parse(cached));
+        const cached = await getCachedIncidents();
+        setIncidents(cached);
         return;
       }
 
       const result = await getRecentIncidents();
       const data = result || [];
 
-      setIncidents(data);
-      localStorage.setItem('cached_incidents', JSON.stringify(data));
+      // When coming online, keep any queued/offline items visible until they are replaced.
+      const cached = await getCachedIncidents();
+      const offlineItems = (cached || []).filter((i) => i?._offline);
+      const remoteIds = new Set(data.map((i) => String(i?.id)));
+      const merged = [
+        ...offlineItems.filter((i) => !remoteIds.has(String(i?.id))),
+        ...data,
+      ];
+
+      setIncidents(merged);
+      await setCachedIncidents(merged);
 
     } catch (err) {
       console.error('Failed to load incidents:', err);
 
       // Fallback to cache
-      const cached = localStorage.getItem('cached_incidents');
-      if (cached) setIncidents(JSON.parse(cached));
+      const cached = await getCachedIncidents();
+      setIncidents(cached);
 
     } finally {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    const onSyncComplete = () => {
+      loadIncidents();
+    };
+    const handleOnline = () => {
+      console.log('[IncidentScreen] Coming online - reloading incidents from server');
+      loadIncidents();
+    };
+    window.addEventListener('nightguard_sync_complete', onSyncComplete);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
+    return () => {
+      window.removeEventListener('nightguard_sync_complete', onSyncComplete);
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
+    };
+  }, []);
 
   const handleFormChange = (field, value) => {
     setFormData(prev => ({ ...prev, [field]: value }));
@@ -112,17 +147,33 @@ export default function IncidentScreen() {
     setError('');
     setSubmitting(true);
     try {
-      const result = await saveIncident({
+      const clientTempId = `incident_${Date.now()}`;
+      const payload = {
+        site_id: getCachedSiteSettings().id || null,
+        shift_id: shiftSession?.id || getShiftSession()?.id || null,
+        reported_by: user?.id || null,
+        guard_id: user?.id || null,
         incident_type: formData.category,
         description: `${formData.details}\n\nAction Taken: ${formData.actionTaken}\n\nComplainant: ${formData.complainantName} (${formData.complainantContact})\nIncident With: ${formData.incidentWith}\nGuard: ${formData.guardName}`,
         severity: 'low',
         location: formData.address,
+      };
+      const result = await post('/incidents/report', payload, {
+        clientTempId,
+        offlineResponse: {
+          ...payload,
+          id: clientTempId,
+          reported_at: new Date().toISOString(),
+          _offline: true,
+        },
       });
-      setIncidents([result, ...incidents]);
+      const updated = [result, ...incidents];
+      setIncidents(updated);
+      await setCachedIncidents(updated);
       setView('list');
       setCurrentStep(1);
       setFormData(EMPTY_FORM);
-      setSuccess('Incident saved successfully');
+      setSuccess(result._offline ? 'Incident saved offline and queued for sync' : 'Incident saved successfully');
       setTimeout(() => setSuccess(''), 3000);
     } catch (err) {
       setError(err.response?.data?.error || 'Error saving incident');
@@ -162,7 +213,7 @@ export default function IncidentScreen() {
               <label className="form-label required">Incident Category</label>
               <select className={`form-select ${errors.category ? 'error' : ''}`} value={formData.category} onChange={e => handleFormChange('category', e.target.value)}>
                 <option value="">Select category</option>
-                {CATEGORIES.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+                {lookupData.incidentTypes.map(cat => <option key={cat} value={cat}>{cat}</option>)}
               </select>
               {errors.category && <div className="form-error">{errors.category}</div>}
             </div>
@@ -178,7 +229,7 @@ export default function IncidentScreen() {
             </div>
             <div className="form-group">
               <label className="form-label required">Complainant Contact</label>
-              <input type="tel" className={`form-input ${errors.complainantContact ? 'error' : ''}`} placeholder="Contact number" value={formData.complainantContact} onChange={e => handleFormChange('complainantContact', e.target.value)} />
+              <input type="tel" inputMode="tel" autoComplete="tel" className={`form-input ${errors.complainantContact ? 'error' : ''}`} placeholder="Contact number" value={formData.complainantContact} onChange={e => handleFormChange('complainantContact', e.target.value)} />
               {errors.complainantContact && <div className="form-error">{errors.complainantContact}</div>}
             </div>
             <div className="form-group">
@@ -239,7 +290,7 @@ export default function IncidentScreen() {
             <div className="photo-section">
               <label className="form-label">Photo of Vehicle</label>
               <input type="file" className="photo-input" id="vehicle-photo" accept="image/*" capture="environment" onChange={e => handlePhotoCapture('vehicle', e)} />
-              <button type="button" className="photo-button" onClick={() => document.getElementById('vehicle-photo').click()}>📷 Capture Vehicle Photo</button>
+              <button type="button" className="photo-button" onClick={() => document.getElementById('vehicle-photo').click()}>Capture Vehicle Photo</button>
               {formData.vehiclePhoto && <img src={formData.vehiclePhoto} alt="Vehicle" className="photo-preview" style={{ marginTop: 8, width: '100%', borderRadius: 8 }} />}
             </div>
           </div>
@@ -250,14 +301,14 @@ export default function IncidentScreen() {
             <h2>Step 4: Incident Images</h2>
             <div className="photo-section">
               <input type="file" className="photo-input" id="incident-photos" accept="image/*" capture="environment" multiple onChange={e => handlePhotoCapture('incident', e)} />
-              <button type="button" className="photo-button" onClick={() => document.getElementById('incident-photos').click()}>📸 Add Photos</button>
+              <button type="button" className="photo-button" onClick={() => document.getElementById('incident-photos').click()}>Add Photos</button>
             </div>
             {formData.incidentPhotos?.length > 0 ? (
               <div className="photos-grid">
                 {formData.incidentPhotos.map((photo, idx) => (
                   <div key={idx} className="photo-grid-item">
                     <img src={photo} alt={`Incident ${idx + 1}`} />
-                    <button type="button" className="photo-delete-btn" onClick={() => handleFormChange('incidentPhotos', formData.incidentPhotos.filter((_, i) => i !== idx))}>✕</button>
+                    <button type="button" className="photo-delete-btn" onClick={() => handleFormChange('incidentPhotos', formData.incidentPhotos.filter((_, i) => i !== idx))}>Remove</button>
                   </div>
                 ))}
               </div>

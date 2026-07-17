@@ -1,13 +1,29 @@
 {
   "name": "nightguardtrackappfinal",
-  "version": "1.0.0",
+  "version": "1.0.15",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "postinstall": "node scripts/patch-capgo.mjs",
+    "ota:publish": "npm run build && node scripts/ota-publish.mjs",
+    "ota:publish:beta": "npm run build && node scripts/ota-publish.mjs --channel beta"
   },
   "dependencies": {
+    "@capacitor/android": "^8.3.0",
+    "@capacitor/app": "^8.1.0",
+    "@capacitor/cli": "^8.3.0",
+    "@capacitor/core": "^8.3.0",
+    "@capacitor/device": "^8.0.2",
+    "@capacitor/filesystem": "^8.1.2",
+    "@capacitor/geolocation": "^8.2.0",
+    "@capacitor/keyboard": "^8.0.1",
+    "@capacitor/local-notifications": "^8.1.0",
+    "@capacitor/network": "^8.0.1",
+    "@capacitor/preferences": "^8.0.1",
+    "@capacitor/share": "^8.0.1",
+    "@capgo/capacitor-updater": "^8.51.0",
     "@supabase/supabase-js": "^2.103.0",
     "axios": "^1.14.0",
     "jspdf": "^2.5.1",
@@ -18,7 +34,15 @@
     "react-router-dom": "^7.13.2"
   },
   "devDependencies": {
+    "@capacitor/assets": "^3.0.5",
+    "@eslint/js": "^9.39.5",
+    "@vitejs/plugin-basic-ssl": "^1.1.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.3",
+    "globals": "^17.7.0",
+    "sharp": "^0.35.3",
     "vite": "^5.4.11"
   }
 }

@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import api from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import './screens.css';
 import { getPatrols } from '../services/api';
+import { getCachedPatrols } from '../lib/deviceStore';
 
 export default function PatrolsScreen() {
-  const [patrols, setPatrols] = useState([]);
+  const [patrols, setPatrols] = useState(getCachedPatrols());
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const { logout } = useAuth();
@@ -14,11 +14,19 @@ export default function PatrolsScreen() {
 
   useEffect(() => {
     fetchPatrols();
+    const refreshCachedPatrols = () => setPatrols(getCachedPatrols());
+    window.addEventListener('nightguard_patrols_updated', refreshCachedPatrols);
+    window.addEventListener('nightguard_sync_complete', fetchPatrols);
+    return () => {
+      window.removeEventListener('nightguard_patrols_updated', refreshCachedPatrols);
+      window.removeEventListener('nightguard_sync_complete', fetchPatrols);
+    };
   }, []);
 
   const fetchPatrols = async () => {
     setLoading(true);
     try {
+      setPatrols(getCachedPatrols());
       const data = await getPatrols();
       setPatrols(data || []);
     } catch (error) {

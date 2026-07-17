@@ -1,16 +1,18 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { createOBEntry } from '../services/api';
 import './screens.css';
 import { useOfflineApi } from '../hooks/useOfflineApi';
+import { getCachedSiteSettings, getShiftSession } from '../lib/deviceStore';
+import { useAuth } from '../contexts/AuthContext';
 
 export default function OBEntryScreen() {
+  const { user, shiftSession } = useAuth();
   const [serialNumber, setSerialNumber] = useState('');
   const [nature, setNature] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const navigate = useNavigate();
-  const { post, isOnline } = useOfflineApi();
+  const { post } = useOfflineApi();
 
 
   const submitEntry = async (e) => {
@@ -22,7 +24,14 @@ export default function OBEntryScreen() {
     setError('');
     setLoading(true);
     try {
-      const response = await post('/ob-entries', { serial_number: serialNumber, nature_of_occurrence: nature });
+      const response = await post('/obentries/create', {
+        site_id: getCachedSiteSettings().id || null,
+        shift_id: shiftSession?.id || getShiftSession()?.id || null,
+        captured_by: user?.id || null,
+        guard_id: user?.id || null,
+        serial_number: serialNumber,
+        nature_of_occurrence: nature,
+      });
       
       // Handle offline response:
       if (response._offline) {

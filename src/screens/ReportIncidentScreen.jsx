@@ -1,17 +1,27 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import api from '../services/api';
 import './screens.css';
 import { useOfflineApi } from '../hooks/useOfflineApi';
+import { getCachedSiteSettings, getLookupData, getShiftSession } from '../lib/deviceStore';
+import { useAuth } from '../contexts/AuthContext';
+import NotificationService from '../services/notificationService';
 
 export default function ReportIncidentScreen() {
+  const { user, shiftSession } = useAuth();
   const [incidentType, setIncidentType] = useState('');
   const [description, setDescription] = useState('');
   const [severity, setSeverity] = useState('medium');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [lookupData, setLookupData] = useState(getLookupData());
   const navigate = useNavigate();
-  const { post, isOnline } = useOfflineApi();
+  const { post } = useOfflineApi();
+
+  React.useEffect(() => {
+    const handleLookupUpdate = () => setLookupData(getLookupData());
+    window.addEventListener('nightguard_lookup_updated', handleLookupUpdate);
+    return () => window.removeEventListener('nightguard_lookup_updated', handleLookupUpdate);
+  }, []);
 
   const submitIncident = async (e) => {
     e.preventDefault();
@@ -25,9 +35,20 @@ export default function ReportIncidentScreen() {
 
     try {
       const response = await post('/incidents/report', {
+        site_id: getCachedSiteSettings().id || null,
+        shift_id: shiftSession?.id || getShiftSession()?.id || null,
+        reported_by: user?.id || null,
+        guard_id: user?.id || null,
         incident_type: incidentType,
         description,
-        severity
+        severity,
+      });
+
+      await NotificationService.addToAppNotificationFeed({
+        type: 'incident',
+        title: 'Incident reported',
+        body: `${incidentType}: ${description.slice(0, 80)}`,
+        metadata: { shiftId: shiftSession?.id || getShiftSession()?.id || null, severity },
       });
 
       // Handle offline response
@@ -52,15 +73,18 @@ export default function ReportIncidentScreen() {
       <h1 className="form-title">Report Incident</h1>
       {error && <div style={{ color: '#ef4444', marginBottom: '16px', textAlign: 'center' }}>{error}</div>}
       <form onSubmit={submitIncident}>
-        <input
-          type="text"
-          className="form-input"
-          placeholder="Incident Type"
+        <select
+          className="form-select"
           value={incidentType}
           onChange={(e) => setIncidentType(e.target.value)}
           required
           disabled={loading}
-        />
+        >
+          <option value="">Incident Type</option>
+          {lookupData.incidentTypes.map((type) => (
+            <option key={type} value={type}>{type}</option>
+          ))}
+        </select>
         <textarea
           className="form-textarea"
           placeholder="Description"
