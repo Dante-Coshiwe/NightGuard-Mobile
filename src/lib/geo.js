@@ -1,12 +1,12 @@
 // Geolocation helpers for GPS patrols.
 //
 // A checkpoint counts as "reached" when the guard is physically close to it — within
-// GEOFENCE_RADIUS_METERS (~5 m, i.e. standing at the point). A small accuracy margin (capped at
+// GEOFENCE_RADIUS_METERS (~3 m, i.e. standing at the point). A small accuracy margin (capped at
 // ACCURACY_MARGIN_CAP_METERS) forgives GPS jitter for a guard who is genuinely at the point, and
 // fixes worse than MAX_ACCEPTABLE_ACCURACY_METERS are rejected outright so a bad reading can
 // never credit a check-in from far away.
 
-export const GEOFENCE_RADIUS_METERS = 5;
+export const GEOFENCE_RADIUS_METERS = 3;
 export const MAX_ACCEPTABLE_ACCURACY_METERS = 25;
 export const ACCURACY_MARGIN_CAP_METERS = 5;
 

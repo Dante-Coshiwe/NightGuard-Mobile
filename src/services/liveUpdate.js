@@ -23,7 +23,7 @@ import { getAdminDeviceBinding } from '../lib/deviceBinding';
 // Web bundle version currently shipped. Bump this on every release you publish
 // (it must match the `version` you pass to `ota:publish`). It is what the
 // server compares against to decide if a newer bundle exists.
-export const OTA_CURRENT_VERSION = '1.0.15';
+export const OTA_CURRENT_VERSION = '1.0.16';
 
 const OTA_CHECK_FN = 'ota-check';
 const OTA_REPORT_FN = 'ota-report';
