@@ -29,6 +29,12 @@
     <uses-feature android:name="android.hardware.location" android:required="false" />
     <uses-feature android:name="android.hardware.location.gps" android:required="false" />
 
+    <!-- MainActivity must keep android:windowSoftInputMode="adjustResize". Under forced
+         edge-to-edge, Capacitor's SystemBars inset listener already lifts the WebView above the
+         IME by padding its parent. adjustPan made the window ALSO slide up, so the keyboard height
+         was subtracted twice and the black decor background showed through as a bar above the
+         keyboard. Paired with Keyboard.resizeOnFullScreen=false in capacitor.config.json, which is
+         the other half of that double-resize (it shrank the content view a second time). -->
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -42,7 +48,7 @@
             android:label="@string/title_activity_main"
             android:theme="@style/AppTheme.NoActionBarLaunch"
             android:launchMode="singleTask"
-            android:windowSoftInputMode="adjustPan"
+            android:windowSoftInputMode="adjustResize"
             android:lockTaskMode="if_whitelisted"
             android:excludeFromRecents="true"
             android:noHistory="false"

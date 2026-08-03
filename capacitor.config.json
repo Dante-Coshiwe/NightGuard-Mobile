@@ -5,7 +5,7 @@
   "plugins": {
     "Keyboard": {
       "resize": "body",
-      "resizeOnFullScreen": true
+      "resizeOnFullScreen": false
     },
     "CapacitorUpdater": {
       "autoUpdate": false,
