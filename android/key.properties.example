@@ -1,0 +1,8 @@
+# Copy this file to android/key.properties and fill in your real values.
+# key.properties and *.jks/*.keystore are gitignored — never commit them.
+# storeFile is resolved relative to android/app/ (put the keystore there), or use a full path.
+
+storeFile=nightguard-release.jks
+storePassword=CHANGE_ME
+keyAlias=nightguard
+keyPassword=CHANGE_ME

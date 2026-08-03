@@ -72,6 +72,99 @@ export function findNearestCheckpoint(checkpoints, latitude, longitude) {
   return best;
 }
 
+// Total ground distance walked along a recorded route, in metres.
+//
+// Route points are thinned (see patrolSession), so this reads slightly under the true path on a
+// winding walk — it is an honest floor, not an exact odometer. Individual hops longer than
+// MAX_SEGMENT_GAP_METERS are skipped: those are a GPS glitch or a resumed session, not walking.
+export function routeDistanceMeters(route = []) {
+  const points = (Array.isArray(route) ? route : []).filter((point) => (
+    isValidCoordinate(point?.latitude, point?.longitude)
+  ));
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    const step = distanceMeters(
+      points[i - 1].latitude, points[i - 1].longitude,
+      points[i].latitude, points[i].longitude,
+    );
+    if (Number.isFinite(step) && step <= MAX_SEGMENT_GAP_METERS) total += step;
+  }
+  return total;
+}
+
+// Average walking stride. Used to turn measured distance into a step estimate — the phone has no
+// pedometer available to the WebView, so this is derived from GPS, never counted.
+export const AVERAGE_STRIDE_METERS = 0.75;
+
+export function estimateStepsFromDistance(metres) {
+  const value = Number(metres);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.round(value / AVERAGE_STRIDE_METERS);
+}
+
+// Perpendicular distance in metres from a point to the straight segment A->B, via a local
+// equirectangular projection (sub-centimetre at patrol scale).
+export function distanceToSegmentMeters(lat, lng, latA, lngA, latB, lngB) {
+  if (![lat, lng, latA, lngA, latB, lngB].every((value) => Number.isFinite(Number(value)))) {
+    return Infinity;
+  }
+  const metresPerDegreeLat = 111320;
+  const metresPerDegreeLng = 111320 * Math.cos(toRadians(Number(lat)));
+
+  const toXY = (la, ln) => ({
+    x: (Number(ln) - Number(lng)) * metresPerDegreeLng,
+    y: (Number(la) - Number(lat)) * metresPerDegreeLat,
+  });
+
+  const a = toXY(latA, lngA);
+  const b = toXY(latB, lngB);
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lengthSquared = dx * dx + dy * dy;
+
+  // Degenerate segment (the guard stood still): fall back to point distance.
+  if (lengthSquared === 0) return Math.hypot(a.x, a.y);
+
+  // Projection of the origin (the checkpoint) onto AB, clamped to the segment.
+  const t = Math.max(0, Math.min(1, -((a.x * dx) + (a.y * dy)) / lengthSquared));
+  return Math.hypot(a.x + t * dx, a.y + t * dy);
+}
+
+// A GPS fix arrives every few seconds, so a guard walking past a checkpoint covers several metres
+// between fixes and can step straight over a 3 m fence without a single fix ever landing inside it
+// — the point silently reads as "missed". Checking the PATH between two consecutive fixes instead
+// of each fix in isolation is what dedicated patrol trackers do, and it credits the guard who
+// genuinely walked the route without widening the fence for someone who did not.
+//
+// Guard rails: both fixes must be trustworthy, and the gap must look like walking. A long jump
+// (vehicle, GPS glitch, resumed after a pause) would otherwise credit every checkpoint on the
+// straight line between two distant points.
+export const MAX_SEGMENT_GAP_MS = 120000;
+export const MAX_SEGMENT_GAP_METERS = 200;
+
+export function segmentCrossedCheckpoint(checkpoint, previousFix, fix, radius = GEOFENCE_RADIUS_METERS) {
+  if (!hasCoordinates(checkpoint) || !previousFix || !fix) return false;
+
+  const previousAccuracy = Number(previousFix.accuracy);
+  const accuracy = Number(fix.accuracy);
+  if (Number.isFinite(accuracy) && accuracy > MAX_ACCEPTABLE_ACCURACY_METERS) return false;
+  if (Number.isFinite(previousAccuracy) && previousAccuracy > MAX_ACCEPTABLE_ACCURACY_METERS) return false;
+
+  const elapsed = Math.abs(new Date(fix.at || fix.timestamp || Date.now()) - new Date(previousFix.at || previousFix.timestamp || Date.now()));
+  if (elapsed > MAX_SEGMENT_GAP_MS) return false;
+
+  const travelled = distanceMeters(previousFix.latitude, previousFix.longitude, fix.latitude, fix.longitude);
+  if (!Number.isFinite(travelled) || travelled > MAX_SEGMENT_GAP_METERS) return false;
+
+  const margin = Number.isFinite(accuracy) ? Math.min(Math.max(accuracy, 0), ACCURACY_MARGIN_CAP_METERS) : 0;
+  const distance = distanceToSegmentMeters(
+    Number(checkpoint.latitude), Number(checkpoint.longitude),
+    Number(previousFix.latitude), Number(previousFix.longitude),
+    Number(fix.latitude), Number(fix.longitude),
+  );
+  return distance <= radius + margin;
+}
+
 // Whether a position/accuracy pair is inside a checkpoint's geofence and trustworthy enough to log.
 // The effective radius grows with the fix's reported accuracy (capped) so an honest guard at the
 // point is credited despite GPS jitter, while clearly unreliable fixes are rejected outright.

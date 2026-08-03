@@ -6,6 +6,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useOfflineApi } from '../hooks/useOfflineApi';
 import { syncOfflineQueueNow } from '../hooks/useOfflineQueue';
 import { getCachedSiteSettings, getPatrolConfig, getShiftSession, upsertCachedPatrol } from '../lib/deviceStore';
+import { getActivePatrolSession, startPatrolSession } from '../lib/patrolSession';
 import NotificationService from '../services/notificationService';
 
 function formatMinute(date = new Date()) {
@@ -14,10 +15,6 @@ function formatMinute(date = new Date()) {
 
 function formatDateKey(date = new Date()) {
   return date.toISOString().slice(0, 10);
-}
-
-function createLocalId(prefix) {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function startAlarm() {
@@ -153,7 +150,24 @@ export default function PatrolScheduleAlert() {
   const handleStartPatrol = async () => {
     if (!duePatrol) return;
 
-    const patrolId = createLocalId('patrol');
+    const config = getPatrolConfig();
+    const requiredCount = config.checkpoints.filter((checkpoint) => checkpoint.required !== false).length
+      || config.minimumTagCount
+      || 1;
+
+    // Open the same durable patrol session the Patrol tab and <PatrolRecorder /> work from. The
+    // alarm used to mint a loose patrol id and hand off to a separate tracking screen that never
+    // opened a session, so an alarm-started patrol recorded no route and never completed.
+    // A patrol already in progress is resumed, never overwritten — that would discard its route.
+    const session = getActivePatrolSession() || startPatrolSession({
+      siteId: duePatrol.siteId,
+      shiftId: duePatrol.shiftId,
+      guardId: duePatrol.guardId,
+      guardName: duePatrol.guardName,
+      requiredCount,
+    });
+
+    const patrolId = session.id;
     const now = new Date().toISOString();
     const patrol = {
       id: patrolId,
@@ -162,13 +176,13 @@ export default function PatrolScheduleAlert() {
       guard_id: null,
       local_guard_id: duePatrol.guardId,
       patrol_name: `Scheduled Patrol ${duePatrol.time}`,
-      actual_start: now,
+      actual_start: session.startedAt,
       status: 'in_progress',
       created_at: now,
       updated_at: now,
       guard_name: duePatrol.guardName,
       _offline: true,
-      total_checkpoints: getPatrolConfig().checkpoints.length,
+      total_checkpoints: config.checkpoints.length,
       checkpoints_completed: 0,
     };
 
@@ -197,7 +211,9 @@ export default function PatrolScheduleAlert() {
       console.error('[PatrolAlert] Patrol start queued with warning:', err?.message || err);
     }
 
-    navigate(`/patrol/${patrolId}`, { state: { patrol }, replace: false });
+    // Land on the app's own Patrol tab — same screen "Start Patrol" opens by hand — instead of a
+    // separate tracking screen with its own navigation.
+    navigate('/', { state: { tab: 'patrols' }, replace: false });
   };
 
   if (!duePatrol) return null;

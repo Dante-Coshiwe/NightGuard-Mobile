@@ -2,19 +2,23 @@ import { supabase } from '../lib/supabase';
 import {
   GENERAL_GUARD,
   getCachedGuards,
+  getCachedCompletedShifts,
   getCachedPatrols,
   getCachedSiteSettings,
+  saveCachedCompletedShifts,
   getNfcScans,
   getPatrolConfig,
   getShiftSession,
   saveCachedGuards,
   upsertCachedGuard,
   updateCachedGuard,
+  saveCachedPatrols,
   upsertCachedPatrol,
   isGeneralGuardId,
 } from '../lib/deviceStore';
 
-const SITE_ID = import.meta.env.VITE_SITE_ID || null;
+import { getBoundSiteIdSync, getSiteBinding } from '../lib/siteResolver';
+
 const CACHED_USER_KEY = 'nightguard_cached_user';
 
 class ApiError extends Error {
@@ -128,7 +132,7 @@ async function getCurrentProfile() {
       user_type: 'guard',
       role: 'guard',
       is_active: true,
-      site_id: SITE_ID,
+      site_id: getBoundSiteIdSync(),
     };
   }
   return {
@@ -144,11 +148,25 @@ async function getActorId() {
   return session?.user?.id || null;
 }
 
+// The DEVICE's site, not the signed-in user's.
+//
+// This used to read the cached user's site_id first, which is the home site on
+// that manager's profile. For a manager who holds several sites that is simply
+// the wrong site, and every row the device wrote was filed against it. The
+// device's own binding is the only correct answer; the profile is a last-ditch
+// fallback for a device that somehow has no binding at all.
 async function getCurrentSiteId() {
+  const binding = await getSiteBinding();
+  if (binding?.site_id) return binding.site_id;
+
+  const cachedSite = getCachedSiteSettings();
+  if (cachedSite?.id) return cachedSite.id;
+
   const cachedUser = getCachedUser();
   if (cachedUser?.site_id) return cachedUser.site_id;
+
   const profile = await getCurrentProfile();
-  return profile?.site_id || SITE_ID || null;
+  return profile?.site_id || null;
 }
 
 async function getCurrentOrganizationId() {
@@ -288,7 +306,9 @@ async function listPatrols(filter = {}) {
   const siteId = filter.siteId || await getCurrentSiteId();
   const cachedPatrols = getCachedPatrols();
 
-  if (!navigator.onLine) {
+  // No site means no server read: an unfiltered query returns every site's patrols and caches them
+  // on this device. Offline behaves the same way — answer from what is already here.
+  if (!navigator.onLine || !siteId) {
     return cachedPatrols.filter((patrol) => (
       (!siteId || String(patrol.site_id) === String(siteId)) &&
       (!filter.id || String(patrol.id) === String(filter.id)) &&
@@ -296,9 +316,7 @@ async function listPatrols(filter = {}) {
     ));
   }
 
-  let query = supabase.from('patrols').select('*').order('created_at', { ascending: false });
-
-  if (siteId) query = query.eq('site_id', siteId);
+  let query = supabase.from('patrols').select('*').eq('site_id', siteId).order('created_at', { ascending: false });
   if (filter.guardId) {
     const guardRefs = resolveGuardRefs({ guard_id: filter.guardId });
     if (guardRefs.local_guard_id) {
@@ -323,8 +341,23 @@ async function listPatrols(filter = {}) {
       checkpoints_completed: counts.completed,
     };
   });
-  mapped.forEach(upsertCachedPatrol);
-  return mapped.length ? mapped : cachedPatrols;
+  // One write, not one per patrol. upsertCachedPatrol re-reads, re-parses, dedupes, rewrites the
+  // whole array and fires a re-render event EACH time, so refreshing a few hundred patrols was
+  // quadratic and visibly froze the screen. Server rows lead, so first-wins dedupe prefers them.
+  saveCachedPatrols([...mapped, ...cachedPatrols]);
+
+  // Merge in patrols the server does not know about yet (completed offline, still in the queue) so
+  // a guard who just finished a walk never sees it vanish from the list the moment they reconnect.
+  const serverIds = new Set(mapped.map((patrol) => String(patrol.id)));
+  const pendingLocal = cachedPatrols.filter((patrol) => (
+    !serverIds.has(String(patrol.id)) &&
+    (!siteId || !patrol.site_id || String(patrol.site_id) === String(siteId)) &&
+    (!filter.id || String(patrol.id) === String(filter.id))
+  ));
+  if (!pendingLocal.length) return mapped;
+  return [...pendingLocal, ...mapped].sort(
+    (a, b) => new Date(b.actual_start || b.created_at || 0) - new Date(a.actual_start || a.created_at || 0),
+  );
 }
 
 async function listGuardProfiles(siteId) {
@@ -364,6 +397,8 @@ async function getCurrentShift(siteId) {
     };
   }
 
+  if (!siteId) return null;
+
   let query = supabase
     .from('shifts')
     .select('*')
@@ -371,7 +406,7 @@ async function getCurrentShift(siteId) {
     .order('started_at', { ascending: false })
     .limit(1);
 
-  if (siteId) query = query.eq('site_id', siteId);
+  query = query.eq('site_id', siteId);
 
   const { data, error } = await query;
   if (error) throwSupabaseError(error, 400);
@@ -448,33 +483,52 @@ async function endShiftRecord(payload = {}) {
 
 async function listCompletedShifts() {
   const siteId = await getCurrentSiteId();
+  const cached = getCachedCompletedShifts().filter((shift) => (
+    !shift.site_id || String(shift.site_id) === String(siteId)
+  ));
+
+  // An unbound device (binding not yet resolved, fresh install, wiped storage) must never read
+  // across sites. Offline, answer from the cache rather than showing the report as empty.
+  if (!siteId) return [];
+  if (!navigator.onLine) return cached;
+
   let query = supabase
     .from('shifts')
     .select('*')
     .neq('status', 'active')
     .order('started_at', { ascending: false });
 
-  if (siteId) query = query.eq('site_id', siteId);
+  query = query.eq('site_id', siteId);
 
   const { data, error } = await query;
-  if (error) throwSupabaseError(error, 400);
+  // A failed refresh must not empty a report the device can already answer from its cache.
+  if (error) {
+    if (cached.length) return cached;
+    throwSupabaseError(error, 400);
+  }
 
   const rows = await mapRowsWithProfiles(data || []);
-  return rows.map((row) => ({
+  const mapped = rows.map((row) => ({
     ...row,
     start_time: row.started_at,
     end_time: row.ended_at,
   }));
+
+  saveCachedCompletedShifts([...mapped, ...cached]);
+  return mapped.length ? mapped : cached;
 }
 
 async function listPedestrians({ currentGuardOnly = false } = {}) {
   const siteId = await getCurrentSiteId();
+  // An unbound device (binding not yet resolved, fresh install, wiped storage) must never
+  // read across sites — without a site filter this returns every site's records.
+  if (!siteId) return [];
   let query = supabase
     .from('pedestrians')
     .select('*')
     .order('entry_time', { ascending: false });
 
-  if (siteId) query = query.eq('site_id', siteId);
+  query = query.eq('site_id', siteId);
   if (currentGuardOnly) {
     const actorId = await getActorId();
     const guardRefs = resolveGuardRefs({ guard_id: actorId });
@@ -531,12 +585,15 @@ async function markPedestrianExited(id) {
 
 async function listVehicles({ currentGuardOnly = false } = {}) {
   const siteId = await getCurrentSiteId();
+  // An unbound device (binding not yet resolved, fresh install, wiped storage) must never
+  // read across sites — without a site filter this returns every site's records.
+  if (!siteId) return [];
   let query = supabase
     .from('vehicles')
     .select('*')
     .order('entered_at', { ascending: false });
 
-  if (siteId) query = query.eq('site_id', siteId);
+  query = query.eq('site_id', siteId);
   if (currentGuardOnly) {
     const actorId = await getActorId();
     const guardRefs = resolveGuardRefs({ guard_id: actorId });
@@ -598,12 +655,15 @@ async function markVehicleExited(id) {
 
 async function listIncidents() {
   const siteId = await getCurrentSiteId();
+  // An unbound device (binding not yet resolved, fresh install, wiped storage) must never
+  // read across sites — without a site filter this returns every site's records.
+  if (!siteId) return [];
   let query = supabase
     .from('incidents')
     .select('*')
     .order('reported_at', { ascending: false });
 
-  if (siteId) query = query.eq('site_id', siteId);
+  query = query.eq('site_id', siteId);
 
   const { data, error } = await query;
   if (error) throwSupabaseError(error, 400);
@@ -655,12 +715,15 @@ async function createSecurityEvent(payload) {
 
 async function listObEntries() {
   const siteId = await getCurrentSiteId();
+  // An unbound device (binding not yet resolved, fresh install, wiped storage) must never
+  // read across sites — without a site filter this returns every site's records.
+  if (!siteId) return [];
   let query = supabase
     .from('ob_entries')
     .select('*')
     .order('captured_timestamp', { ascending: false });
 
-  if (siteId) query = query.eq('site_id', siteId);
+  query = query.eq('site_id', siteId);
 
   const { data, error } = await query;
   if (error) throwSupabaseError(error, 400);
@@ -698,16 +761,18 @@ async function listNfcCheckpoints() {
     checkpoint_name: checkpoint.name,
   }));
 
-  if (!navigator.onLine) {
+  // Without a resolved site this query would return the patrol point layout of EVERY site on the
+  // project and cache it on this device. A device that does not know where it is must show only
+  // what it already holds locally.
+  if (!navigator.onLine || !siteId) {
     return localCheckpoints;
   }
 
-  let query = supabase
+  const query = supabase
     .from('patrol_checkpoints')
     .select('*')
+    .eq('site_id', siteId)
     .order('checkpoint_order', { ascending: true });
-
-  if (siteId) query = query.eq('site_id', siteId);
 
   const { data, error } = await query;
   if (error) throwSupabaseError(error, 400);
@@ -791,22 +856,27 @@ async function completePatrolRecord(payload = {}) {
   )) : [];
 
   if (route.length && data?.id) {
-    // Skip if this patrol's route already landed (a retried queue item after a partial failure).
+    // How much of this patrol's route already landed. Batches are written in order, so a retry
+    // after a partial failure resumes from there. The old code skipped the whole route whenever
+    // any of it existed, which permanently truncated the walk at the batch that failed.
     const { count } = await supabase
       .from('nfc_scans')
       .select('id', { count: 'exact', head: true })
       .eq('patrol_id', data.id)
       .eq('method', 'route_point');
 
-    if (!count) {
-      const rows = route.map((point, index) => ({
+    const alreadyStored = Number(count) || 0;
+    const remaining = route.slice(alreadyStored);
+
+    if (remaining.length) {
+      const rows = remaining.map((point, offset) => ({
         site_id: siteId,
         guard_id: guardRefs.guard_id,
         local_guard_id: guardRefs.local_guard_id,
         shift_id: nullableUuid(payload.shift_id),
         patrol_id: data.id,
         checkpoint_id: null,
-        checkpoint_name: `Route point ${index + 1}`,
+        checkpoint_name: `Route point ${alreadyStored + offset + 1}`,
         tag_uid: null,
         scanned_at: point.at || new Date().toISOString(),
         status: 'route',
@@ -820,8 +890,7 @@ async function completePatrolRecord(payload = {}) {
         let batch = rows.slice(i, i + 400);
         let { error: routeError } = await supabase.from('nfc_scans').insert(batch);
 
-        // A dead shift/guard reference (FK 23503) must not throw away the whole walked route
-        // (the patrols row is already saved, so a thrown 400 just gets this queue item dropped).
+        // A dead shift/guard reference (FK 23503) must not throw away the whole walked route.
         // Retry once with the link columns nulled — the trail itself is what matters.
         if (routeError?.code === '23503') {
           console.warn('[api] completePatrolRecord(): dead reference in route batch, retrying unlinked:', routeError.message);
@@ -875,11 +944,11 @@ const SCAN_FK_COLUMNS = ['patrol_id', 'checkpoint_id', 'shift_id', 'local_guard_
 async function insertScanDroppingDeadRefs(insertPayload) {
   let attempt = { ...insertPayload };
   for (let i = 0; i <= SCAN_FK_COLUMNS.length; i += 1) {
-    const { data, error } = await supabase
-      .from('nfc_scans')
-      .insert(attempt)
-      .select('*')
-      .single();
+    // Upsert, not insert: the device supplies nfc_scans.id, so re-sending a scan whose response
+    // was lost on a flaky link resolves to the same row instead of a duplicate check-in.
+    const { data, error } = attempt.id
+      ? await supabase.from('nfc_scans').upsert(attempt, { onConflict: 'id' }).select('*').single()
+      : await supabase.from('nfc_scans').insert(attempt).select('*').single();
 
     if (!error) return { data, attempt };
 
@@ -898,7 +967,9 @@ async function insertScanDroppingDeadRefs(insertPayload) {
 
 async function createNfcScan(payload) {
   const guardRefs = resolveGuardRefs(payload, payload.guard_id || await getActorId());
+  const clientScanId = isUuid(payload.client_scan_id) ? payload.client_scan_id : (isUuid(payload.id) ? payload.id : null);
   const insertPayload = {
+    ...(clientScanId ? { id: clientScanId } : {}),
     site_id: payload.site_id || await getCurrentSiteId(),
     guard_id: guardRefs.guard_id,
     local_guard_id: guardRefs.local_guard_id,
@@ -940,17 +1011,17 @@ async function createNfcScan(payload) {
 async function listNfcScans() {
   const siteId = await getCurrentSiteId();
   const localScans = getNfcScans();
-  if (!navigator.onLine) {
+  // Same rule as the other reads: unbound device never pulls the whole project's scan history.
+  if (!navigator.onLine || !siteId) {
     return localScans.filter((scan) => !siteId || String(scan.site_id) === String(siteId));
   }
 
-  let query = supabase
+  const query = supabase
     .from('nfc_scans')
     .select('*')
+    .eq('site_id', siteId)
     .or('method.is.null,method.neq.route_point')
     .order('scanned_at', { ascending: false });
-
-  if (siteId) query = query.eq('site_id', siteId);
 
   const { data, error } = await query;
   if (error) throwSupabaseError(error, 400);

@@ -31,6 +31,13 @@ import {
 } from '../lib/deviceStore';
 import { confirmAppOnline, isAppOnline, NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
 import { clearAdminDeviceBinding, getAdminDeviceBinding, saveAdminDeviceBinding } from '../lib/deviceBinding';
+import {
+  claimDeviceForSite,
+  getBoundSiteIdSync,
+  listBindableSites,
+  resolveSiteBinding,
+  __clearSiteBinding,
+} from '../lib/siteResolver';
 import NotificationService from '../services/notificationService';
 import KioskService from '../services/kioskService';
 import { hasAdminPinHash } from '../services/kioskPinService';
@@ -40,7 +47,6 @@ const AuthContext = createContext();
 const CACHED_USER_KEY = 'nightguard_cached_user';
 const BOUND_USER_KEY = 'nightguard_bound_user';
 const DEVICE_BOUND_KEY = 'nightguard_device_bound';
-const SITE_ID = import.meta.env.VITE_SITE_ID;
 
 function normaliseGuard(guard) {
   if (isGeneralGuardId(guard?.id) || guard?._is_general_guard) {
@@ -98,6 +104,10 @@ export const AuthProvider = ({ children }) => {
   const [shiftSession, setShiftSession] = useState(getShiftSession());
   const [quickSwitchEnabled, setQuickSwitchEnabledState] = useState(getQuickSwitchEnabled());
   const [loading, setLoading] = useState(true);
+  // True only when this device has no site at all and a manager is signed in to
+  // choose one. Never set for a device that is already running against a site —
+  // those are adopted silently by resolveSiteBinding().
+  const [needsSiteBinding, setNeedsSiteBinding] = useState(false);
 
   const cacheUser = (userData) => {
     localStorage.setItem(CACHED_USER_KEY, JSON.stringify(userData));
@@ -180,7 +190,7 @@ export const AuthProvider = ({ children }) => {
           id: adminBinding.admin_id || null,
           email: adminBinding.admin_email,
           organization_id: adminBinding.org_id || null,
-          site_id: adminBinding.site_id || SITE_ID || null,
+          site_id: getBoundSiteIdSync() || adminBinding.site_id || null,
           full_name: adminBinding.admin_email,
           name: adminBinding.admin_email,
           user_type: 'admin',
@@ -209,18 +219,46 @@ export const AuthProvider = ({ children }) => {
         }
       }
 
-      await Promise.all([loadGuards(), refreshSiteSettings()]);
-      await Promise.allSettled([
-        loadSiteLookupData(getCachedSiteSettings()),
-        loadPatrolConfiguration(getCachedSiteSettings()),
-        loadDeviceConfiguration(getCachedSiteSettings()),
-        loadReportSchedules(getCachedSiteSettings()),
-      ]);
+      // Resolve the site BEFORE anything reads it. A device already in the field
+      // has its site adopted here from the old admin binding — same site, no
+      // picker, no re-login. Only a device with no site anywhere lands on the
+      // picker, and only once a manager is signed in to answer it.
+      //
+      // Reads local storage first and only touches the network when the device
+      // both believes it is online and has no binding at all, so an offline boot
+      // never waits here.
+      const resolvedSite = await resolveSiteBinding({ refresh: isAppOnline() });
+      if (!resolvedSite) setNeedsSiteBinding(true);
+
+      // Everything the UI needs is already on disk. Seed state from the cache and
+      // open the app NOW — a guard coming on duty must not wait on a network that
+      // may not answer.
+      loadGuards();
+      setSiteSettings(getCachedSiteSettings());
+      setLoading(false);
+
+      // The refresh runs behind the open app. Every loader writes to the cache and
+      // fires its store event, and the screens all listen for those, so whatever
+      // comes back lands on screen without anyone waiting for it. Failures are
+      // expected offline and are not worth surfacing.
+      void (async () => {
+        try {
+          await refreshSiteSettings();
+          await Promise.allSettled([
+            loadSiteLookupData(getCachedSiteSettings()),
+            loadPatrolConfiguration(getCachedSiteSettings()),
+            loadDeviceConfiguration(getCachedSiteSettings()),
+            loadReportSchedules(getCachedSiteSettings()),
+          ]);
+        } catch (err) {
+          console.warn('[Auth] Background refresh failed:', err?.message || err);
+        }
+      })();
+
       // NightGuard fix: restore persisted kiosk mode after app boot without touching keyboard/inset code.
-      await KioskService.restoreActiveSession().catch((err) => {
+      KioskService.restoreActiveSession().catch((err) => {
         console.error('[Auth] Kiosk restore failed:', err?.message || err);
       });
-      setLoading(false);
     };
 
     bootstrap();
@@ -271,7 +309,7 @@ export const AuthProvider = ({ children }) => {
     if (cachedUser) {
       const userData = JSON.parse(cachedUser);
       setUser(userData);
-      return userData;
+      return { user: userData, needsSiteBinding: false };
     }
 
     const boundUser = getBoundUser();
@@ -280,7 +318,60 @@ export const AuthProvider = ({ children }) => {
     }
 
     cacheUser(boundUser);
-    return boundUser;
+    return { user: boundUser, needsSiteBinding: false };
+  };
+
+  // Decide this device's site at admin login.
+  //
+  //   already bound     -> keep it, silently. The binding is permanent, so a
+  //                        second manager signing in never moves the device.
+  //   exactly one site  -> bind to it; there is nothing to ask.
+  //   several sites     -> the picker.
+  //
+  // Returns true when the caller must send the manager to the picker.
+  const resolveSiteForLogin = async () => {
+    const existing = await resolveSiteBinding({ refresh: true });
+    if (existing?.site_id) {
+      setNeedsSiteBinding(false);
+      return false;
+    }
+
+    let sites = [];
+    try {
+      sites = await listBindableSites();
+    } catch (err) {
+      console.warn('[Auth] Could not list bindable sites:', err?.message || err);
+    }
+
+    if (sites.length === 1) {
+      try {
+        await claimDeviceForSite(sites[0]);
+        setNeedsSiteBinding(false);
+        return false;
+      } catch (err) {
+        console.warn('[Auth] Auto-bind failed, falling back to picker:', err?.message || err);
+      }
+    }
+
+    setNeedsSiteBinding(true);
+    return true;
+  };
+
+  // Called by the picker once the manager has chosen. Binds permanently, then
+  // pulls the new site's lookup/patrol/device config so the device is usable
+  // straight away.
+  const completeSiteBinding = async (site) => {
+    const binding = await claimDeviceForSite(site);
+    setNeedsSiteBinding(false);
+
+    const latestSite = await refreshSiteSettings();
+    await Promise.allSettled([
+      loadSiteLookupData(latestSite),
+      loadPatrolConfiguration(latestSite),
+      loadDeviceConfiguration(latestSite),
+      loadReportSchedules(latestSite),
+    ]);
+    return binding;
   };
 
   const login = async (email, password) => {
@@ -306,10 +397,17 @@ export const AuthProvider = ({ children }) => {
     cacheUser(userData);
     cacheBoundUser(userData);
     await saveAdminDeviceBinding(userData, email);
+
+    // Site first: everything below reads it.
+    const mustPickSite = await resolveSiteForLogin();
+    if (mustPickSite) {
+      return { user: userData, needsSiteBinding: true };
+    }
+
     await Promise.all([loadGuards(), refreshSiteSettings()]);
     await syncOfflineQueueNow();
     await syncPendingSchemaData(getCachedSiteSettings());
-    return userData;
+    return { user: userData, needsSiteBinding: false };
   };
 
   const startShiftLogin = async ({ guardId, pin, shiftLabel, createShift = true } = {}) => {
@@ -325,7 +423,7 @@ export const AuthProvider = ({ children }) => {
 
     commitGuards([guardUser]);
 
-    const siteId = getCachedSiteSettings().id || SITE_ID || null;
+    const siteId = getBoundSiteIdSync() || getCachedSiteSettings().id || null;
     const shiftId = createShift ? createLocalId('shift') : (shiftSession?.id || getShiftSession()?.id || null);
     const startedAt = new Date().toISOString();
     const session = {
@@ -414,6 +512,11 @@ export const AuthProvider = ({ children }) => {
     localStorage.removeItem(BOUND_USER_KEY);
     localStorage.removeItem('nightguard_bound_email');
     await clearAdminDeviceBinding();
+    // Drop the local site bind too. The server record stands, so a device that
+    // has not physically moved re-adopts the same site on the next login;
+    // relocating it is a dashboard action, deliberately not one the device can
+    // perform on itself.
+    await __clearSiteBinding();
     clearShiftSession();
     setShiftSession(null);
     setUser(null);
@@ -443,6 +546,8 @@ export const AuthProvider = ({ children }) => {
         startShiftLogin,
         switchGuard,
         shiftSession,
+        needsSiteBinding,
+        completeSiteBinding,
         quickSwitchEnabled,
         setQuickSwitchEnabled,
         setCachedGuards: commitGuards,

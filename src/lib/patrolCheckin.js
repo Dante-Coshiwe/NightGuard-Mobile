@@ -1,4 +1,5 @@
-import { findNearestCheckpoint, isWithinGeofence } from './geo';
+import { findNearestCheckpoint, hasCoordinates, isWithinGeofence, segmentCrossedCheckpoint } from './geo';
+import { newUuid } from './uuid';
 
 // Shared patrol check-in logic used by both the home Patrol tab and the Patrol Tracking
 // screen, so NFC and GPS behave identically regardless of which surface the guard uses.
@@ -39,6 +40,24 @@ export function evaluateGpsFix(checkpoints, position) {
   };
 }
 
+// Every checkpoint newly satisfied by this fix, considering both where the guard is now and the
+// path walked since the previous fix. Most sites are GPS-only, so this is the primary way points
+// get captured — a checkpoint missed here is a checkpoint missing from the report.
+export function evaluateGpsProgress(checkpoints, previousFix, fix, reachedIds = []) {
+  const reached = new Set((reachedIds || []).map(String));
+  const candidates = (Array.isArray(checkpoints) ? checkpoints : []).filter(hasCoordinates);
+  if (!candidates.length) return [];
+
+  return candidates.filter((checkpoint) => {
+    if (reached.has(String(checkpoint.id))) return false;
+
+    const distance = findNearestCheckpoint([checkpoint], fix?.latitude, fix?.longitude)?.distance;
+    if (Number.isFinite(distance) && isWithinGeofence(distance, fix?.accuracy)) return true;
+
+    return segmentCrossedCheckpoint(checkpoint, previousFix, fix);
+  });
+}
+
 function checkpointName(checkpoint, method) {
   return (
     checkpoint?.name ||
@@ -60,18 +79,26 @@ export function buildPatrolScanEntry({
   shiftLabel = 'Active Shift',
   patrolId = null,
   isOnline = true,
+  // Captures recorded by the background service are handed over later, so they carry the moment
+  // the guard was actually at the point rather than the moment the app got round to saving them.
+  scannedAt = null,
 }) {
   const resolvedTag = method === 'nfc' ? tagUid || null : matchedCheckpoint?.tag_uid || null;
+  // A real UUID, not a `scan_...` string: the server writes it straight into nfc_scans.id, so a
+  // queue retry after a response was lost in transit upserts the same row instead of logging the
+  // guard at the same checkpoint twice.
+  const scanId = newUuid();
 
   return {
-    id: `scan_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    id: scanId,
+    client_scan_id: scanId,
     site_id: siteId,
     guard_id: guardId,
     shift_id: shiftId,
     patrol_id: patrolId,
     guard_name: guardName,
     shift_label: shiftLabel,
-    scanned_at: new Date().toISOString(),
+    scanned_at: scannedAt || new Date().toISOString(),
     tag_uid: resolvedTag,
     checkpoint_id: matchedCheckpoint?.id || null,
     checkpoint_name: checkpointName(matchedCheckpoint, method),

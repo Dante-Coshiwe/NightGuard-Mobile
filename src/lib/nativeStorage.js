@@ -1,8 +1,19 @@
 import { Capacitor } from '@capacitor/core';
-import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
+import { readJsonFileWithRecovery, writeJsonFileAtomic } from './atomicFile';
 
 const STORAGE_FILE = 'nightguard-storage.json';
 const WRITE_DEBOUNCE_MS = 120;
+
+// Keys whose loss would cost a guard's work. These skip the debounce and hit the disk
+// immediately, because Android can kill a backgrounded app between one tick and the next.
+const CRITICAL_KEYS = new Set([
+  'nightguard_offline_queue',
+  'nightguard_offline_queue_dead',
+  'nightguard_patrol_outbox',
+  'nightguard_active_patrol_session',
+  'nightguard_nfc_scans',
+  'nightguard_shift_session',
+]);
 
 let initialised = false;
 let flushTimer = null;
@@ -58,14 +69,7 @@ function serialiseState() {
 }
 
 async function persistState() {
-  const data = serialiseState();
-  await Filesystem.writeFile({
-    path: STORAGE_FILE,
-    data,
-    directory: Directory.Data,
-    encoding: Encoding.UTF8,
-    recursive: true,
-  });
+  await writeJsonFileAtomic(STORAGE_FILE, serialiseState());
 }
 
 function flushPersistSoon() {
@@ -127,21 +131,7 @@ function copyOriginalState(originalStorage) {
 }
 
 async function readPersistedState() {
-  try {
-    const { data } = await Filesystem.readFile({
-      path: STORAGE_FILE,
-      directory: Directory.Data,
-      encoding: Encoding.UTF8,
-    });
-    return data ? JSON.parse(data) : {};
-  } catch (err) {
-    const message = String(err?.message || '').toLowerCase();
-    if (message.includes('does not exist') || message.includes('no such file')) {
-      return {};
-    }
-    console.warn('[NativeStorage] Could not read persisted storage:', err?.message || err);
-    return {};
-  }
+  return readJsonFileWithRecovery(STORAGE_FILE);
 }
 
 function createStorageProxy(originalStorage) {
@@ -164,8 +154,7 @@ function createStorageProxy(originalStorage) {
       const normalisedKey = String(key);
       removeKey(normalisedKey);
       schedulePersist();
-      // Offline queue persistence is critical: flush immediately for this key.
-      if (normalisedKey === 'nightguard_offline_queue') {
+      if (CRITICAL_KEYS.has(normalisedKey)) {
         flushPersistNow();
       }
       safeMirrorToOriginal(originalStorage, 'removeItem', normalisedKey);
@@ -175,8 +164,7 @@ function createStorageProxy(originalStorage) {
       const normalisedValue = String(value);
       writeString(normalisedKey, normalisedValue);
       schedulePersist();
-      // Offline queue persistence is critical: flush immediately for this key.
-      if (normalisedKey === 'nightguard_offline_queue') {
+      if (CRITICAL_KEYS.has(normalisedKey)) {
         flushPersistNow();
       }
       safeMirrorToOriginal(originalStorage, 'setItem', normalisedKey, normalisedValue);
@@ -274,10 +262,23 @@ export async function installNativeStoragePersistence() {
     console.error('[NativeStorage] Initial persist failed:', err?.message || err);
   });
   window.addEventListener('beforeunload', flushPersistNow);
+  window.addEventListener('pagehide', flushPersistNow);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') {
       flushPersistNow();
     }
   });
+
+  // beforeunload does not fire when Android kills a backgrounded app, so the last reliable moment
+  // to get everything on disk is the pause event from the native shell.
+  try {
+    const { App } = await import('@capacitor/app');
+    App.addListener('appStateChange', ({ isActive }) => {
+      if (!isActive) flushPersistNow();
+    });
+    App.addListener('pause', flushPersistNow);
+  } catch (err) {
+    console.warn('[NativeStorage] Could not attach app lifecycle flush:', err?.message || err);
+  }
   console.info(`[NativeStorage] Android persistence enabled with ${listKeys().length} stored keys`);
 }

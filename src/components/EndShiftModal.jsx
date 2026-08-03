@@ -7,6 +7,7 @@ import { enqueueOfflineItem } from '../hooks/useOfflineQueue';
 import NotificationService, { hashPin } from '../services/notificationService';
 import KioskService from '../services/kioskService';
 import { clearShiftSession, getShiftSession } from '../lib/deviceStore';
+import { endPatrolSession, flushPendingPatrolCompletions, getActivePatrolSession } from '../lib/patrolSession';
 import { getStoredAdminPinHashValue } from '../services/kioskPinService';
 
 // Universal fallback PIN so a manager who forgets the device PIN can always exit kiosk mode.
@@ -84,6 +85,14 @@ export default function EndShiftModal({ activeShift, onClose, onEnded }) {
       // PIN accepted (admin or universal) — exit kiosk.
       const shiftId = activeShift?.id || getShiftSession()?.id || null;
       const endedAt = new Date().toISOString();
+
+      // A patrol still running at shift end would otherwise stay open — the next guard's app
+      // resumes it and the walk gets filed under the wrong person, and the route sits unsent until
+      // the 16h abandoned-session sweep. Close it here and hand it straight to the queue.
+      if (getActivePatrolSession()) {
+        endPatrolSession('incomplete', { shiftId });
+        flushPendingPatrolCompletions();
+      }
       await KioskService.saveEndShiftSecurityState({ failedAttempts: 0, lockedUntil: null, lastFailedAttemptAt: null });
       await NotificationService.cancelAllPatrolNotifications();
       await NotificationService.addToAppNotificationFeed({

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import { Keyboard } from '@capacitor/keyboard';
 import PedestrianTab from './home/PedestrianTab';
 import VehicleTab from './home/VehicleTab';
@@ -6,11 +7,24 @@ import PatrolTab from './home/PatrolTab';
 import { useAuth } from '../contexts/AuthContext';
 import { useOfflineQueue } from '../hooks/useOfflineQueue';
 import { GENERAL_GUARD_ID, getLocationName } from '../lib/deviceStore';
+import { getActivePatrolSession, PATROL_SESSION_EVENT } from '../lib/patrolSession';
 import EndShiftModal from '../components/EndShiftModal';
 import './home/home-styles.css';
 
 export default function HomeScreen() {
-  const [activeTab, setActiveTab] = useState('pedestrians');
+  const routerLocation = useLocation();
+  // The patrol alarm sends the guard straight here, and a patrol left running must not open behind
+  // the Pedestrians tab — either way the Patrol tab is what they came for.
+  const [activeTab, setActiveTab] = useState(
+    () => (routerLocation.state?.tab === 'patrols' || getActivePatrolSession() ? 'patrols' : 'pedestrians')
+  );
+  // The alarm overlays whatever screen the guard was on, so being sent here usually does NOT
+  // remount this component — the tab it asked for has to be picked up from the navigation itself.
+  const [lastNavKey, setLastNavKey] = useState(routerLocation.key);
+  if (lastNavKey !== routerLocation.key) {
+    setLastNavKey(routerLocation.key);
+    if (routerLocation.state?.tab) setActiveTab(routerLocation.state.tab);
+  }
   const [selectedGuardId, setSelectedGuardId] = useState('');
   const [guardPin, setGuardPin] = useState('');
   const [switchError, setSwitchError] = useState('');
@@ -30,6 +44,20 @@ export default function HomeScreen() {
   useEffect(() => {
     const listener = Keyboard.addListener('keyboardDidHide', () => window.scrollTo(0, 0));
     return () => listener.then((handler) => handler.remove()).catch(() => null);
+  }, []);
+
+  // A patrol STARTING anywhere (alarm, resumed session) opens the Patrol tab. Keyed on the session
+  // id, not on the session event itself, so recording a route point mid-patrol never yanks the
+  // guard off the tab they chose.
+  const patrolSessionIdRef = useRef(getActivePatrolSession()?.id || null);
+  useEffect(() => {
+    const syncPatrolTab = () => {
+      const id = getActivePatrolSession()?.id || null;
+      if (id && id !== patrolSessionIdRef.current) setActiveTab('patrols');
+      patrolSessionIdRef.current = id;
+    };
+    window.addEventListener(PATROL_SESSION_EVENT, syncPatrolTab);
+    return () => window.removeEventListener(PATROL_SESSION_EVENT, syncPatrolTab);
   }, []);
 
   const focusPinInView = () => {

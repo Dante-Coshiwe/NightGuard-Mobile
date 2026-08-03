@@ -4,6 +4,7 @@ import { getMySite } from '../services/api';
 import { useOfflineApi } from '../hooks/useOfflineApi';
 import { useAuth } from '../contexts/AuthContext';
 import { buildLocalDataExport, getDeviceId, getDeviceSettings, getSyncLogs } from '../lib/deviceStore';
+import { exportBlobFile } from '../lib/reportUtils';
 import { getCurrentDeviceRecord, loadDeviceConfiguration, saveDeviceConfiguration } from '../services/schemaData';
 import { getRunningVersion, runOtaUpdate, OTA_CURRENT_VERSION } from '../services/liveUpdate';
 
@@ -242,22 +243,13 @@ export default function SettingsConfig() {
     try {
       const snapshot = buildLocalDataExport();
       const fileName = `nightguard-local-export-${new Date().toISOString().slice(0, 10)}.json`;
-      const file = new File([JSON.stringify(snapshot, null, 2)], fileName, { type: 'application/json' });
+      const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
 
-      if (navigator.canShare?.({ files: [file] })) {
-        await navigator.share({
-          title: 'NightGuard Local Export',
-          text: 'Share this local NightGuard device export.',
-          files: [file],
-        });
-      } else {
-        const url = URL.createObjectURL(file);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = fileName;
-        link.click();
-        URL.revokeObjectURL(url);
-      }
+      await exportBlobFile(blob, fileName, {
+        shareTitle: 'NightGuard Local Export',
+        shareText: 'Share this local NightGuard device export.',
+        mimeType: 'application/json',
+      });
 
       setSuccess('Local device export prepared successfully');
     } catch (err) {
@@ -325,7 +317,7 @@ export default function SettingsConfig() {
         {/* OTA smoke-test marker: first shipped over-the-air in 1.0.8. Seeing a version
             here HIGHER than the APK's baked-in bundle proves updates land without reinstalls. */}
         <div style={{ margin: '0 0 14px', padding: '10px 12px', background: '#052e16', border: '1px solid #166534', borderRadius: 8, color: '#86efac', fontSize: 13, fontWeight: 600 }}>
-          🚀 Live update test passed — bundle v{runningVersion}, pushed 15 July 2026 with zero reinstall
+          🚀 Live update test passed — bundle v{runningVersion}, pushed with zero reinstall
         </div>
         <button
           type="button"

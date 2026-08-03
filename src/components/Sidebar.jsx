@@ -1,5 +1,5 @@
 ﻿import React, { useState } from 'react';
-import { NavLink, useNavigate } from 'react-router-dom';
+import { NavLink, useLocation, useNavigate } from 'react-router-dom';
 import {
   Menu, X, Home, BookOpen, AlertTriangle, MessageCircle,
   Info, FileText, Settings, ChevronDown, ChevronRight, Bell,
@@ -16,6 +16,16 @@ const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
   const isAdmin = user?.user_type === 'admin';
   const [openReports, setOpenReports] = useState(false);
   const [openConfig,  setOpenConfig]  = useState(false);
+  const location = useLocation();
+
+  // Picking a page closes the menu on its own — no reaching for the X. Tapping the page you are
+  // already on leaves it open, because that was not an attempt to go anywhere.
+  const normalisePath = (path) => (path === '/' ? '/' : String(path || '').replace(/\/+$/, ''));
+  const closeAfterNavigating = (to) => {
+    if (!isOpen) return;
+    if (normalisePath(to) === normalisePath(location.pathname)) return;
+    toggleSidebar();
+  };
   const [unreadCount, setUnreadCount] = useState(0);
   const [showEndShift, setShowEndShift] = useState(false);
   const locationName = getLocationName();
@@ -235,6 +245,7 @@ const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
                         <NavLink
                           key={subIdx}
                           to={sub.to}
+                          onClick={() => closeAfterNavigating(sub.to)}
                           style={({ isActive }) => ({
                             display:         'block',
                             padding:         '8px 14px',
@@ -261,6 +272,7 @@ const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
                           key={subIdx}
                           to={sub.to}
                           title={sub.label}
+                          onClick={() => closeAfterNavigating(sub.to)}
                           style={({ isActive }) => ({
                             display:         'flex',
                             alignItems:      'center',
@@ -284,6 +296,7 @@ const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
                 <NavLink
                   to={item.to}
                   end={item.to === '/'}
+                  onClick={() => closeAfterNavigating(item.to)}
                   style={({ isActive }) => ({
                     display:         'flex',
                     alignItems:      'center',

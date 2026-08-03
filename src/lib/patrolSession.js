@@ -1,4 +1,6 @@
-import { distanceMeters } from './geo';
+import { distanceMeters, estimateStepsFromDistance, routeDistanceMeters } from './geo';
+import { enqueueOfflineItem } from '../hooks/useOfflineQueue';
+import { upsertCachedPatrol } from './deviceStore';
 
 // Persistent patrol session state.
 //
@@ -10,7 +12,13 @@ import { distanceMeters } from './geo';
 
 const ACTIVE_SESSION_KEY = 'nightguard_active_patrol_session';
 const HISTORY_KEY = 'nightguard_patrol_history';
-const HISTORY_LIMIT = 5;
+const OUTBOX_KEY = 'nightguard_patrol_outbox';
+const HISTORY_LIMIT = 25;
+const OUTBOX_LIMIT = 50;
+
+// Fired whenever the active session changes on disk, so any screen showing patrol progress stays
+// in step with the background recorder rather than only with its own local state.
+export const PATROL_SESSION_EVENT = 'nightguard_patrol_session_updated';
 
 // Route thinning: keep the trail light without losing the shape of the walk.
 const MIN_POINT_DISTANCE_METERS = 6;
@@ -50,7 +58,11 @@ export function getActivePatrolSession() {
 }
 
 export function saveActivePatrolSession(session) {
-  return writeJson(ACTIVE_SESSION_KEY, session);
+  writeJson(ACTIVE_SESSION_KEY, session);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event(PATROL_SESSION_EVENT));
+  }
+  return session;
 }
 
 export function startPatrolSession({ siteId = null, shiftId = null, guardId = null, guardName = 'Unknown guard', requiredCount = 0 } = {}) {
@@ -114,19 +126,137 @@ export function markCheckpointReached(checkpointId) {
   return session;
 }
 
+// The exact body /patrols/complete expects. Built from the session itself so a completion can be
+// re-sent later without needing the screen that created it.
+export function buildPatrolCompletionPayload(session, fallback = {}) {
+  const completed = session.status === 'completed';
+  // steps_taken used to be sent as the CHECKPOINT count, which the patrol report then printed as
+  // "Steps" — a three-checkpoint patrol read "Steps: 3". It now carries a genuine estimate derived
+  // from the distance actually walked.
+  const distance = routeDistanceMeters(session.route);
+  return {
+    id: session.id,
+    site_id: session.siteId || fallback.siteId || null,
+    shift_id: session.shiftId || fallback.shiftId || null,
+    guard_id: session.guardId || fallback.guardId || null,
+    patrol_name: `${completed ? 'Patrol' : 'Incomplete patrol'} ${new Date(session.startedAt).toLocaleString()}`,
+    actual_start: session.startedAt,
+    actual_end: session.endedAt,
+    status: session.status,
+    steps_taken: estimateStepsFromDistance(distance),
+    route: session.route || [],
+  };
+}
+
+// What the device can say about a finished walk without any extra sensor or permission: how far,
+// how long, and roughly how many steps that distance represents.
+export function summarisePatrol(session) {
+  if (!session) return null;
+  const distance = routeDistanceMeters(session.route);
+  const startedAt = new Date(session.startedAt).getTime();
+  const endedAt = session.endedAt ? new Date(session.endedAt).getTime() : Date.now();
+  const durationMs = Math.max(endedAt - startedAt, 0);
+  return {
+    distanceMeters: Math.round(distance),
+    estimatedSteps: estimateStepsFromDistance(distance),
+    durationMs,
+    routePoints: (session.route || []).length,
+    checkpointsReached: (session.reachedCheckpointIds || []).length,
+  };
+}
+
+export function formatDistance(metres) {
+  const value = Number(metres) || 0;
+  return value >= 1000 ? `${(value / 1000).toFixed(2)} km` : `${Math.round(value)} m`;
+}
+
+export function formatDuration(ms) {
+  const total = Math.max(Math.round(Number(ms) || 0), 0);
+  const minutes = Math.floor(total / 60000);
+  const hours = Math.floor(minutes / 60);
+  if (hours) return `${hours}h ${minutes % 60}m`;
+  if (minutes) return `${minutes} min`;
+  return `${Math.floor(total / 1000)}s`;
+}
+
+export function getPendingPatrolCompletions() {
+  return readJson(OUTBOX_KEY, []);
+}
+
+// Called once the completion has been handed to the network layer (delivered, or durably queued).
+export function resolvePendingPatrolCompletion(id) {
+  const remaining = getPendingPatrolCompletions().filter((entry) => String(entry.id) !== String(id));
+  return writeJson(OUTBOX_KEY, remaining);
+}
+
 // End the active session, archive it to history and return the finished session.
 // `status` should be 'completed' or 'incomplete'.
-export function endPatrolSession(status = 'completed') {
+export function endPatrolSession(status = 'completed', fallback = {}) {
   const session = getActivePatrolSession();
   if (!session) return null;
   session.endedAt = new Date().toISOString();
   session.status = status;
+
+  // Park the ready-to-send completion BEFORE the active session is cleared. Android kills
+  // backgrounded apps aggressively, and the old order (clear session -> then POST) meant a kill in
+  // that gap lost the patrol and its entire walked route with nothing left to recover from.
+  const pending = [
+    { id: session.id, payload: buildPatrolCompletionPayload(session, fallback), queuedAt: new Date().toISOString() },
+    ...getPendingPatrolCompletions().filter((entry) => String(entry.id) !== String(session.id)),
+  ].slice(0, OUTBOX_LIMIT);
+  writeJson(OUTBOX_KEY, pending);
+
   localStorage.removeItem(ACTIVE_SESSION_KEY);
+
+  // Show it in "My Patrols" straight away. Offline the server list is empty, and without this the
+  // guard finished a walk and saw no trace of it until the device next reconnected.
+  upsertCachedPatrol({
+    id: session.id,
+    site_id: session.siteId || fallback.siteId || null,
+    shift_id: session.shiftId || fallback.shiftId || null,
+    guard_id: session.guardId || fallback.guardId || null,
+    patrol_name: session.patrolName,
+    actual_start: session.startedAt,
+    actual_end: session.endedAt,
+    status: session.status,
+    steps_taken: (session.reachedCheckpointIds || []).length,
+    checkpoints_completed: (session.reachedCheckpointIds || []).length,
+    total_checkpoints: session.requiredCount || (session.reachedCheckpointIds || []).length,
+    created_at: session.startedAt,
+    _offline: true,
+  });
 
   const history = [session, ...getPatrolHistory()].slice(0, HISTORY_LIMIT);
   writeJson(HISTORY_KEY, history);
   window.dispatchEvent(new Event('nightguard_patrol_history_updated'));
+  window.dispatchEvent(new Event(PATROL_SESSION_EVENT));
   return session;
+}
+
+// Hand every unsent completion to the offline queue, which owns delivery from there. Safe to call
+// repeatedly: the queue de-duplicates by endpoint + patrol id, and /patrols/complete upserts.
+export function flushPendingPatrolCompletions() {
+  const pending = getPendingPatrolCompletions();
+  if (!pending.length) return 0;
+
+  pending.forEach((entry) => {
+    if (!entry?.payload?.id) return;
+    enqueueOfflineItem('post', '/patrols/complete', entry.payload, entry.payload.id);
+  });
+  writeJson(OUTBOX_KEY, []);
+  console.log(`[PatrolSession] flushPendingPatrolCompletions(): recovered ${pending.length} unsent patrol(s)`);
+  return pending.length;
+}
+
+// A patrol nobody ended — the app was killed mid-shift, or the device was handed over without
+// tapping End. Left alone the session sits active forever and its route never reaches the
+// dashboard. Close it as incomplete so the walked route is still delivered.
+export function closeAbandonedPatrolSession(maxAgeMs = 16 * 60 * 60 * 1000) {
+  const session = getActivePatrolSession();
+  if (!session) return null;
+  if (Date.now() - new Date(session.startedAt).getTime() < maxAgeMs) return null;
+  console.warn('[PatrolSession] closing abandoned patrol session:', session.id);
+  return endPatrolSession('incomplete');
 }
 
 export function getPatrolHistory() {

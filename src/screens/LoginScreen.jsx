@@ -41,7 +41,13 @@ export default function LoginScreen() {
     setLoading(true);
     setError('');
     try {
-      await login(email, password);
+      const result = await login(email, password);
+      // A manager with more than one location picks which one this device is,
+      // before anything else — the kiosk PIN belongs to a site.
+      if (result?.needsSiteBinding) {
+        navigate('/setup/site', { replace: true });
+        return;
+      }
       if (!(await hasAdminPinHash())) {
         navigate('/setup/kiosk-pin', { replace: true, state: { initialSetup: true } });
         return;

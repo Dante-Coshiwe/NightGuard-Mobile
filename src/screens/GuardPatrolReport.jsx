@@ -3,7 +3,7 @@ import api from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 import jsPDF from 'jspdf';
 import 'jspdf-autotable';
-import { getNfcScans, getPatrolConfig } from '../lib/deviceStore';
+import { getCachedPatrols, getNfcScans, getPatrolConfig } from '../lib/deviceStore';
 import ReportEmailPanel from '../components/ReportEmailPanel';
 import CheckpointMap from '../components/CheckpointMap';
 import { NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
@@ -50,7 +50,8 @@ export default function GuardPatrolDashboard() {
       const [summary, scans] = await Promise.all([
         api.get('/patrols/summary').then(res => res.data).catch((err) => {
           logApiError(navigator.onLine, err, 'GuardPatrolReport-summary');
-          return [];
+          // Fall back to what the device holds — a failed refresh must not blank the report.
+          return getCachedPatrols();
         }),
         api.get('/nfc/scans').then(res => res.data).catch((err) => {
           logApiError(navigator.onLine, err, 'GuardPatrolReport-scans');
@@ -58,7 +59,7 @@ export default function GuardPatrolDashboard() {
         }),
       ]);
       
-      setPatrols(summary || []);
+      setPatrols(summary?.length ? summary : getCachedPatrols());
       setCheckpoints((scans || []).map(scan => ({
         ...scan,
         scanned: scan.scanned !== false,
@@ -72,7 +73,7 @@ export default function GuardPatrolDashboard() {
       }
     } catch (err) {
       logApiError(navigator.onLine, err, 'GuardPatrolReport');
-      setPatrols([]);
+      setPatrols(getCachedPatrols());
       setCheckpoints(getNfcScans());
       console.warn('[GuardPatrolReport] Using cached NFC scans from device');
       setError('Showing saved patrol scans from this device');
@@ -273,7 +274,7 @@ export default function GuardPatrolDashboard() {
       doc.text('Detailed Patrol Log', 14, finalY > 160 ? 20 : finalY);
 
       doc.autoTable({
-        head: [['Guard', 'Date/Time', 'Patrol Name', 'Location', 'Status', 'Steps']],
+        head: [['Guard', 'Date/Time', 'Patrol Name', 'Location', 'Status', 'Est. steps']],
         body: filteredPatrols.map(p => [
           p.guard_name || p.profiles?.full_name || '-',
           new Date(p.actual_start || p.created_at).toLocaleString(),
@@ -588,7 +589,7 @@ export default function GuardPatrolDashboard() {
                       </div>
                       <div style={{ display: 'flex', gap: 12, fontSize: 11, color: '#666' }}>
                         <span> {new Date(patrol.actual_start || patrol.created_at).toLocaleDateString()}</span>
-                        <span> Steps: {patrol.steps_taken || 0}</span>
+                        <span> Est. steps: {patrol.steps_taken || 0}</span>
                       </div>
                     </div>
                   );

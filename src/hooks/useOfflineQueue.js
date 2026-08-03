@@ -28,10 +28,33 @@ import {
 } from '../lib/deviceStore';
 
 const QUEUE_KEY = 'nightguard_offline_queue';
+const DEAD_LETTER_KEY = 'nightguard_offline_queue_dead';
 const OfflineQueueContext = createContext(null);
 let syncInFlight = null;
 let lastOnlineSyncTriggerAt = 0;
 const ONLINE_SYNC_DEBOUNCE_MS = 4000;
+
+// A queued write must never disappear because the server said "no" once. Items that are rejected
+// keep retrying up to MAX_SYNC_ATTEMPTS, then move to a dead-letter list instead of being deleted,
+// so a guard's patrol is always recoverable. Dead letters are revived on app launch (conditions
+// that caused the rejection — a missing site binding, an unsynced shift — are usually fixed by
+// then), up to DEAD_LETTER_REVIVALS times.
+const MAX_SYNC_ATTEMPTS = 8;
+const DEAD_LETTER_LIMIT = 200;
+const DEAD_LETTER_REVIVALS = 3;
+
+// The Supabase facade ignores axios-style { timeout }. Without this, one stalled write blocks the
+// whole queue forever and `syncInFlight` never clears, so nothing syncs again until the app is
+// restarted — the queue silently stops draining while the guard keeps patrolling.
+const SYNC_ITEM_TIMEOUT_MS = 20000;
+
+function withSyncTimeout(promise, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Sync timed out: ${label}`)), SYNC_ITEM_TIMEOUT_MS);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 function canTriggerOnlineSync() {
   const now = Date.now();
@@ -63,9 +86,75 @@ function saveQueue(queue) {
   }
 }
 
-function shouldDropFailedItem(err) {
+function getDeadLetterQueue() {
+  try {
+    return JSON.parse(localStorage.getItem(DEAD_LETTER_KEY) || '[]');
+  } catch {
+    return [];
+  }
+}
+
+function deadLetter(item, err) {
+  try {
+    const entry = {
+      ...item,
+      deadLetteredAt: new Date().toISOString(),
+      lastError: err?.message || 'unknown error',
+      lastStatus: err?.response?.status ?? null,
+      revivals: item.revivals || 0,
+    };
+    const next = [entry, ...getDeadLetterQueue()].slice(0, DEAD_LETTER_LIMIT);
+    localStorage.setItem(DEAD_LETTER_KEY, JSON.stringify(next));
+    console.error(`[OfflineQueue] DEAD-LETTERED after ${item.attempts} attempts - ${item.method.toUpperCase()} ${item.url}`, entry);
+  } catch (writeErr) {
+    console.error('[OfflineQueue] deadLetter() write failed:', writeErr?.message || writeErr);
+  }
+}
+
+// Move dead letters back onto the queue. The rejections that put them there are usually
+// environmental (site binding not yet resolved, a shift row that had not synced, an RLS race), so
+// a later launch often succeeds where the original attempt could not.
+export function reviveDeadLetteredItems() {
+  const dead = getDeadLetterQueue();
+  if (!dead.length) return 0;
+
+  const revivable = dead.filter((item) => (item.revivals || 0) < DEAD_LETTER_REVIVALS);
+  const retained = dead.filter((item) => (item.revivals || 0) >= DEAD_LETTER_REVIVALS);
+  if (!revivable.length) return 0;
+
+  const queue = getQueue();
+  const existing = new Set(queue.map((item) => makeQueueKey(item.method, item.url, item.data, item.clientTempId)));
+  const restored = revivable
+    .filter((item) => !existing.has(makeQueueKey(item.method, item.url, item.data, item.clientTempId)))
+    .map((item) => ({ ...item, attempts: 0, revivals: (item.revivals || 0) + 1 }));
+
+  try {
+    localStorage.setItem(DEAD_LETTER_KEY, JSON.stringify(retained));
+  } catch { /* keep going: requeueing matters more than pruning */ }
+
+  if (restored.length) {
+    saveQueue([...queue, ...restored]);
+    console.log(`[OfflineQueue] reviveDeadLetteredItems(): requeued ${restored.length} item(s)`);
+  }
+  return restored.length;
+}
+
+// What to do with an item whose sync attempt failed.
+//   'retry' — the request never reached the server (offline, timeout, 5xx, auth). Keep it and do
+//             NOT count the attempt: a device that is offline for a week must not exhaust its
+//             retries and lose the night's patrols.
+//   'count' — the server rejected it. Every Supabase error surfaces as 400 here, and most are
+//             transient (FK to a row that has not synced yet, RLS evaluated before the session
+//             refreshed, a dropped connection), so retry a bounded number of times before
+//             dead-lettering. Never delete.
+//   'drop'  — terminal and safe to forget: the write already landed (409), the target is gone
+//             (410), or the route does not exist (404). Retrying cannot change the outcome.
+function classifySyncFailure(err) {
   const status = err?.response?.status;
-  return [400, 404, 409, 410, 422].includes(status);
+  if (!status) return 'retry';
+  if ([404, 409, 410].includes(status)) return 'drop';
+  if ([400, 422].includes(status)) return 'count';
+  return 'retry';
 }
 
 function normaliseQueueUrl(item) {
@@ -167,12 +256,16 @@ async function applySuccessfulSync(item, response) {
     updateCachedNfcScan(item.clientTempId, responseData);
   }
 
-  if (item.url === '/patrols/start' && item.clientTempId && responseData?.id) {
-    const updated = getCachedPatrols().map((patrol) => (
-      String(patrol.id) === String(item.clientTempId)
-        ? { ...patrol, ...responseData, id: responseData.id, _offline: false }
-        : patrol
-    ));
+  if ((item.url === '/patrols/start' || item.url === '/patrols/complete') && item.clientTempId && responseData?.id) {
+    const cached = getCachedPatrols();
+    const known = cached.some((patrol) => String(patrol.id) === String(item.clientTempId));
+    const updated = known
+      ? cached.map((patrol) => (
+        String(patrol.id) === String(item.clientTempId)
+          ? { ...patrol, ...responseData, id: responseData.id, _offline: false }
+          : patrol
+      ))
+      : [{ ...responseData, _offline: false }, ...cached];
     saveCachedPatrols(updated);
   }
 
@@ -268,8 +361,14 @@ async function applySuccessfulSync(item, response) {
   }
 }
 
+// The key must include the endpoint. `clientTempId` alone is NOT unique: a patrol posts both
+// /patrols/start and /patrols/complete under the same patrol id, so keying on the id alone made
+// the completion look like a duplicate of the start and silently discarded it — every patrol run
+// offline lost its end time, its status and its entire walked route.
 function makeQueueKey(method, url, data, clientTempId) {
-  return clientTempId || `${method}:${url}:${JSON.stringify(data || {})}`;
+  return clientTempId
+    ? `${method}:${url}:${clientTempId}`
+    : `${method}:${url}:${JSON.stringify(data || {})}`;
 }
 
 export function enqueueOfflineItem(method, url, data, clientTempId = null) {
@@ -292,12 +391,13 @@ export function enqueueOfflineItem(method, url, data, clientTempId = null) {
   const next = [
     ...queue,
     {
-      id: Date.now(),
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       method,
       url,
       data,
       timestamp: new Date().toISOString(),
       clientTempId,
+      attempts: 0,
     },
   ];
   console.log(`[OfflineQueue] enqueueOfflineItem(): QUEUED - ${method} ${url}, clientId="${clientTempId}"`, data);
@@ -374,7 +474,7 @@ export async function syncOfflineQueueNow() {
           console.log(`[OfflineQueue] SYNC - Uploaded queued ${photoType} photo -> ${uploadedUrl ? 'ok' : 'no url'}`);
         }
 
-        const response = await api[item.method](resolvedUrl, remappedData);
+        const response = await withSyncTimeout(api[item.method](resolvedUrl, remappedData), resolvedUrl);
         confirmAppOnline('offline-queue-sync-success');
         const responseEntityId = response?.data?.id || extractGuardPayload(response?.data)?.id;
         
@@ -388,11 +488,34 @@ export async function syncOfflineQueueNow() {
         syncedCount += 1;
       } catch (err) {
         console.error(`[OfflineQueue] SYNC ERROR - ${item.method.toUpperCase()} ${item.url}:`, err.message, err?.response?.status);
-        if (!shouldDropFailedItem(err)) {
+        const disposition = classifySyncFailure(err);
+
+        if (disposition === 'drop') {
+          console.log(`[OfflineQueue] SYNC - Item dropped (terminal ${err?.response?.status})`);
+          continue;
+        }
+
+        if (disposition === 'retry') {
+          // Never reached the server, so the attempt says nothing about the payload.
           failed.push(item);
-          console.log(`[OfflineQueue] SYNC - Item kept in queue to retry later`);
+          console.log('[OfflineQueue] SYNC - Item kept (transient failure, attempt not counted)');
+          // Connectivity died mid-drain. Stop here and keep the rest intact rather than burning
+          // a 20s timeout on every remaining item while the guard waits.
+          if (!isAppOnline()) {
+            const remaining = queue.slice(queue.indexOf(item) + 1);
+            failed.push(...remaining);
+            console.log(`[OfflineQueue] SYNC - Went offline mid-sync, deferring ${remaining.length} remaining item(s)`);
+            break;
+          }
+          continue;
+        }
+
+        const attempted = { ...item, attempts: (item.attempts || 0) + 1, lastError: err?.message || 'rejected' };
+        if (attempted.attempts >= MAX_SYNC_ATTEMPTS) {
+          deadLetter(attempted, err);
         } else {
-          console.log(`[OfflineQueue] SYNC - Item dropped (unrecoverable error ${err?.response?.status})`);
+          failed.push(attempted);
+          console.log(`[OfflineQueue] SYNC - Item kept (rejected, attempt ${attempted.attempts}/${MAX_SYNC_ATTEMPTS})`);
         }
       }
     }
@@ -471,6 +594,8 @@ function useOfflineQueueController() {
       }
     };
 
+    // Give previously rejected writes another chance now that the app has re-launched.
+    reviveDeadLetteredItems();
     updateCount();
     if (isAppOnline() && getQueue().length > 0 && canTriggerOnlineSync()) {
       syncQueue();
@@ -498,6 +623,13 @@ function useOfflineQueueController() {
     addToQueue,
     syncQueue,
   }), [isOnline, queueCount, syncing, addToQueue, syncQueue]);
+}
+
+// Total writes still waiting to reach the server, including rejected ones parked in the
+// dead-letter list. Surfaced on the Info screen so a device holding unsent patrols is visible
+// before the guard hands it over.
+export function getUnsyncedWriteCount() {
+  return getQueue().length + getDeadLetterQueue().length;
 }
 
 export function OfflineQueueProvider({ children }) {

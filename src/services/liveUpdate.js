@@ -1,6 +1,7 @@
 import { Capacitor } from '@capacitor/core';
-import { getDeviceId, getCachedSiteSettings } from '../lib/deviceStore';
+import { getDeviceId, getCachedSiteSettings, getShiftSession } from '../lib/deviceStore';
 import { getAdminDeviceBinding } from '../lib/deviceBinding';
+import { getSiteBinding } from '../lib/siteResolver';
 
 // ============================================================================
 //  Self-hosted OTA live updates on Supabase.
@@ -23,7 +24,7 @@ import { getAdminDeviceBinding } from '../lib/deviceBinding';
 // Web bundle version currently shipped. Bump this on every release you publish
 // (it must match the `version` you pass to `ota:publish`). It is what the
 // server compares against to decide if a newer bundle exists.
-export const OTA_CURRENT_VERSION = '1.0.16';
+export const OTA_CURRENT_VERSION = '1.1.7';
 
 const OTA_CHECK_FN = 'ota-check';
 const OTA_REPORT_FN = 'ota-report';
@@ -90,8 +91,13 @@ async function loadUpdaterBox() {
   return updaterBoxPromise;
 }
 
-// Resolve the org id for this device from whatever the app has stored.
+// Resolve the org id for this device — it selects the OTA channel, so the
+// device's own site binding is the right source, ahead of whoever last logged in.
 async function resolveOrgId() {
+  try {
+    const siteBinding = await getSiteBinding();
+    if (siteBinding?.organization_id) return siteBinding.organization_id;
+  } catch { /* ignore */ }
   try {
     const binding = await getAdminDeviceBinding();
     if (binding?.org_id) return binding.org_id;
@@ -242,7 +248,12 @@ async function doRunOtaUpdate({ immediate = false } = {}) {
   // Already downloaded and staged on a previous check — don't re-download the
   // same bundle on every launch while it waits for a background/restart to apply.
   // (immediate skips this: the user asked to apply NOW, staging isn't enough.)
-  if (!immediate && check.mandatory !== true && localStorage.getItem(OTA_STAGED_KEY) === check.version) {
+  // A mandatory bundle normally re-checks so it can apply as soon as possible,
+  // but while a shift is running it cannot be applied anyway — so honour the
+  // staged marker rather than re-downloading it every 30 minutes on a kiosk.
+  const shiftRunning = Boolean(getShiftSession());
+  const stagedAlready = localStorage.getItem(OTA_STAGED_KEY) === check.version;
+  if (!immediate && stagedAlready && (check.mandatory !== true || shiftRunning)) {
     return { status: 'staged', version: check.version };
   }
 
@@ -271,7 +282,13 @@ async function doRunOtaUpdate({ immediate = false } = {}) {
     // the Edge Function does not round-trip; we log by version instead.
     await reportOta({ ...base, status: 'downloaded' });
 
-    const applyNow = immediate || check.mandatory === true;
+    // A mandatory bundle still must not be applied out from under a guard who is
+    // on duty: set() destroys the JS context and reloads. Nothing is lost — the
+    // shift session, the offline queue and the Supabase session all live in
+    // storage that survives the swap — but the screen going blank mid-patrol
+    // reads as a crash. Stage it instead; it applies the moment the app next
+    // goes to the background or restarts, which for a kiosk is the shift change.
+    const applyNow = immediate || (check.mandatory === true && !shiftRunning);
 
     if (applyNow) {
       await reportOta({ ...base, status: 'applied' });

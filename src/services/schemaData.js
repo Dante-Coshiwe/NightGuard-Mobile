@@ -1,4 +1,5 @@
 import { supabase } from '../lib/supabase';
+import { getBoundSiteIdSync } from '../lib/siteResolver';
 import {
   DEFAULT_LOOKUP_DATA,
   DEFAULT_PATROL_CONFIG,
@@ -40,7 +41,18 @@ function shouldFallbackToLocal(error) {
     message.includes('schema cache') ||
     message.includes('could not find the') ||
     message.includes('permission denied') ||
-    message.includes('not found in the schema cache')
+    message.includes('not found in the schema cache') ||
+    // Network reachability, including the 12s client deadline in lib/supabase.js.
+    // A device that cannot reach the server has cached data that is still good;
+    // throwing here would surface an error where the cache is the right answer.
+    message.includes('failed to fetch') ||
+    message.includes('fetch failed') ||
+    message.includes('networkerror') ||
+    message.includes('network request failed') ||
+    message.includes('aborted') ||
+    message.includes('abort') ||
+    message.includes('timeout') ||
+    message.includes('timed out')
   );
 }
 
@@ -62,7 +74,7 @@ function isUuid(value) {
 }
 
 function getSiteId(siteSettings = getCachedSiteSettings()) {
-  return siteSettings?.id || import.meta.env.VITE_SITE_ID || null;
+  return siteSettings?.id || getBoundSiteIdSync() || null;
 }
 
 export function getCurrentDeviceRecord(siteSettings = getCachedSiteSettings()) {
@@ -363,12 +375,23 @@ export async function loadPatrolConfiguration(siteSettings = getCachedSiteSettin
   if (scheduleError && !shouldFallbackToLocal(scheduleError)) throw new Error(scheduleError.message);
   if (checkpointsError && !shouldFallbackToLocal(checkpointsError)) throw new Error(checkpointsError.message);
 
+  // The stored config is stamped with the site it was loaded for. A device that moved between
+  // sites — or whose binding resolved after the config was first cached — must not carry the
+  // previous site's patrol points across. Without this, an empty new site got seeded with the OLD
+  // site's layout below, copying one client's checkpoint names and GPS pins into another's.
+  const configSiteId = cachedPatrolConfig.site_id || null;
+  const belongsToThisSite = !configSiteId || String(configSiteId) === String(siteId);
+  const localBaseline = belongsToThisSite ? cachedPatrolConfig : { ...DEFAULT_PATROL_CONFIG };
+  if (!belongsToThisSite) {
+    console.warn(`[PatrolConfig] cached config belongs to site ${configSiteId}, not ${siteId} — discarding it`);
+  }
+
   const hasRemoteSchedule = Boolean(scheduleRow);
   const hasRemoteCheckpoints = Array.isArray(checkpoints) && checkpoints.length > 0;
   const localConfig = (hasRemoteSchedule || hasRemoteCheckpoints)
     ? mapPatrolConfig(scheduleRow, checkpoints)
-    : cachedPatrolConfig;
-  savePatrolConfig(localConfig);
+    : localBaseline;
+  savePatrolConfig({ ...localConfig, site_id: siteId });
 
   if (!scheduleRow || !Array.isArray(checkpoints) || checkpoints.length === 0) {
     try {
@@ -387,6 +410,7 @@ export async function savePatrolConfiguration(localConfig, siteSettings = getCac
   const normalisedConfig = {
     ...localConfig,
     patrolTimes: normalisePatrolTimes(localConfig.patrolTimes),
+    site_id: siteId || localConfig.site_id || null,
   };
   savePatrolConfig(normalisedConfig);
 

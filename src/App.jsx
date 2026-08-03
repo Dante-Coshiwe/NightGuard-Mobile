@@ -3,7 +3,6 @@ import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation, useNavigat
 import { App as CapacitorApp } from '@capacitor/app';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import LoginScreen from './screens/LoginScreen';
-import BottomTabLayout from './components/BottomTabLayout';
 import ErrorBoundary from './components/ErrorBoundary';
 import HomeScreen from './screens/HomeScreen';
 import OBScreen from './screens/OBScreen';
@@ -19,19 +18,15 @@ import UsersConfig from './screens/UsersConfig';
 import GuardPatrolConfig from './screens/GuardPatrolConfig';
 import SettingsConfig from './screens/SettingsConfig';
 import LookupDataConfig from './screens/LookupDataConfig';
-import PatrolsScreen from './screens/PatrolsScreen';
-import PatrolTrackingScreen from './screens/PatrolTrackingScreen';
-import RegisterPedestrianScreen from './screens/RegisterPedestrianScreen';
-import RegisterVehicleScreen from './screens/RegisterVehicleScreen';
-import ReportIncidentScreen from './screens/ReportIncidentScreen';
-import OBEntryScreen from './screens/OBEntryScreen';
 import ShiftManagementScreen from './screens/ShiftManagementScreen';
 import Layout from './components/Layout';
 import ShiftScreen from './screens/ShiftScreen';
 import PatrolScheduleAlert from './components/PatrolScheduleAlert';
+import PatrolRecorder from './components/PatrolRecorder';
 import SplashScreen from './components/SplashScreen';
 import NotificationsScreen from './screens/NotificationsScreen';
 import SetKioskPinScreen from './screens/SetKioskPinScreen';
+import SelectSiteScreen from './screens/SelectSiteScreen';
 import NotificationService from './services/notificationService';
 import KioskService from './services/kioskService';
 import { hasAdminPinHash } from './services/kioskPinService';
@@ -39,9 +34,16 @@ import { hasAdminPinHash } from './services/kioskPinService';
 const isNative = typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.();
 
 const ProtectedRoute = ({ children }) => {
-  const { user, loading } = useAuth() || {};
+  const { user, loading, needsSiteBinding } = useAuth() || {};
+  const location = useLocation();
   if (loading) return <SplashScreen />;
   if (!user) return <Navigate to="/login" />;
+  // A device that does not know its site cannot record anything correctly, so
+  // nothing else is reachable until it is bound. Devices already bound — every
+  // device currently in the field — never see this.
+  if (needsSiteBinding && location.pathname !== '/setup/site') {
+    return <Navigate to="/setup/site" replace />;
+  }
   return children;
 };
 
@@ -60,7 +62,7 @@ const BootSplash = () => {
 const AppRuntimeBridge = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  const { shiftSession } = useAuth() || {};
+  const { shiftSession, needsSiteBinding } = useAuth() || {};
   const [permissionDenied, setPermissionDenied] = useState(false);
 
   useEffect(() => {
@@ -85,7 +87,7 @@ const AppRuntimeBridge = () => {
     }, 20000);
     const back = CapacitorApp.addListener('backButton', ({ canGoBack }) => {
       if (window.__nightguardPatrolAlertActive) return;
-      const atHome = location.pathname === '/' || location.pathname === '/patrols';
+      const atHome = location.pathname === '/';
       if (!canGoBack || atHome) return;
       window.history.back();
     });
@@ -106,7 +108,9 @@ const AppRuntimeBridge = () => {
   useEffect(() => {
     let cancelled = false;
     const guardPinSetup = async () => {
-      if (!shiftSession && location.pathname !== '/login' && location.pathname !== '/setup/kiosk-pin') {
+      // The kiosk PIN is set per site, so it waits until the site is known.
+      if (needsSiteBinding) return;
+      if (!shiftSession && !['/login', '/setup/kiosk-pin', '/setup/site'].includes(location.pathname)) {
         const ok = await hasAdminPinHash();
         if (!cancelled && !ok) {
           navigate('/setup/kiosk-pin', { replace: true, state: { initialSetup: true } });
@@ -117,7 +121,7 @@ const AppRuntimeBridge = () => {
     return () => {
       cancelled = true;
     };
-  }, [location.pathname, navigate, shiftSession]);
+  }, [location.pathname, navigate, shiftSession, needsSiteBinding]);
 
   if (!permissionDenied || !shiftSession || !isNative) return null;
 
@@ -151,9 +155,11 @@ function App() {
       <BrowserRouter>
         <AuthProvider>
           <AppRuntimeBridge />
+          <PatrolRecorder />
           <PatrolScheduleAlert />
           <Routes>
             <Route path="/login" element={<LoginScreen />} />
+            <Route path="/setup/site" element={<ProtectedRoute><SelectSiteScreen /></ProtectedRoute>} />
             <Route path="/setup/kiosk-pin" element={<ProtectedRoute><SetKioskPinScreen /></ProtectedRoute>} />
             <Route element={<ProtectedRoute><Layout><Outlet /></Layout></ProtectedRoute>}>
               <Route path="/" element={<HomeScreen />} />
@@ -175,16 +181,9 @@ function App() {
               <Route path="config/kiosk-pin" element={<SetKioskPinScreen />} />
               <Route path="config/lookup-data" element={<LookupDataConfig />} />
             </Route>
-            <Route element={<ProtectedRoute><BottomTabLayout /></ProtectedRoute>}>
-              <Route path="patrols" element={<PatrolsScreen />} />
-              <Route path="patrol/:id" element={<PatrolTrackingScreen />} />
-              <Route path="pedestrian" element={<RegisterPedestrianScreen />} />
-              <Route path="vehicle" element={<RegisterVehicleScreen />} />
-              <Route path="incident" element={<ReportIncidentScreen />} />
-              <Route path="obentry" element={<OBEntryScreen />} />
-              <Route path="notifications" element={<NotificationsScreen />} />
-              <Route path="shift" element={<ShiftScreen />} />
-            </Route>
+            {/* Anything unknown (an old deep link, a stale notification) belongs on the home
+                screen rather than on a blank page. */}
+            <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </AuthProvider>
       </BrowserRouter>

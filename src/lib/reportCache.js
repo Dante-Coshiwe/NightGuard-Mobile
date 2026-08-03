@@ -1,5 +1,5 @@
 import { Capacitor } from '@capacitor/core';
-import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
+import { readJsonFileWithRecovery, writeJsonFileAtomic } from './atomicFile';
 
 const REPORT_CACHE_FILE = 'nightguard-report-cache.json';
 const WRITE_DEBOUNCE_MS = 120;
@@ -27,19 +27,7 @@ function readFromLocalStorage() {
 }
 
 async function readFromFilesystem() {
-  try {
-    const { data } = await Filesystem.readFile({
-      path: REPORT_CACHE_FILE,
-      directory: Directory.Data,
-      encoding: Encoding.UTF8,
-    });
-    return data ? JSON.parse(data) : {};
-  } catch (err) {
-    const message = String(err?.message || '').toLowerCase();
-    if (message.includes('does not exist') || message.includes('no such file')) return {};
-    console.warn('[ReportCache] Failed to read filesystem cache:', err?.message || err);
-    return {};
-  }
+  return readJsonFileWithRecovery(REPORT_CACHE_FILE);
 }
 
 async function ensureLoaded() {
@@ -68,13 +56,7 @@ function schedulePersist() {
   flushTimer = setTimeout(async () => {
     flushTimer = null;
     try {
-      await Filesystem.writeFile({
-        path: REPORT_CACHE_FILE,
-        data: JSON.stringify(state),
-        directory: Directory.Data,
-        encoding: Encoding.UTF8,
-        recursive: true,
-      });
+      await writeJsonFileAtomic(REPORT_CACHE_FILE, JSON.stringify(state));
     } catch (err) {
       console.error('[ReportCache] Persist failed:', err?.message || err);
     }
@@ -84,13 +66,7 @@ function schedulePersist() {
 async function persistNow() {
   if (!isNativeAndroid()) return;
   try {
-    await Filesystem.writeFile({
-      path: REPORT_CACHE_FILE,
-      data: JSON.stringify(state),
-      directory: Directory.Data,
-      encoding: Encoding.UTF8,
-      recursive: true,
-    });
+    await writeJsonFileAtomic(REPORT_CACHE_FILE, JSON.stringify(state));
   } catch (err) {
     console.error('[ReportCache] PersistNow failed:', err?.message || err);
   }

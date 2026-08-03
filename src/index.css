@@ -52,7 +52,6 @@ body.keyboard-open {
 
 body.keyboard-open .offline-banner,
 body.keyboard-open .tab-bar,
-body.keyboard-open .bottom-tab-bar,
 body.keyboard-open .ob-footer {
   opacity: 0;
   pointer-events: none;

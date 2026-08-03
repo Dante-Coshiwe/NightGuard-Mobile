@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { getRecentOBEntries } from '../services/api';
+import { buildDatedReportFileName, exportPdfDocument } from '../lib/reportUtils';
 import jsPDF from 'jspdf';
 import 'jspdf-autotable';
 import './OBScreen.css';
@@ -129,7 +130,7 @@ export default function OBScreen() {
     });
   };
 
-  const handleExportPDF = () => {
+  const handleExportPDF = async () => {
     const doc = new jsPDF({ orientation: 'landscape' });
     const siteName = getCachedSiteSettings()?.name || 'UNKNOWN SITE';  // ← changed
 
@@ -164,7 +165,11 @@ export default function OBScreen() {
       margin: { top: 28, right: 14, bottom: 14, left: 14 },
     });
 
-    doc.save(`OB-Report-${new Date().toISOString().split('T')[0]}.pdf`);
+    await exportPdfDocument(doc, buildDatedReportFileName('OB-Report'), {
+      shareTitle: 'OB Report',
+      shareText: 'NightGuard occurrence book report.',
+      preferShare: true,
+    });
   };
 
   return (

@@ -3,18 +3,30 @@ import { useAuth } from '../../contexts/AuthContext';
 import { useNFC } from '../../hooks/useNFC';
 import { useGeolocation } from '../../hooks/useGeolocation';
 import { useOfflineApi } from '../../hooks/useOfflineApi';
-import { appendNfcScan, getCachedSiteSettings, getNfcScans, getPatrolConfig, getShiftSession, saveNfcScans } from '../../lib/deviceStore';
+import { getCachedSiteSettings, getNfcScans, getPatrolConfig, getShiftSession } from '../../lib/deviceStore';
 import NotificationService from '../../services/notificationService';
 import { hasCoordinates, MAX_ACCEPTABLE_ACCURACY_METERS } from '../../lib/geo';
 import { buildPatrolScanEntry, evaluateGpsFix, matchNfcCheckpoint } from '../../lib/patrolCheckin';
+import { persistPatrolScan } from '../../lib/patrolScanStore';
 import {
   appendRoutePoint,
+  buildPatrolCompletionPayload,
   endPatrolSession,
+  formatDistance,
+  formatDuration,
+  summarisePatrol,
   getActivePatrolSession,
   getLastPatrolSession,
   markCheckpointReached,
+  PATROL_SESSION_EVENT,
+  resolvePendingPatrolCompletion,
   startPatrolSession,
 } from '../../lib/patrolSession';
+import {
+  drainBackgroundPatrol,
+  isBackgroundPatrolAvailable,
+  stopBackgroundPatrol,
+} from '../../lib/backgroundPatrol';
 import CheckpointMap from '../../components/CheckpointMap';
 import './home-styles.css';
 
@@ -38,6 +50,10 @@ export default function PatrolTab() {
 
   const patrolActive = Boolean(session);
   const patrolStartedAt = session ? new Date(session.startedAt).getTime() : null;
+  // Whether THIS install can record with the screen off. The same web bundle also runs on shells
+  // built before the tracking service existed, and a guard must be told the truth for the phone in
+  // their hand rather than a promise the device cannot keep.
+  const backgroundTrackingAvailable = isBackgroundPatrolAvailable();
 
   useEffect(() => {
     const refresh = () => {
@@ -46,6 +62,10 @@ export default function PatrolTab() {
     };
     const refreshHistory = () => setLastPatrol(getLastPatrolSession());
 
+    // The background recorder owns the GPS watch, so progress can advance while this screen is
+    // closed. Re-read the session whenever it changes on disk instead of trusting local state.
+    const refreshSession = () => setSession(getActivePatrolSession());
+
     refresh();
     if (getActivePatrolSession()) {
       setFeedback(`Resumed unfinished patrol started at ${new Date(getActivePatrolSession().startedAt).toLocaleTimeString()}.`);
@@ -53,10 +73,12 @@ export default function PatrolTab() {
     window.addEventListener('nightguard_patrol_config_updated', refresh);
     window.addEventListener('nightguard_sync_complete', refresh);
     window.addEventListener('nightguard_patrol_history_updated', refreshHistory);
+    window.addEventListener(PATROL_SESSION_EVENT, refreshSession);
     return () => {
       window.removeEventListener('nightguard_patrol_config_updated', refresh);
       window.removeEventListener('nightguard_sync_complete', refresh);
       window.removeEventListener('nightguard_patrol_history_updated', refreshHistory);
+      window.removeEventListener(PATROL_SESSION_EVENT, refreshSession);
     };
   }, []);
 
@@ -74,19 +96,8 @@ export default function PatrolTab() {
     setSubmitting(true);
     setFeedback('');
     try {
-      appendNfcScan(entry);
+      await persistPatrolScan(entry, post);
       setRecentScans(getNfcScans().slice(0, 6));
-      const result = await post('/nfc/scan', entry, {
-        clientTempId: entry.id,
-        offlineResponse: { ...entry, offline: true, _offline: true },
-      });
-      if (!result?._offline) {
-        const updated = getNfcScans().map((scan) => (
-          String(scan.id) === String(entry.id) ? { ...scan, offline: false, _offline: false } : scan
-        ));
-        saveNfcScans(updated);
-        setRecentScans(updated.slice(0, 6));
-      }
       if (entry.checkpoint_id) {
         setSession(markCheckpointReached(entry.checkpoint_id) || getActivePatrolSession());
         // Audible/visible ping the moment a point is captured.
@@ -128,39 +139,10 @@ export default function PatrolTab() {
     return submitScan(entry);
   };
 
-  // While a patrol is active every GPS fix feeds two things: the breadcrumb route (the walk the
-  // guard took between points) and the automatic checkpoint check-in. Kept in a ref so the
-  // persistent watch callback always sees fresh state.
-  const gpsFixHandlerRef = useRef(() => {});
-  gpsFixHandlerRef.current = (fix) => {
-    const active = getActivePatrolSession();
-    if (!active) return;
-
-    const before = active.route.length;
-    const updated = appendRoutePoint(fix);
-    if (updated && updated.route.length !== before) {
-      setSession({ ...updated });
-    }
-
-    if (submitting) return;
-    const result = evaluateGpsFix(patrolConfig.checkpoints, fix);
-    const reached = new Set((updated?.reachedCheckpointIds || []).map(String));
-    if (result.matchedCheckpoint && !reached.has(String(result.matchedCheckpoint.id))) {
-      setSession(markCheckpointReached(result.matchedCheckpoint.id) || getActivePatrolSession());
-      registerGpsCheckin(fix, result.matchedCheckpoint);
-    }
-  };
-
+  // The GPS watch lives in <PatrolRecorder />, mounted at the app shell, so route points and
+  // automatic check-ins keep being captured while the guard is on any other screen. This tab only
+  // reflects the session it maintains, plus the manual actions below.
   const hasGpsCheckpoints = patrolConfig.checkpoints.some(hasCoordinates);
-
-  // The watch runs for the whole patrol (not only when GPS checkpoints exist) so the walked
-  // route is always recorded.
-  useEffect(() => {
-    if (!patrolActive || !geo.isSupported) return undefined;
-    geo.startWatch((fix) => gpsFixHandlerRef.current(fix));
-    return () => geo.stopWatch();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [patrolActive, geo.isSupported]);
 
   const handleManualGpsCheckin = async () => {
     setCheckingIn(true);
@@ -231,32 +213,45 @@ export default function PatrolTab() {
       const active = getActivePatrolSession();
       if (!active) return;
 
-      const reachedCount = reachedRequiredCount;
+      const context = scanContext();
+
+      // Stop background recording and fold in everything it captured BEFORE the patrol is measured
+      // and closed: endPatrolSession builds the completion payload from the session, and anything
+      // still sitting in the native buffer would be left out of the route and the score.
+      await stopBackgroundPatrol();
+      await drainBackgroundPatrol({ post, context });
+
+      // Re-read progress after the drain — points captured with the screen off count too.
+      const latest = getActivePatrolSession() || active;
+      const latestReached = new Set((latest.reachedCheckpointIds || []).map(String));
+      const reachedCount = requiredCheckpointCount
+        ? [...latestReached].filter((id) => requiredCheckpointIds.has(id)).length
+        : latestReached.size;
       const completed = reachedCount >= patrolTargetCount;
       const status = completed ? 'completed' : 'incomplete';
-      const finished = endPatrolSession(status);
+
+      // endPatrolSession writes the completion to a durable outbox before it clears the session,
+      // so an app kill anywhere from here on is recovered on the next launch rather than losing
+      // the patrol and its route.
+      const finished = endPatrolSession(status, context);
       setSession(null);
       setEndedSummary(finished);
       setLastPatrol(finished);
 
-      const context = scanContext();
       const summaryText = completed
         ? `Patrol completed. All ${patrolTargetCount} required points were reached.`
         : `Patrol ended early — ${reachedCount}/${patrolTargetCount} required points reached. Saved as incomplete.`;
 
-      // Persist the patrol + walked route to the control room (queued when offline).
-      const result = await post('/patrols/complete', {
-        id: finished.id,
-        site_id: finished.siteId || context.siteId,
-        shift_id: finished.shiftId || context.shiftId,
-        guard_id: finished.guardId || context.guardId,
-        patrol_name: `${completed ? 'Patrol' : 'Incomplete patrol'} ${new Date(finished.startedAt).toLocaleString()}`,
-        actual_start: finished.startedAt,
-        actual_end: finished.endedAt,
-        status,
-        steps_taken: finished.reachedCheckpointIds.length,
-        route: finished.route,
-      }, { clientTempId: finished.id });
+      // Persist the patrol + walked route to the control room (queued when offline). Same builder
+      // the outbox uses, so the live send and a crash-recovered send are byte-identical.
+      const result = await post(
+        '/patrols/complete',
+        buildPatrolCompletionPayload(finished, context),
+        { clientTempId: finished.id },
+      );
+
+      // Delivered or durably queued — either way the offline queue owns it now.
+      resolvePendingPatrolCompletion(finished.id);
 
       setFeedback(result?._offline
         ? `${summaryText} Stored on this device — it will sync to the dashboard when back online.`
@@ -288,20 +283,32 @@ export default function PatrolTab() {
   const requiredCheckpoints = patrolConfig.checkpoints.filter((checkpoint) => checkpoint.required !== false);
   const requiredCheckpointCount = requiredCheckpoints.length;
   const requiredCheckpointIds = new Set(requiredCheckpoints.map((checkpoint) => String(checkpoint.id)));
-  const patrolTargetCount = requiredCheckpointCount || patrolConfig.minimumTagCount || 1;
+  // Lock the target to what the site required when this patrol started — a config sync arriving
+  // mid-walk must not move the finish line under the guard.
+  const patrolTargetCount = (patrolActive && session?.requiredCount)
+    || requiredCheckpointCount
+    || patrolConfig.minimumTagCount
+    || 1;
   const reachedRequiredCount = requiredCheckpointCount
     ? [...reachedCheckpointIds].filter((id) => requiredCheckpointIds.has(id)).length
     : reachedCheckpointIds.size;
   const pendingRequiredCount = Math.max(patrolTargetCount - reachedRequiredCount, 0);
 
   useEffect(() => {
-    if (patrolActive && reachedRequiredCount >= patrolTargetCount) {
+    if (!patrolActive) return;
+    // Never auto-finish against a checkpoint list that has not loaded. On a cold offline start the
+    // config can be momentarily empty, which collapses the target to 1 and ended the patrol on the
+    // guard's very first point.
+    if (!patrolConfig.checkpoints.length) return;
+    if (reachedRequiredCount >= patrolTargetCount) {
       handleEndPatrol({ auto: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reachedRequiredCount, patrolActive, patrolTargetCount]);
+  }, [reachedRequiredCount, patrolActive, patrolTargetCount, patrolConfig.checkpoints.length]);
 
   const hasNfcCheckpoints = patrolConfig.checkpoints.some((cp) => cp.tag_uid?.trim());
+  const liveSummary = summarisePatrol(session);
+  const endedStats = summarisePatrol(endedSummary);
 
   return (
     <div className="tab-content">
@@ -350,10 +357,60 @@ export default function PatrolTab() {
                 <span className="summary-value">{reachedRequiredCount}/{patrolTargetCount}</span>
               </div>
               <div className="summary-row">
+                <span className="summary-label">Distance walked</span>
+                <span className="summary-value">{formatDistance(liveSummary?.distanceMeters)}</span>
+              </div>
+              <div className="summary-row">
+                <span className="summary-label">Est. steps</span>
+                <span className="summary-value">{liveSummary?.estimatedSteps || 0}</span>
+              </div>
+              <div className="summary-row">
                 <span className="summary-label">Route points recorded</span>
                 <span className="summary-value">{session?.route?.length || 0}</span>
               </div>
             </div>
+
+            {backgroundTrackingAvailable ? (
+              <div
+                style={{
+                  background: '#04180d',
+                  border: '1px solid #166534',
+                  borderRadius: 10,
+                  padding: '12px 14px',
+                  marginBottom: 12,
+                  color: '#bbf7d0',
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                }}
+              >
+                <strong style={{ display: 'block', marginBottom: 4, color: '#4ade80' }}>
+                  Recording in the background
+                </strong>
+                You can lock the screen and pocket the phone — your route and checkpoints keep
+                recording, and you will be notified at each point. Come back and tap End Patrol
+                when you are finished.
+              </div>
+            ) : (
+              <div
+                style={{
+                  background: '#1a1400',
+                  border: '1px solid #a16207',
+                  borderRadius: 10,
+                  padding: '12px 14px',
+                  marginBottom: 12,
+                  color: '#fde68a',
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                }}
+              >
+                <strong style={{ display: 'block', marginBottom: 4, color: '#fbbf24' }}>
+                  Keep your screen on during the patrol
+                </strong>
+                Your route and checkpoints are recorded from GPS. If the screen switches off or the
+                phone goes in your pocket, Android stops the GPS and points will be missed. Keep the
+                display awake and the app open until you tap End Patrol.
+              </div>
+            )}
 
             {geo.isSupported && hasGpsCheckpoints && (
               <button
@@ -417,6 +474,18 @@ export default function PatrolTab() {
             <div className="summary-row">
               <span className="summary-label">Points reached</span>
               <span className="summary-value">{endedSummary.reachedCheckpointIds.length}</span>
+            </div>
+            <div className="summary-row">
+              <span className="summary-label">Distance walked</span>
+              <span className="summary-value">{formatDistance(endedStats?.distanceMeters)}</span>
+            </div>
+            <div className="summary-row">
+              <span className="summary-label">Time on patrol</span>
+              <span className="summary-value">{formatDuration(endedStats?.durationMs)}</span>
+            </div>
+            <div className="summary-row">
+              <span className="summary-label">Est. steps</span>
+              <span className="summary-value">{endedStats?.estimatedSteps || 0}</span>
             </div>
           </div>
         )}

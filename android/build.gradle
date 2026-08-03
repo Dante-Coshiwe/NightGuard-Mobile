@@ -1,0 +1,46 @@
+// Top-level build file where you can add configuration options common to all sub-projects/modules.
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.13.0'
+        classpath 'com.google.gms:google-services:4.4.4'
+    }
+}
+
+apply from: "variables.gradle"
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+subprojects {
+    afterEvaluate { project ->
+        if (project.hasProperty('android')) {
+            project.android {
+                compileOptions {
+                    sourceCompatibility JavaVersion.VERSION_17
+                    targetCompatibility JavaVersion.VERSION_17
+                }
+            }
+        }
+        // Some Capacitor 8 plugins (e.g. @capacitor/geolocation 8.2.0) request a Java 21
+        // toolchain. Force every module's Kotlin/Java toolchain back to 17 so the project
+        // builds with the installed JDK 17 — no JDK 21 install required.
+        if (project.plugins.hasPlugin('org.jetbrains.kotlin.android')) {
+            project.kotlin {
+                jvmToolchain(17)
+            }
+        }
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}

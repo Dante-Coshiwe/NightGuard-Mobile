@@ -64,6 +64,7 @@ export const DEFAULT_PATROL_CONFIG = {
 };
 
 const CACHED_PATROLS_KEY = 'nightguard_cached_patrols';
+const CACHED_SHIFTS_KEY = 'nightguard_cached_completed_shifts';
 
 function normalisePatrolTimes(times) {
   const values = Array.isArray(times) ? times : [];
@@ -75,7 +76,10 @@ function normalisePatrolTimes(times) {
 }
 
 export const DEFAULT_SITE_SETTINGS = {
-  id: import.meta.env.VITE_SITE_ID || '',
+  // Dev builds only. A production bundle ships to every device on the channel,
+  // so a baked site id is a wrong answer waiting for any device whose binding
+  // has not resolved yet — see src/lib/siteResolver.js.
+  id: import.meta.env.DEV ? (import.meta.env.VITE_SITE_ID || '') : '',
   site_name: ENV_LOCATION_NAME,
   location_name: ENV_LOCATION_NAME,
   address: '',
@@ -123,14 +127,35 @@ function dispatchStoreEvent(name) {
   window.dispatchEvent(new Event(name));
 }
 
+// Keeps the FIRST occurrence of each id.
+//
+// Callers upsert by prepending the fresh copy — `saveCachedX([updated, ...cached])` — so a
+// last-wins dedupe let the stale cached entry overwrite the update and silently throw it away. A
+// patrol that synced, or a visitor that was marked exited, kept showing its old state forever.
 function dedupeById(entries = []) {
   const map = new Map();
   entries.forEach((entry) => {
     if (!entry?.id) return;
-    map.set(String(entry.id), entry);
+    const key = String(entry.id);
+    if (!map.has(key)) map.set(key, entry);
   });
   return Array.from(map.values());
 }
+
+// Stop a cache growing until localStorage throws and NEW writes start failing silently — the
+// newest records are the first thing lost when the quota goes. Entries still waiting to sync are
+// kept no matter how old: they are the only copy that exists.
+function capCache(entries, limit) {
+  if (entries.length <= limit) return entries;
+  const isPending = (entry) => entry?._offline || entry?.offline || entry?._pendingExit;
+  const pending = entries.filter(isPending);
+  const synced = entries.filter((entry) => !isPending(entry));
+  return [...pending, ...synced.slice(0, Math.max(limit - pending.length, 0))];
+}
+
+const CACHED_PATROLS_LIMIT = 200;
+const CACHED_VISITORS_LIMIT = 500;
+const CACHED_SHIFTS_LIMIT = 200;
 
 function normaliseGuard(guard) {
   const isGeneralGuard = String(guard?.id) === GENERAL_GUARD_ID ||
@@ -247,13 +272,23 @@ export function getCachedPatrols() {
 }
 
 export function saveCachedPatrols(entries) {
-  const saved = writeJson(CACHED_PATROLS_KEY, dedupeById(entries));
+  const saved = writeJson(CACHED_PATROLS_KEY, capCache(dedupeById(entries), CACHED_PATROLS_LIMIT));
   dispatchStoreEvent('nightguard_patrols_updated');
   return saved;
 }
 
 export function upsertCachedPatrol(entry) {
   return saveCachedPatrols([entry, ...getCachedPatrols()]);
+}
+
+// Completed shifts had no local copy at all, so both shift reports showed nothing but an error
+// message the moment the device was offline. Cache them like every other read.
+export function getCachedCompletedShifts() {
+  return readJson(CACHED_SHIFTS_KEY, []);
+}
+
+export function saveCachedCompletedShifts(entries) {
+  return writeJson(CACHED_SHIFTS_KEY, capCache(dedupeById(entries), CACHED_SHIFTS_LIMIT));
 }
 
 export function getNfcScans() {
@@ -264,10 +299,38 @@ export function saveNfcScans(scans) {
   return writeJson(NFC_SCANS_KEY, scans);
 }
 
+const NFC_SCAN_HISTORY_LIMIT = 500;
+
+// localStorage holds a few MB and every GPS check-in appends a row that was never removed. Once
+// the quota is reached the write throws and NEW scans stop persisting — the freshest evidence is
+// the first thing lost, silently. Trim the oldest scans that have ALREADY reached the server;
+// anything still pending sync is kept no matter how old, because it is the only copy.
+function trimNfcScans(scans) {
+  if (scans.length <= NFC_SCAN_HISTORY_LIMIT) return scans;
+
+  const pending = scans.filter((scan) => scan?.offline || scan?._offline);
+  const synced = scans.filter((scan) => !(scan?.offline || scan?._offline));
+  const keep = synced.slice(0, Math.max(NFC_SCAN_HISTORY_LIMIT - pending.length, 0));
+  return [...pending, ...keep].sort((a, b) => new Date(b?.scanned_at || 0) - new Date(a?.scanned_at || 0));
+}
+
 export function appendNfcScan(scan) {
-  const updated = [scan, ...getNfcScans()];
+  const updated = trimNfcScans([scan, ...getNfcScans()]);
   saveNfcScans(updated);
   return updated;
+}
+
+// A device rebound to another site must not keep the previous site's patrol setup or history
+// visible — that layout belongs to a different client. Anything still waiting to sync is KEPT: it
+// was recorded at the old site and must still be delivered there.
+export function purgeSiteScopedPatrolCaches() {
+  try {
+    localStorage.removeItem(PATROL_CONFIG_KEY);
+  } catch { /* ignore */ }
+  saveCachedPatrols([]);
+  saveNfcScans(getNfcScans().filter((scan) => scan?.offline || scan?._offline));
+  dispatchStoreEvent('nightguard_patrol_config_updated');
+  console.warn('[DeviceStore] site changed — cleared patrol config, patrol list and synced scans');
 }
 
 export function getShiftSession() {
@@ -417,7 +480,7 @@ export function getCachedPedestrians() {
 }
 
 export function saveCachedPedestrians(entries) {
-  const deduped = dedupeById(entries);
+  const deduped = capCache(dedupeById(entries), CACHED_VISITORS_LIMIT);
   const saved = writeJson(CACHED_PEDESTRIANS_KEY, deduped);
   console.log(`[DeviceStore] saveCachedPedestrians(): saved ${deduped.length} entries`);
   dispatchStoreEvent('nightguard_pedestrians_updated');
@@ -445,7 +508,7 @@ export function getCachedVehicles() {
 }
 
 export function saveCachedVehicles(entries) {
-  const deduped = dedupeById(entries);
+  const deduped = capCache(dedupeById(entries), CACHED_VISITORS_LIMIT);
   const saved = writeJson(CACHED_VEHICLES_KEY, deduped);
   console.log(`[DeviceStore] saveCachedVehicles(): saved ${deduped.length} entries`);
   dispatchStoreEvent('nightguard_vehicles_updated');
