@@ -5,6 +5,7 @@ import { loadPatrolConfiguration, savePatrolConfiguration } from '../services/sc
 import NotificationService from '../services/notificationService';
 import { useGeolocation } from '../hooks/useGeolocation';
 import { isValidCoordinate } from '../lib/geo';
+import { isNfcReaderAvailable, listenForNfcTags, nfcStatus } from '../lib/nfcReader';
 import CheckpointMap from '../components/CheckpointMap';
 
 const styles = {
@@ -19,26 +20,51 @@ const styles = {
   fieldError: { color: '#fca5a5', fontSize: 12, marginTop: 5 },
 };
 
-const isNative = typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.();
+const TAG_READ_TIMEOUT_MS = 20000;
 
-function readNfcTag() {
-  return new Promise((resolve, reject) => {
-    if (isNative && window.Nfc) {
-      window.Nfc.startScan()
-        .then(() => {
-          window.Nfc.addListener('nfcTagScanned', (event) => {
-            const uid = event.nfcTag?.id || 'UNKNOWN';
-            window.Nfc.stopScan();
-            window.Nfc.removeAllListeners();
-            resolve(String(uid).toUpperCase());
-          });
+// Assigning a tag to a checkpoint has to read that tag. Two things here never worked in the APK:
+// `window.Nfc` is a global no plugin ever defined, and `NDEFReader` (Web NFC) is a Chrome API that
+// is not exposed to a WebView. So the native reader is tried first; Web NFC stays only for the
+// admin panel running in a real browser.
+async function readNfcTag() {
+  if (isNfcReaderAvailable()) {
+    // Ask the adapter FIRST. Without this a phone with no NFC chip, or with NFC switched off,
+    // simply sat on the 20 s timeout and then blamed the guard for not holding the tag close
+    // enough — the one thing that was never the problem.
+    const status = await nfcStatus();
+    if (!status.available) throw new Error('This phone has no NFC reader. Set the checkpoint by GPS instead.');
+    if (!status.enabled) throw new Error('NFC is switched off. Turn NFC on in Android settings, then try again.');
+
+    return new Promise((resolve, reject) => {
+      let stop = null;
+      let done = false;
+
+      const finish = (fn, value) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        stop?.();
+        fn(value);
+      };
+
+      const timer = setTimeout(
+        () => finish(reject, new Error('No tag detected. Hold the phone against the tag and try again.')),
+        TAG_READ_TIMEOUT_MS,
+      );
+
+      listenForNfcTags((uid) => finish(resolve, String(uid).toUpperCase()))
+        .then((cleanup) => {
+          // The tag can be read before this resolves; tear down straight away if so.
+          if (done) cleanup();
+          else stop = cleanup;
         })
-        .catch((err) => reject(new Error(err.message || 'NFC scan failed')));
-      return;
-    }
+        .catch((err) => finish(reject, new Error(err?.message || 'NFC scan failed')));
+    });
+  }
 
+  return new Promise((resolve, reject) => {
     if (!('NDEFReader' in window)) {
-      reject(new Error('NFC not supported on this device/browser'));
+      reject(new Error('NFC not supported on this device'));
       return;
     }
 

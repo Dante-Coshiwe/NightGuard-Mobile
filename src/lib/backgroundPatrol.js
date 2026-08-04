@@ -1,4 +1,5 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
+import { Geolocation } from '@capacitor/geolocation';
 import { hasCoordinates } from './geo';
 import { getPatrolConfig } from './deviceStore';
 import { buildPatrolScanEntry } from './patrolCheckin';
@@ -43,12 +44,35 @@ function nativeCheckpoints() {
     }));
 }
 
+// The native recorder is a foreground service of type `location`, and Android 14+ refuses to start
+// one unless a location permission is already held — so the grant has to happen here, before the
+// plugin call, rather than lazily whenever the in-app watch first reads a position. Fine location
+// specifically: the ~3 m geofence cannot be judged from an approximate fix.
+//
+// Nothing races with this. PatrolRecorder keeps the in-app watch off until this function has
+// answered, so its own permission request cannot be in flight at the same time.
+async function ensureLocationPermission() {
+  try {
+    const status = await Geolocation.checkPermissions();
+    if (status.location === 'granted') return true;
+    const requested = await Geolocation.requestPermissions();
+    return requested.location === 'granted';
+  } catch (err) {
+    console.warn('[BackgroundPatrol] permission check failed:', err?.message || err);
+    return false;
+  }
+}
+
 // Returns true only when the service actually took the job, so the caller knows whether it still
 // needs the in-app GPS watch as the recorder.
 export async function startBackgroundPatrol(patrolId) {
   if (!isBackgroundPatrolAvailable()) return false;
   const checkpoints = nativeCheckpoints();
   if (!checkpoints.length) return false;
+  if (!(await ensureLocationPermission())) {
+    console.warn('[BackgroundPatrol] location not granted; falling back to in-app watch');
+    return false;
+  }
 
   try {
     await PatrolTracker.start({ patrolId: patrolId ? String(patrolId) : null, checkpoints });

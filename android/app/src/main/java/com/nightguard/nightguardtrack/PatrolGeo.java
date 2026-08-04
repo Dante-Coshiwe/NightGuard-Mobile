@@ -9,7 +9,7 @@ package com.nightguard.nightguardtrack;
  */
 final class PatrolGeo {
     /** A checkpoint counts as reached when the guard is this close (metres). */
-    static final double GEOFENCE_RADIUS_METERS = 3;
+    static final double GEOFENCE_RADIUS_METERS = 10;
     /** Fixes worse than this are never trusted to credit a check-in. */
     static final double MAX_ACCEPTABLE_ACCURACY_METERS = 25;
     /** How much GPS jitter is forgiven for a guard genuinely at the point. */

@@ -1,6 +1,8 @@
 package com.nightguard.nightguardtrack;
 
+import android.Manifest;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 
 import androidx.core.content.ContextCompat;
 
@@ -40,6 +42,17 @@ public class PatrolTrackerPlugin extends Plugin {
      */
     @PluginMethod
     public void start(PluginCall call) {
+        // Refuse before the service is ever asked. Android 14+ throws SecurityException out of
+        // startForeground() for a `location` service with no location grant, and that lands on the
+        // main thread inside onStartCommand where it is fatal to the app rather than to the
+        // patrol. The service guards itself too; this just keeps the failure on the JS side, which
+        // already reads a rejection as "the in-app GPS watch is the recorder".
+        if (ContextCompat.checkSelfPermission(getContext(), Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED) {
+            call.reject("location permission not granted");
+            return;
+        }
+
         JSArray checkpoints = call.getArray("checkpoints", new JSArray());
         String patrolId = call.getString("patrolId", null);
 

@@ -23,6 +23,9 @@ public class MainActivity extends BridgeActivity {
         // Background patrol recording. Only this shell has it; the shared web bundle
         // feature-detects it and falls back to the in-app GPS watch on older installs.
         registerPlugin(PatrolTrackerPlugin.class);
+        // Native tag reading. Web NFC (NDEFReader) does not exist in a WebView, so without this
+        // plugin NFC check-ins cannot fire at all inside the APK.
+        registerPlugin(NfcReaderPlugin.class);
         super.onCreate(savedInstanceState);
 
         getWindow().addFlags(

@@ -100,9 +100,67 @@ handset (`NG-B4D60C7CB96F8727`), which walked 1.6→1.7→1.8→1.9 in a single 
 not a guard. So the keyboard bug, which arrived with the 1.8 `adjustPan` commit, never reached a
 real user. Re-run the query rather than trusting this paragraph.
 
+Snapshot **2026-08-04** (5 real devices): 3 on **APK 1.6**, 1 on 1.9, 1 on 1.11 (the dev phone
+above). The 1.6 devices have no `PatrolTrackerPlugin`, so they cannot gather points with the screen
+off — `useInAppWatch` is true there, which both holds the screen-wake lock and shows the amber
+"Keep the screen on" banner. Both 1.6 and 1.9 are to be upgraded to 1.11 by hand; OTA cannot
+deliver an APK.
+
 Caveat when using git to date a native regression: `android/` was untracked before commit `4f4debd`
 (Release 1.8) and `capacitor.config.json` before `f0c1bfc` (Release 1.0.15, which postdates the APK
 1.6 build). Git cannot tell you what shipped in APKs older than those commits.
+
+## A `location` foreground service must hold permission BEFORE `startForeground()`
+
+Android 14+ validates the service type *inside* `startForeground()` and throws `SecurityException`
+when no location permission is held. Thrown from `onStartCommand`, that kills the **whole app** —
+this was the "app crashes the moment I start a patrol" bug (APK 1.8–1.10, fixed in 1.11).
+
+```
+java.lang.SecurityException: Starting FGS with type location ... targetSDK=36
+  requires ... any of [ACCESS_COARSE_LOCATION, ACCESS_FINE_LOCATION]
+  and the app must be in the eligible state/exemptions
+```
+
+Three rules, all of which `PatrolTrackingService` now follows:
+
+1. Check permission **before** `startForegroundNotification()`, not in `startTracking()` after it.
+2. Wrap `ServiceCompat.startForeground` in `try/catch`. Permission is not sufficient — location is
+   a *while-in-use* permission, so the platform also refuses when the app is not in an eligible
+   (visible) state. That is precisely the case when Android restarts the service itself after a
+   process kill, so a refusal is a NORMAL outcome and must never be fatal.
+3. Return `START_NOT_STICKY` on that failure path. With `START_REDELIVER_INTENT` the system
+   redelivers the same intent straight back into the same refusal — the original bug crash-looped
+   three times in nine seconds.
+
+Request the permission on the JS side before calling the plugin (`startBackgroundPatrol` does), or
+the service is asked for something it can only refuse.
+
+## Web NFC (`NDEFReader`) does not exist in a WebView
+
+`'NDEFReader' in window` is **always false inside the APK**. Web NFC ships in Chrome for Android
+only; a Capacitor WebView never exposes it. The old `useNFC` hook and `GuardPatrolConfig`'s
+`readNfcTag` were both built on it, so NFC check-ins could not fire on any device — it only ever
+appeared to work when tested in a desktop/Chrome browser. `window.Nfc` was likewise a global no
+plugin ever defined.
+
+Tag reading is native: `NfcReaderPlugin` uses `NfcAdapter.enableReaderMode` with
+`FLAG_READER_SKIP_NDEF_CHECK` (the UID is all that is wanted, and blank/Mifare tags carry no NDEF).
+Reader mode is bound to the activity, so it is re-armed in `handleOnResume`. **Android only
+dispatches NFC to a foreground activity** — with the screen off or the app backgrounded no tag is
+read, and GPS remains the recorder for a pocketed phone.
+
+Compare tag UIDs with separators stripped (`normaliseTagUid`): native reports bare hex
+(`045a1b2c`) while a `tag_uid` typed into the admin panel is usually `04:5A:1B:2C`.
+
+## Checkpoint radius lives in TWO places
+
+`GEOFENCE_RADIUS_METERS` exists in both [src/lib/geo.js](src/lib/geo.js) and
+[PatrolGeo.java](android/app/src/main/java/com/nightguard/nightguardtrack/PatrolGeo.java). Change
+them together or a patrol walked with the screen off scores differently from the same walk with the
+screen on. Currently **10 m**: 1.0.16 tightened it to 3 m, which plus the 5 m margin cap gave an
+~8 m effective radius that consumer GPS beside a building routinely misses — guards walked whole
+routes that registered nothing.
 
 ## Rollout order: APK before any bundle that needs it
 

@@ -107,9 +107,38 @@ public class PatrolTrackingService extends Service implements LocationListener {
             return START_NOT_STICKY;
         }
 
-        startForegroundNotification();
+        // Android 14+ validates the `location` service type inside startForeground() itself and
+        // throws SecurityException — which kills the whole app — when no location permission is
+        // held. This check used to live in startTracking(), which ran AFTER the service was already
+        // foreground, so it never got the chance to run. It must stay ahead of startForeground().
+        if (!hasLocationPermission()) {
+            Log.w(TAG, "location permission not granted; not starting foreground tracking");
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        // Permission alone is not sufficient: location is a while-in-use permission, so the system
+        // also refuses the start when the app is not in an eligible (visible) state. That is exactly
+        // the case when Android restarts this service on its own after a process kill, so a refusal
+        // is a normal outcome here and must never be fatal. Give up on this attempt instead, and
+        // return START_NOT_STICKY so the intent is not redelivered straight back into the same
+        // refusal — a crash loop is what the redelivery produced before.
+        if (!startForegroundNotification()) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
         startTracking();
         return START_REDELIVER_INTENT;
+    }
+
+    /**
+     * FINE specifically: the geofence is ~3 m wide and the trail is recorded from GPS_PROVIDER, so
+     * an approximate-only grant cannot do this job. It is also a strict subset of what the platform
+     * demands for a `location` foreground service, so passing this passes that.
+     */
+    private boolean hasLocationPermission() {
+        return ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            == PackageManager.PERMISSION_GRANTED;
     }
 
     private void applyStartPayload(Intent intent) {
@@ -137,8 +166,7 @@ public class PatrolTrackingService extends Service implements LocationListener {
 
     private void startTracking() {
         if (tracking) return;
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-            != PackageManager.PERMISSION_GRANTED) {
+        if (!hasLocationPermission()) {
             Log.e(TAG, "ACCESS_FINE_LOCATION not granted; cannot track");
             stopSelf();
             return;
@@ -323,11 +351,26 @@ public class PatrolTrackingService extends Service implements LocationListener {
             .build();
     }
 
-    private void startForegroundNotification() {
+    /**
+     * @return true only once the service is genuinely in the foreground state. Every way the
+     *     platform can refuse a `location` foreground service arrives here as an unchecked
+     *     exception (SecurityException, ForegroundServiceStartNotAllowedException, the
+     *     ForegroundServiceType ones), and an escape from onStartCommand takes the app down with
+     *     it. Background recording is best-effort by design — the in-app GPS watch is the
+     *     fallback — so a refusal is reported, never thrown.
+     */
+    private boolean startForegroundNotification() {
         int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
             ? ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
             : 0;
-        ServiceCompat.startForeground(this, ONGOING_NOTIFICATION_ID, buildOngoingNotification(), type);
+        try {
+            ServiceCompat.startForeground(
+                this, ONGOING_NOTIFICATION_ID, buildOngoingNotification(), type);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "startForeground(location) refused: " + e);
+            return false;
+        }
     }
 
     private void updateOngoingNotification() {

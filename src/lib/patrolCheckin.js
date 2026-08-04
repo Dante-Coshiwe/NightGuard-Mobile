@@ -1,17 +1,22 @@
 import { findNearestCheckpoint, hasCoordinates, isWithinGeofence, segmentCrossedCheckpoint } from './geo';
+import { normaliseTagUid } from './nfcReader';
 import { newUuid } from './uuid';
 
 // Shared patrol check-in logic used by both the home Patrol tab and the Patrol Tracking
 // screen, so NFC and GPS behave identically regardless of which surface the guard uses.
 
-// Match a scanned NFC tag to a configured checkpoint (case-insensitive), mirroring the
-// original PatrolTab behaviour.
+// Match a scanned NFC tag to a configured checkpoint.
+//
+// Compared with separators stripped, not merely lower-cased: the native reader reports bare hex
+// ("045a1b2c") while a tag_uid configured in the admin panel is commonly written with colons,
+// dashes or spaces ("04:5A:1B:2C"). A plain case-insensitive compare failed those, and the guard
+// holding a perfectly good tag against the phone got "unregistered checkpoint".
 export function matchNfcCheckpoint(checkpoints, tagUid) {
-  if (!tagUid) return null;
-  const needle = String(tagUid).toLowerCase();
+  const needle = normaliseTagUid(tagUid);
+  if (!needle) return null;
   return (
     (Array.isArray(checkpoints) ? checkpoints : []).find(
-      (checkpoint) => checkpoint.tag_uid && String(checkpoint.tag_uid).toLowerCase() === needle
+      (checkpoint) => checkpoint.tag_uid && normaliseTagUid(checkpoint.tag_uid) === needle
     ) || null
   );
 }

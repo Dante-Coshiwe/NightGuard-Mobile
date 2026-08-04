@@ -4,7 +4,8 @@ import { useGeolocation } from '../hooks/useGeolocation';
 import { useOfflineApi } from '../hooks/useOfflineApi';
 import { isAppOnline } from '../lib/connectivity';
 import { getCachedSiteSettings, getPatrolConfig, getShiftSession } from '../lib/deviceStore';
-import { buildPatrolScanEntry, evaluateGpsProgress } from '../lib/patrolCheckin';
+import { buildPatrolScanEntry, evaluateGpsProgress, matchNfcCheckpoint } from '../lib/patrolCheckin';
+import { listenForNfcTags } from '../lib/nfcReader';
 import { persistPatrolScan } from '../lib/patrolScanStore';
 import { releaseScreenWakeLock, requestScreenWakeLock } from '../lib/screenWakeLock';
 import {
@@ -113,6 +114,70 @@ export default function PatrolRecorder() {
       inFlightRef.current.delete(id);
     }
   }, [post, user, shiftSession]);
+
+  // A tag held against the phone counts on its own — there is no button to press and nothing to
+  // type. Lives here rather than in the Patrol tab so a tag read while the guard is on any other
+  // screen still registers.
+  //
+  // Offline is the normal case, not the exception: persistPatrolScan writes the scan to the device
+  // before any network call, so a tag read with no signal is already saved and the queue delivers
+  // it later.
+  const logNfcTag = useCallback(async (tagUid) => {
+    const session = getActivePatrolSession();
+    if (!session) return;
+
+    const checkpoints = getPatrolConfig().checkpoints;
+    const matchedCheckpoint = matchNfcCheckpoint(checkpoints, tagUid);
+    // An unmatched tag is still recorded (it proves the guard was there and shows up as an
+    // unregistered scan), but it must not be de-duplicated against a checkpoint id it has none of.
+    const id = matchedCheckpoint ? String(matchedCheckpoint.id) : `tag:${tagUid}`;
+    if (inFlightRef.current.has(id)) return;
+    if (matchedCheckpoint && (session.reachedCheckpointIds || []).map(String).includes(id)) return;
+    inFlightRef.current.add(id);
+
+    try {
+      if (matchedCheckpoint) markCheckpointReached(matchedCheckpoint.id);
+      const entry = buildPatrolScanEntry({
+        method: 'nfc',
+        tagUid,
+        matchedCheckpoint,
+        siteId: getCachedSiteSettings().id || null,
+        guardId: user?.id || null,
+        guardName: user?.full_name || 'Unknown guard',
+        shiftId: shiftSession?.id || getShiftSession()?.id || null,
+        shiftLabel: shiftSession?.shiftLabel || 'On Duty',
+        patrolId: session.id || null,
+        isOnline: isAppOnline(),
+      });
+
+      await persistPatrolScan(entry, post);
+      NotificationService.announceCheckpointCaptured(entry.checkpoint_name, {
+        shiftId: entry.shift_id,
+        checkpointId: entry.checkpoint_id,
+        method: 'nfc',
+      }).catch(() => null);
+    } catch (err) {
+      console.warn('[PatrolRecorder] nfc log failed:', err?.message || err);
+    } finally {
+      inFlightRef.current.delete(id);
+    }
+  }, [post, user, shiftSession]);
+
+  // Detection runs for the whole patrol. Android only dispatches NFC to a foreground activity, so
+  // this covers the guard walking with the app open; a pocketed phone is recorded by GPS instead.
+  useEffect(() => {
+    if (!patrolActive) return undefined;
+    let stop = null;
+    let cancelled = false;
+    listenForNfcTags((tagUid) => logNfcTag(tagUid)).then((cleanup) => {
+      if (cancelled) cleanup();
+      else stop = cleanup;
+    });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, [patrolActive, logNfcTag]);
 
   // Fold whatever the background service recorded into the session and the offline queue.
   const drainNative = useCallback(async () => {

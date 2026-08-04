@@ -1,12 +1,17 @@
 // Geolocation helpers for GPS patrols.
 //
 // A checkpoint counts as "reached" when the guard is physically close to it — within
-// GEOFENCE_RADIUS_METERS (~3 m, i.e. standing at the point). A small accuracy margin (capped at
+// GEOFENCE_RADIUS_METERS (~10 m, i.e. at the point). A small accuracy margin (capped at
 // ACCURACY_MARGIN_CAP_METERS) forgives GPS jitter for a guard who is genuinely at the point, and
 // fixes worse than MAX_ACCEPTABLE_ACCURACY_METERS are rejected outright so a bad reading can
 // never credit a check-in from far away.
+//
+// 1.0.16 tightened this to 3 m, which reads well on paper but not on a phone: a 3 m fence plus the
+// 5 m margin cap gave an ~8 m effective radius, and consumer GPS beside a building is routinely
+// worse than that. Guards walked whole routes that registered nothing. 10 m credits an honest
+// walk-by on real hardware while staying far too tight to reach from a parked car.
 
-export const GEOFENCE_RADIUS_METERS = 3;
+export const GEOFENCE_RADIUS_METERS = 10;
 export const MAX_ACCEPTABLE_ACCURACY_METERS = 25;
 export const ACCURACY_MARGIN_CAP_METERS = 5;
 
@@ -48,6 +53,55 @@ export function distanceMeters(lat1, lng1, lat2, lng2) {
       Math.sin(dLng / 2);
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return EARTH_RADIUS_METERS * c;
+}
+
+// Initial great-circle bearing from one point to another, in degrees clockwise from true north.
+export function bearingDegrees(lat1, lng1, lat2, lng2) {
+  if (![lat1, lng1, lat2, lng2].every((value) => Number.isFinite(Number(value)))) return null;
+  const φ1 = toRadians(Number(lat1));
+  const φ2 = toRadians(Number(lat2));
+  const Δλ = toRadians(Number(lng2) - Number(lng1));
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+const COMPASS_POINTS = [
+  'north', 'north-east', 'east', 'south-east',
+  'south', 'south-west', 'west', 'north-west',
+];
+
+// A compass word rather than a rotating arrow: an arrow is only meaningful if the phone's heading
+// is known, and a WebView cannot read the magnetometer reliably. "Head north-east" is something a
+// guard can act on with the phone flat in their hand.
+export function compassDirection(degrees) {
+  if (!Number.isFinite(Number(degrees))) return '';
+  const index = Math.round(((Number(degrees) % 360) + 360) % 360 / 45) % 8;
+  return COMPASS_POINTS[index];
+}
+
+// The point the guard should walk to next: the closest one they have not gathered yet. Purely
+// advisory — points may be gathered in ANY order, so this never gates or sequences anything.
+export function nextCheckpointGuidance(checkpoints, reachedIds, position) {
+  if (!isValidCoordinate(position?.latitude, position?.longitude)) return null;
+  const reached = new Set((reachedIds || []).map(String));
+  const remaining = (Array.isArray(checkpoints) ? checkpoints : [])
+    .filter((checkpoint) => hasCoordinates(checkpoint) && !reached.has(String(checkpoint.id)));
+  if (!remaining.length) return null;
+
+  const nearest = findNearestCheckpoint(remaining, position.latitude, position.longitude);
+  if (!nearest) return null;
+
+  const bearing = bearingDegrees(
+    position.latitude, position.longitude,
+    Number(nearest.checkpoint.latitude), Number(nearest.checkpoint.longitude),
+  );
+  return {
+    checkpoint: nearest.checkpoint,
+    distance: nearest.distance,
+    bearing,
+    direction: compassDirection(bearing),
+  };
 }
 
 // Nearest GPS-enabled checkpoint to a position. Returns { checkpoint, distance } or null.
