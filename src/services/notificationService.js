@@ -151,12 +151,27 @@ const NotificationService = {
     const body = patrolLabel || `Scheduled patrol ${patrolTime} must start now`;
 
     if (isNative()) {
+      const [hour, minute] = String(patrolTime).split(':').map(Number);
       await LocalNotifications.schedule({
         notifications: [{
           id,
           title,
           body,
-          schedule: { at, allowWhileIdle: true },
+          // REPEATING daily, via `on` — not a one-shot `at`.
+          //
+          // A one-shot alarm only re-armed itself from the localNotificationReceived listener,
+          // which needs the JS context alive when it fires. An alarm's whole job is to fire when
+          // the app is closed, so in practice each patrol time went off once and then never again
+          // until someone started a new shift or re-saved the patrol config. Letting the OS own
+          // the recurrence means nothing has to be running for tomorrow's alarm to exist.
+          schedule: {
+            // `second: 0` is intent, not a guarantee — the Android plugin ignores it and arms at
+            // whatever second the call was made (verified: alarms land at hh:mm:51). That is
+            // inside the target minute, which is all the schedule cares about.
+            on: { hour: hour || 0, minute: minute || 0, second: 0 },
+            repeats: true,
+            allowWhileIdle: true,
+          },
           sound: 'patrol_alarm.wav',
           channelId: CHANNEL_ID,
           extra: { type: 'patrol_alarm', patrolTime, notificationId: id },

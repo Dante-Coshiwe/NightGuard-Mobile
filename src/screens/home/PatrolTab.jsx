@@ -18,6 +18,7 @@ import {
   stopBackgroundPatrol,
 } from '../../lib/backgroundPatrol';
 import { distanceMeters, hasCoordinates, nextCheckpointGuidance } from '../../lib/geo';
+import { clearPatrolDue, getPatrolDue, subscribePatrolDue } from '../../lib/patrolDueAlarm';
 import CheckpointMap from '../../components/CheckpointMap';
 import './home-styles.css';
 
@@ -43,7 +44,12 @@ export default function PatrolTab() {
   const [endedSummary, setEndedSummary] = useState(null);
   const [patrolConfig, setPatrolConfig] = useState(getPatrolConfig());
   const [backgroundRunning, setBackgroundRunning] = useState(false);
+  // A scheduled patrol that has come due and is currently sounding the alarm. The button flashes
+  // and the noise continues until it is pressed — there is no other way to silence it.
+  const [patrolDue, setPatrolDue] = useState(getPatrolDue());
   const endingRef = useRef(false);
+
+  useEffect(() => subscribePatrolDue(() => setPatrolDue(getPatrolDue())), []);
 
   const patrolActive = Boolean(session);
 
@@ -122,6 +128,24 @@ export default function PatrolTab() {
   const hasGpsCheckpoints = patrolConfig.checkpoints.some(hasCoordinates);
 
   const handleStartPatrol = () => {
+    // Silences the alarm and tells us whether this start answers a scheduled patrol. Done first so
+    // the noise stops the instant the guard's finger lands, not after the network work below.
+    const due = clearPatrolDue();
+    if (due) {
+      // Bookkeeping the old full-screen alert used to own: drop the fired notification, put the
+      // next occurrence back, and record the start in the in-app feed.
+      NotificationService.cancelNotification(
+        due.notificationId || NotificationService.getNotificationIdForPatrolTime(due.time),
+      ).catch(() => null);
+      NotificationService.rescheduleNextPatrolOccurrence(due.time).catch(() => null);
+      NotificationService.addToAppNotificationFeed({
+        type: 'patrol_start',
+        title: 'Patrol started',
+        body: `Scheduled patrol ${due.time} started.`,
+        metadata: { shiftId: due.shiftId, patrolTime: due.time },
+      }).catch(() => null);
+    }
+
     const context = scanContext();
     const started = startPatrolSession({
       siteId: context.siteId,
@@ -234,14 +258,25 @@ export default function PatrolTab() {
         {!patrolActive ? (
           <>
             <div style={{ textAlign: 'center', padding: '28px 0 22px' }}>
-              <div style={{ fontSize: 15, color: '#8b8b8b', marginBottom: 6 }}>Ready to patrol</div>
-              <div style={{ fontSize: 17, color: '#e5e5e5' }}>
-                {patrolTargetCount} point{patrolTargetCount === 1 ? '' : 's'} on your route
-              </div>
+              {patrolDue ? (
+                <>
+                  <div style={{ fontSize: 15, color: '#fca5a5', marginBottom: 6, fontWeight: 700, letterSpacing: 1 }}>
+                    PATROL DUE — {patrolDue.time}
+                  </div>
+                  <div style={{ fontSize: 17, color: '#e5e5e5' }}>Press Start Patrol to silence the alarm</div>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: 15, color: '#8b8b8b', marginBottom: 6 }}>Ready to patrol</div>
+                  <div style={{ fontSize: 17, color: '#e5e5e5' }}>
+                    {patrolTargetCount} point{patrolTargetCount === 1 ? '' : 's'} on your route
+                  </div>
+                </>
+              )}
             </div>
 
             <button
-              className="button-add"
+              className={patrolDue ? 'button-add patrol-due-flash' : 'button-add'}
               onClick={handleStartPatrol}
               style={{ fontSize: 20, padding: '22px 0', fontWeight: 700 }}
             >

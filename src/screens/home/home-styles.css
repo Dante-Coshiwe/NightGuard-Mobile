@@ -623,3 +623,28 @@
     align-items: stretch;
   }
 }
+
+/* A scheduled patrol has come due: the Start Patrol button pulses red while the alarm sounds.
+   Paired with lib/patrolDueAlarm — pressing the button is the only thing that stops either. */
+@keyframes patrol-due-flash {
+  0%, 100% {
+    background: #dc2626;
+    border-color: #fca5a5;
+    box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.7);
+  }
+  50% {
+    background: #7f1d1d;
+    border-color: #dc2626;
+    box-shadow: 0 0 22px 6px rgba(220, 38, 38, 0.55);
+  }
+}
+
+.patrol-due-flash {
+  animation: patrol-due-flash 0.7s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .patrol-due-flash {
+    animation-duration: 1.6s;
+  }
+}
