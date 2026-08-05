@@ -9,6 +9,7 @@ import { useOfflineQueue } from '../hooks/useOfflineQueue';
 import { GENERAL_GUARD_ID, getLocationName } from '../lib/deviceStore';
 import { getActivePatrolSession, PATROL_SESSION_EVENT } from '../lib/patrolSession';
 import EndShiftModal from '../components/EndShiftModal';
+import KioskService from '../services/kioskService';
 import './home/home-styles.css';
 
 export default function HomeScreen() {
@@ -35,6 +36,7 @@ export default function HomeScreen() {
   const { user, guards, shiftSession, switchGuard, quickSwitchEnabled } = useAuth();
   const { isOnline, queueCount } = useOfflineQueue();
   const locationName = getLocationName();
+  const kioskLocked = KioskService.isEnabled();
 
   const guardOptions = useMemo(
     () => guards.filter((guard) => (guard.user_type || guard.role) !== 'admin' && guard.is_active !== false),
@@ -127,6 +129,14 @@ export default function HomeScreen() {
           {queueCount > 0 ? ` • ${queueCount} queued` : ''}
         </div>
       </div>
+
+      {/* Shown only where it is actionable: on duty, on a device the admin has unlocked. On a
+          kiosk-locked device the guard cannot leave anyway, so the warning would be noise. */}
+      {shiftSession && !kioskLocked && (
+        <div className="leave-warning">
+          Leaving this app is reported. The admin is notified as soon as you leave.
+        </div>
+      )}
 
       {quickSwitchEnabled && switchSheetOpen && (
         <div className="quick-switch-backdrop" onClick={() => setSwitchSheetOpen(false)}>

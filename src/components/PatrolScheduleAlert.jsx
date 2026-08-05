@@ -60,17 +60,24 @@ export default function PatrolScheduleAlert() {
 
   useEffect(() => {
     const raise = async ({ patrolTime, notificationId }) => {
+      // Anyone signed in on this device gets the alarm — an active shift is NOT required.
+      //
+      // The OS notification fires regardless of shift state (it is armed from the site's schedule,
+      // not from a shift), so gating only the in-app half produced the worst possible outcome: the
+      // phone made the noise and the app did nothing — no siren, no announcement, no flashing
+      // button, and the guard left staring at whatever screen they were on. Shift bookkeeping is
+      // recorded when the patrol starts; it must never decide whether the alarm is heard.
       const activeShift = shiftSession || getShiftSession();
-      if (!activeShift?.id || getPatrolDue()) return;
+      if ((!user && !activeShift) || getPatrolDue()) return;
 
-      const siteId = getCachedSiteSettings().id || activeShift.siteId || null;
+      const siteId = getCachedSiteSettings().id || activeShift?.siteId || null;
       raisePatrolDue({
         time: patrolTime,
         notificationId: notificationId || NotificationService.getNotificationIdForPatrolTime(patrolTime),
         siteId,
-        shiftId: activeShift.id,
-        guardId: activeShift.activeGuardId || user?.id || null,
-        guardName: activeShift.activeGuardName || user?.full_name || 'Active Guard',
+        shiftId: activeShift?.id || null,
+        guardId: activeShift?.activeGuardId || user?.id || null,
+        guardName: activeShift?.activeGuardName || user?.full_name || 'Active Guard',
       });
       // Straight to the patrol screen — no intermediate alert to dismiss.
       navigate('/', { state: { tab: 'patrols' }, replace: false });
@@ -80,7 +87,7 @@ export default function PatrolScheduleAlert() {
     // OS alarm is the real mechanism; this only catches the case where the app is already open.
     const checkSchedule = async () => {
       const activeShift = shiftSession || getShiftSession();
-      if (!activeShift?.id || getPatrolDue()) return;
+      if ((!user && !activeShift) || getPatrolDue()) return;
 
       const config = getPatrolConfig();
       if (config.patrolScheduleEnabled === false) return;
@@ -90,7 +97,7 @@ export default function PatrolScheduleAlert() {
       const patrolTimes = Array.isArray(config.patrolTimes) ? config.patrolTimes : [];
       if (!patrolTimes.includes(currentTime)) return;
 
-      const siteId = getCachedSiteSettings().id || activeShift.siteId || null;
+      const siteId = getCachedSiteSettings().id || activeShift?.siteId || null;
       const triggerKey = `nightguard_patrol_triggered_${siteId || 'site'}_${formatDateKey(now)}_${currentTime}`;
       const { value } = await Preferences.get({ key: triggerKey }).catch(() => ({ value: localStorage.getItem(triggerKey) }));
       if (value === 'true') return;

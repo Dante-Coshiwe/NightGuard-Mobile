@@ -94,6 +94,11 @@ export const DEFAULT_DEVICE_SETTINGS = {
   allowQuickGuardSwitch: false,
   allow_quick_guard_switch: false,
   deviceDescription: '',
+  // Whether going on duty locks this handset to NightGuard. Defaults to ON so existing
+  // devices keep the behaviour they already have. Deliberately device-scoped and local:
+  // one site can have a locked patrol phone and an unlocked gatehouse tablet, and the
+  // admin sets it while standing at the device.
+  kioskModeEnabled: true,
 };
 
 function readJson(key, fallback) {

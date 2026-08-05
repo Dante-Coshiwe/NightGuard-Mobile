@@ -648,3 +648,16 @@
     animation-duration: 1.6s;
   }
 }
+
+/* Told to the guard on an unlocked device, because the recording is a deterrent and a
+   deterrent nobody knows about is just surveillance. Paired with lib/appDepartureLog. */
+.leave-warning {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px solid #7f5310;
+  border-radius: 10px;
+  background: #2a1d05;
+  color: #fbbf24;
+  font-size: 13px;
+  font-weight: 600;
+}

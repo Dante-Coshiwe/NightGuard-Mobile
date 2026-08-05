@@ -85,6 +85,12 @@ export default function GuardPatrolConfig() {
   const { unbindDevice } = useAuth();
   const geo = useGeolocation();
   const [config, setConfig] = useState(getPatrolConfig());
+  // The config as it last stood in the store — what a save or a clean load left behind.
+  // Anything on screen that differs from this is the admin's unsaved work.
+  const [savedSnapshot, setSavedSnapshot] = useState(() => JSON.stringify(getPatrolConfig()));
+  // A newer config arrived from the store while the admin was mid-edit. Held here instead of
+  // being applied, and offered as a choice (see the banner) rather than taken silently.
+  const [pendingRemoteConfig, setPendingRemoteConfig] = useState(null);
   const [success, setSuccess] = useState('');
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -100,6 +106,37 @@ export default function GuardPatrolConfig() {
   // True while WE are saving, so the store-update event we trigger does not bounce
   // back and reload (clobbering the edits we just made — e.g. a fresh GPS pin).
   const selfSavingRef = useRef(false);
+  // Derived, not tracked: whatever is on screen versus whatever was last saved.
+  //
+  // This is what stops a background sync from eating a schedule change. A full sync fires
+  // `nightguard_patrol_config_updated` on its own timetable; this screen used to answer that by
+  // reloading from the store, so a patrol time added seconds earlier vanished mid-edit with no
+  // message. Nothing on a patrol screen is allowed to silently discard a supervisor's work.
+  const hasUnsavedEdits = JSON.stringify(config) !== savedSnapshot;
+
+  // Called after a save: the store now matches the screen, so nothing is pending or unsaved.
+  const markSaved = (saved) => {
+    setSavedSnapshot(JSON.stringify(saved));
+    setPendingRemoteConfig(null);
+  };
+
+  // Mirrors hasUnsavedEdits for the store listener below, which is registered once and would
+  // otherwise close over the value as it stood on mount — i.e. always "clean".
+  const dirtyRef = useRef(false);
+  useEffect(() => { dirtyRef.current = hasUnsavedEdits; }, [hasUnsavedEdits]);
+
+
+  // Apply a config that came from the store rather than from the admin's fingers. Held back —
+  // never applied — while there are unsaved edits on screen. Only ever called from effects.
+  const applyRemoteConfig = (incoming) => {
+    if (!incoming) return;
+    if (dirtyRef.current) {
+      setPendingRemoteConfig(incoming);
+      return;
+    }
+    setConfig(incoming);
+    setSavedSnapshot(JSON.stringify(incoming));
+  };
 
   // Persist the given config without disturbing the on-screen editor. Used by the
   // auto-save actions (Set Location / Clear Location) so captured coordinates stick
@@ -108,6 +145,8 @@ export default function GuardPatrolConfig() {
     selfSavingRef.current = true;
     try {
       const result = await savePatrolConfiguration(nextConfig, getCachedSiteSettings());
+      // This writes the WHOLE on-screen config, so anything the admin had typed is now saved too.
+      markSaved(nextConfig);
       return result;
     } catch (err) {
       setError(err.message || 'Failed to save patrol configuration');
@@ -121,7 +160,9 @@ export default function GuardPatrolConfig() {
     const loadConfig = async () => {
       try {
         const loaded = await loadPatrolConfiguration(getCachedSiteSettings());
-        setConfig(loaded);
+        // Deliberately not setConfig: a slow first load must not land on top of edits the
+        // admin has already started making.
+        applyRemoteConfig(loaded);
       } catch (err) {
         setError(err.message || 'Failed to load patrol configuration');
       }
@@ -134,7 +175,7 @@ export default function GuardPatrolConfig() {
     // reloading here would wipe in-progress edits.
     const handlePatrolUpdate = () => {
       if (selfSavingRef.current) return;
-      setConfig(getPatrolConfig());
+      applyRemoteConfig(getPatrolConfig());
     };
     window.addEventListener('nightguard_patrol_config_updated', handlePatrolUpdate);
     return () => window.removeEventListener('nightguard_patrol_config_updated', handlePatrolUpdate);
@@ -305,6 +346,9 @@ export default function GuardPatrolConfig() {
     setSuccess('');
     setValidationErrors({});
 
+    // Our own save fires the store-update event; without this guard it bounces straight back
+    // into applyRemoteConfig and raises a "changed on the server" banner against ourselves.
+    selfSavingRef.current = true;
     try {
       if (!validateConfig()) {
         setError('Please fix the highlighted patrol configuration fields.');
@@ -316,11 +360,16 @@ export default function GuardPatrolConfig() {
       } else {
         await NotificationService.scheduleAllDailyPatrols(config.patrolTimes || []);
       }
-      setConfig(getPatrolConfig());
+      // Saved: the store now holds what is on screen, so a reload is safe and any held
+      // server version is stale — our save is the newer one.
+      const stored = getPatrolConfig();
+      setConfig(stored);
+      markSaved(stored);
       setSuccess(result?._offline ? 'Patrol configuration saved locally and will sync later' : 'Patrol configuration saved');
     } catch (err) {
       setError(err.message || 'Failed to save patrol configuration');
     } finally {
+      selfSavingRef.current = false;
       setSaving(false);
     }
   };
@@ -354,6 +403,37 @@ export default function GuardPatrolConfig() {
 
       {success && <div style={{ ...styles.card, borderColor: '#166534', color: '#86efac' }}>{success}</div>}
       {error && <div style={{ ...styles.card, borderColor: '#7f1d1d', color: '#fca5a5' }}>{error}</div>}
+
+      {/* A sync brought a newer config while the admin was editing. Their work is still on
+          screen and untouched; this is the only place the server version can win, and only
+          because they pressed the button. */}
+      {pendingRemoteConfig && (
+        <div style={{ ...styles.card, borderColor: '#7f5310', background: '#2a1d05' }}>
+          <div style={{ color: '#fbbf24', fontWeight: 700, marginBottom: 6 }}>
+            These patrol settings were changed elsewhere while you were editing
+          </div>
+          <div style={{ color: '#d4d4d4', fontSize: 13, marginBottom: 12 }}>
+            Your changes are still here and have not been touched. Press <strong>Save Configuration</strong>{' '}
+            to keep yours, or load the other version to discard yours.
+          </div>
+          <button
+            type="button"
+            style={styles.subtleBtn}
+            onClick={() => {
+              setConfig(pendingRemoteConfig);
+              markSaved(pendingRemoteConfig);
+            }}
+          >
+            Discard my changes and load theirs
+          </button>
+        </div>
+      )}
+
+      {hasUnsavedEdits && (
+        <div style={{ ...styles.card, borderColor: '#334155', color: '#94a3b8', fontSize: 13 }}>
+          You have unsaved changes. Nothing here is live until you press Save Configuration.
+        </div>
+      )}
 
       <div style={styles.card}>
         <h2 style={{ marginTop: 0 }}>Schedule</h2>

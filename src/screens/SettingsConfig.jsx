@@ -7,6 +7,7 @@ import { buildLocalDataExport, getDeviceId, getDeviceSettings, getSyncLogs } fro
 import { exportBlobFile } from '../lib/reportUtils';
 import { getCurrentDeviceRecord, loadDeviceConfiguration, saveDeviceConfiguration } from '../services/schemaData';
 import { getRunningVersion, runOtaUpdate, OTA_CURRENT_VERSION } from '../services/liveUpdate';
+import KioskService from '../services/kioskService';
 
 const sectionStyle = { background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: 24, marginBottom: 20 };
 
@@ -96,6 +97,7 @@ export default function SettingsConfig() {
   const [contactPerson, setContactPerson] = useState(siteSettings.contact_person || '');
   const [contactPhone, setContactPhone] = useState(siteSettings.contact_phone || '');
   const [autoExit, setAutoExit] = useState(Boolean(getDeviceSettings().autoCloseShiftAtMidnight));
+  const [kioskEnabled, setKioskEnabled] = useState(getDeviceSettings().kioskModeEnabled !== false);
   const [allowQuickGuardSwitch, setAllowQuickGuardSwitch] = useState(false);
   const [deviceDescription, setDeviceDescription] = useState(getDeviceSettings().deviceDescription || '');
   const [exporting, setExporting] = useState(false);
@@ -127,6 +129,7 @@ export default function SettingsConfig() {
     const syncDeviceState = () => {
       const current = getDeviceSettings();
       setAutoExit(Boolean(current.autoCloseShiftAtMidnight));
+      setKioskEnabled(current.kioskModeEnabled !== false);
       setAllowQuickGuardSwitch(false);
       setDeviceDescription(current.deviceDescription || '');
       setSyncLogs(getSyncLogs());
@@ -220,8 +223,14 @@ export default function SettingsConfig() {
         ...getDeviceSettings(),
         allowQuickGuardSwitch: false,
         autoCloseShiftAtMidnight: autoExit,
+        kioskModeEnabled: kioskEnabled,
         deviceDescription,
       }, savedSite);
+
+      // Take effect on the shift that is running right now rather than at the next one:
+      // ensureActive() releases the lock when kiosk has just been switched off, and
+      // re-applies it when it has just been switched on.
+      KioskService.ensureActive().catch(() => null);
 
       setSuccess(result?._offline || deviceResult?._offline ? 'Settings saved locally and will sync later' : 'Settings saved successfully');
       window.setTimeout(() => setSuccess(''), 3000);
@@ -383,6 +392,24 @@ export default function SettingsConfig() {
           value={autoExit}
           onChange={setAutoExit}
         />
+      </Section>
+
+      <Section title="Device Lock">
+        <Toggle
+          label="Kiosk Mode"
+          description="On: going on duty locks this device to NightGuard, and only the exit PIN releases it. Off: the guard keeps the phone and can open WhatsApp, the camera or the dialler. Patrol alarms, tracking and the shift itself work the same either way. This setting applies to this device only."
+          value={kioskEnabled}
+          onChange={setKioskEnabled}
+        />
+        <div style={{ color: '#8b8b8b', fontSize: 12, marginTop: 12 }}>
+          {kioskEnabled
+            ? 'Locked on duty — guards cannot leave the app or open the notification shade.'
+            : 'Unlocked on duty — guards can leave the app. Patrol alarms still sound and still open the Patrol tab.'}
+        </div>
+        <div style={{ color: '#8b8b8b', fontSize: 12, marginTop: 8 }}>
+          Either way, a guard who leaves the app while on duty is written to the Occurrence Book as
+          it happens, and the guard is told so on screen.
+        </div>
       </Section>
 
       <Section title="Kiosk Exit PIN">

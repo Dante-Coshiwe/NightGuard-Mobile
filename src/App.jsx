@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { App as CapacitorApp } from '@capacitor/app';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
@@ -30,6 +30,7 @@ import SelectSiteScreen from './screens/SelectSiteScreen';
 import NotificationService from './services/notificationService';
 import KioskService from './services/kioskService';
 import { hasAdminPinHash } from './services/kioskPinService';
+import { recordAppLeft } from './lib/appDepartureLog';
 
 const isNative = typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.();
 
@@ -62,8 +63,12 @@ const BootSplash = () => {
 const AppRuntimeBridge = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  const { shiftSession, needsSiteBinding } = useAuth() || {};
+  const { user, shiftSession, needsSiteBinding } = useAuth() || {};
   const [permissionDenied, setPermissionDenied] = useState(false);
+  // Read by the appStateChange listener below. A ref, not a dependency: re-subscribing the
+  // lifecycle listeners every time the signed-in user changes would risk missing a departure.
+  const userRef = useRef(user);
+  useEffect(() => { userRef.current = user; }, [user]);
 
   useEffect(() => {
     let mounted = true;
@@ -78,6 +83,10 @@ const AppRuntimeBridge = () => {
         // Re-assert kiosk lock whenever the app returns to the foreground — Android may have
         // dropped screen-pinning while backgrounded.
         KioskService.ensureActive().catch(() => null);
+      } else {
+        // The guard has left the app while on duty. Recorded here rather than on return, so the
+        // report survives Android killing the process while they are away.
+        recordAppLeft({ user: userRef.current });
       }
     });
 
@@ -91,9 +100,11 @@ const AppRuntimeBridge = () => {
       if (!canGoBack || atHome) return;
       window.history.back();
     });
-    const openPatrol = () => {
-      if (location.pathname !== '/') navigate('/', { replace: false });
-    };
+    // ALWAYS carry the tab in the navigation state. This handler and PatrolScheduleAlert both react
+    // to the same event, so whichever navigates last decides which tab HomeScreen opens on — a
+    // stateless navigate here landed the guard on Pedestrians with the alarm sounding behind it.
+    // Navigating even when already at '/' is deliberate: it is what switches the tab.
+    const openPatrol = () => navigate('/', { state: { tab: 'patrols' }, replace: false });
     window.addEventListener('nightguard_open_patrol_alert', openPatrol);
 
     return () => {

@@ -1,5 +1,6 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
 import { Preferences } from '@capacitor/preferences';
+import { getDeviceSettings } from '../lib/deviceStore';
 
 const KIOSK_STATE_KEY = 'kiosk_session_state';
 const KIOSK_ACTIVE_KEY = 'nightguard_kiosk_active';
@@ -66,19 +67,36 @@ async function callNativeWithRetry(method, transitionLabel) {
 }
 
 const KioskService = {
+  /**
+   * Admin switch: does going on duty lock this handset to NightGuard?
+   *
+   * Only the LOCK is optional. The shift, the foreground service and the patrol alarm all
+   * behave identically either way — turning this off buys the guard access to other apps
+   * (WhatsApp, camera, dialler), nothing else.
+   */
+  isEnabled() {
+    return getDeviceSettings().kioskModeEnabled !== false;
+  },
+
   async startSession(shiftId) {
     let lockTaskMode = 'unavailable';
     let kioskModeStarted = false;
     let foregroundServiceStarted = false;
+    const lockWanted = this.isEnabled();
 
     try {
-      console.info('[KioskService] entering kiosk mode');
-      // NightGuard fix: retry kiosk activation once and surface persistent failures to the UI.
-      kioskModeStarted = await callNativeWithRetry('startKioskMode', 'entering kiosk');
-      const lockState = await this.getLockState();
-      lockTaskMode = kioskModeStarted
-        ? (lockState === 'unavailable' ? 'screen_pinning' : lockState)
-        : 'unavailable';
+      if (!lockWanted) {
+        console.info('[KioskService] kiosk mode disabled for this device — starting shift unlocked');
+        lockTaskMode = 'disabled';
+      } else {
+        console.info('[KioskService] entering kiosk mode');
+        // NightGuard fix: retry kiosk activation once and surface persistent failures to the UI.
+        kioskModeStarted = await callNativeWithRetry('startKioskMode', 'entering kiosk');
+        const lockState = await this.getLockState();
+        lockTaskMode = kioskModeStarted
+          ? (lockState === 'unavailable' ? 'screen_pinning' : lockState)
+          : 'unavailable';
+      }
     } catch (err) {
       localStorage.setItem(KIOSK_ACTIVE_KEY, 'false');
       console.error('[KioskService] entering kiosk failed:', err?.message || err);
@@ -158,6 +176,24 @@ const KioskService = {
       return state;
     }
 
+    // A shift restored after an app kill must not re-lock a device the admin has since
+    // unlocked. The foreground service still comes back — only the lock is conditional.
+    if (!this.isEnabled()) {
+      console.info('[KioskService] kiosk disabled for this device — restoring shift unlocked');
+      const foregroundOnly = await callNativeWithRetry('startForegroundService', 'restoring foreground service').catch(() => false);
+      const unlocked = {
+        ...state,
+        kioskModeStarted: false,
+        foregroundServiceStarted: foregroundOnly,
+        lockTaskMode: 'disabled',
+        locked: false,
+        lastHeartbeatAt: new Date().toISOString(),
+      };
+      await prefSet(KIOSK_STATE_KEY, unlocked);
+      localStorage.setItem(KIOSK_ACTIVE_KEY, 'true');
+      return unlocked;
+    }
+
     console.info('[KioskService] re-applying kiosk mode after app boot');
     // NightGuard fix: re-apply persisted kiosk state after Android kills/restarts the app.
     const kioskModeStarted = await callNativeWithRetry('startKioskMode', 'restoring kiosk');
@@ -201,6 +237,28 @@ const KioskService = {
   async ensureActive() {
     const state = await this.getSessionState();
     if (!state?.active || !this.isNativeAvailable()) return state;
+
+    // The watchdog is what makes kiosk mode stick, so it is also what makes turning kiosk
+    // OFF stick: with the lock disabled it releases any lock still held instead of
+    // re-applying one, and a guard who unpins by hand is left alone.
+    if (!this.isEnabled()) {
+      const held = await this.getLockState();
+      if (held === 'locked' || held === 'pinned') {
+        console.info('[KioskService] kiosk disabled — releasing lock');
+        await callNativeWithRetry('stopKioskMode', 'releasing kiosk').catch((err) => {
+          console.warn('[KioskService] release kiosk failed:', err?.message || err);
+        });
+      }
+      const unlocked = {
+        ...state,
+        kioskModeStarted: false,
+        lockTaskMode: 'disabled',
+        locked: false,
+        lastHeartbeatAt: new Date().toISOString(),
+      };
+      await prefSet(KIOSK_STATE_KEY, unlocked);
+      return unlocked;
+    }
 
     let lockState = await this.getLockState();
     if (lockState === 'none') {

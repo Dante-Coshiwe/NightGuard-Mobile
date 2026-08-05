@@ -261,7 +261,10 @@ export default function PatrolTab() {
               {patrolDue ? (
                 <>
                   <div style={{ fontSize: 15, color: '#fca5a5', marginBottom: 6, fontWeight: 700, letterSpacing: 1 }}>
-                    PATROL DUE — {patrolDue.time}
+                    PATROL DUE NOW
+                  </div>
+                  <div style={{ fontSize: 26, color: '#fff', fontWeight: 800, marginBottom: 6 }}>
+                    Scheduled patrol {patrolDue.time}
                   </div>
                   <div style={{ fontSize: 17, color: '#e5e5e5' }}>Press Start Patrol to silence the alarm</div>
                 </>

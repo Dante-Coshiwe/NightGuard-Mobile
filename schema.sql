@@ -72,8 +72,12 @@ CREATE TABLE public.devices (
   is_active boolean DEFAULT true,
   created_at timestamp with time zone DEFAULT now(),
   updated_at timestamp with time zone DEFAULT now(),
+  deleted_at timestamp with time zone,
+  site_bound_at timestamp with time zone,
+  site_bound_by uuid,
   CONSTRAINT devices_pkey PRIMARY KEY (id),
-  CONSTRAINT devices_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id)
+  CONSTRAINT devices_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
+  CONSTRAINT devices_site_bound_by_fkey FOREIGN KEY (site_bound_by) REFERENCES public.profiles(id)
 );
 CREATE TABLE public.device_settings (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -135,6 +139,7 @@ CREATE TABLE public.incidents (
   resolved boolean DEFAULT false,
   local_guard_id uuid,
   updated_at timestamp with time zone DEFAULT now(),
+  deleted_at timestamp with time zone,
   CONSTRAINT incidents_pkey PRIMARY KEY (id),
   CONSTRAINT incidents_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT incidents_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
@@ -159,6 +164,8 @@ CREATE TABLE public.vehicles (
   driver_contact text,
   visitor_type character varying,
   local_guard_id uuid,
+  picture_url text,
+  deleted_at timestamp with time zone,
   CONSTRAINT vehicles_pkey PRIMARY KEY (id),
   CONSTRAINT vehicles_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT vehicles_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
@@ -184,6 +191,7 @@ CREATE TABLE public.pedestrians (
   local_guard_id uuid,
   updated_at timestamp with time zone DEFAULT now(),
   picture_url text,
+  deleted_at timestamp with time zone,
   CONSTRAINT pedestrians_pkey PRIMARY KEY (id),
   CONSTRAINT pedestrians_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT pedestrians_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
@@ -203,6 +211,7 @@ CREATE TABLE public.ob_entries (
   guard_id uuid,
   local_guard_id uuid,
   updated_at timestamp with time zone DEFAULT now(),
+  deleted_at timestamp with time zone,
   CONSTRAINT ob_entries_pkey PRIMARY KEY (id),
   CONSTRAINT ob_entries_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT ob_entries_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
@@ -236,6 +245,7 @@ CREATE TABLE public.patrols (
   updated_at timestamp with time zone DEFAULT now(),
   guard_id uuid,
   local_guard_id uuid,
+  deleted_at timestamp with time zone,
   CONSTRAINT patrols_pkey PRIMARY KEY (id),
   CONSTRAINT patrols_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT patrols_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
@@ -279,6 +289,7 @@ CREATE TABLE public.deliveries (
   recorded_by uuid,
   created_at timestamp with time zone DEFAULT now(),
   updated_at timestamp with time zone DEFAULT now(),
+  deleted_at timestamp with time zone,
   CONSTRAINT deliveries_pkey PRIMARY KEY (id),
   CONSTRAINT deliveries_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT deliveries_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
@@ -302,6 +313,7 @@ CREATE TABLE public.wheel_clamps (
   status character varying DEFAULT 'clamped'::character varying,
   created_at timestamp with time zone DEFAULT now(),
   updated_at timestamp with time zone DEFAULT now(),
+  deleted_at timestamp with time zone,
   CONSTRAINT wheel_clamps_pkey PRIMARY KEY (id),
   CONSTRAINT wheel_clamps_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT wheel_clamps_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
@@ -318,6 +330,7 @@ CREATE TABLE public.dockets (
   pdf_url text,
   created_at timestamp with time zone DEFAULT now(),
   updated_at timestamp with time zone DEFAULT now(),
+  deleted_at timestamp with time zone,
   CONSTRAINT dockets_pkey PRIMARY KEY (id),
   CONSTRAINT dockets_incident_id_fkey FOREIGN KEY (incident_id) REFERENCES public.incidents(id),
   CONSTRAINT dockets_investigator_fkey FOREIGN KEY (investigator) REFERENCES public.profiles(id)
@@ -411,6 +424,7 @@ CREATE TABLE public.guards (
   is_active boolean NOT NULL DEFAULT true,
   created_at timestamp with time zone DEFAULT now(),
   updated_at timestamp with time zone DEFAULT now(),
+  deleted_at timestamp with time zone,
   CONSTRAINT guards_pkey PRIMARY KEY (id),
   CONSTRAINT guards_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id)
 );
@@ -501,4 +515,26 @@ CREATE TABLE public.ota_device_assignments (
   updated_at timestamp with time zone NOT NULL DEFAULT now(),
   CONSTRAINT ota_device_assignments_pkey PRIMARY KEY (id),
   CONSTRAINT ota_device_assignments_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.ota_channels(id)
+);
+CREATE TABLE public.audit_log (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  table_name text NOT NULL,
+  record_id text NOT NULL,
+  action text NOT NULL CHECK (action = ANY (ARRAY['update'::text, 'delete'::text, 'restore'::text])),
+  actor_id uuid,
+  actor_email text,
+  site_id uuid,
+  record_label text,
+  changes jsonb,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT audit_log_pkey PRIMARY KEY (id),
+  CONSTRAINT audit_log_actor_id_fkey FOREIGN KEY (actor_id) REFERENCES auth.users(id)
+);
+CREATE TABLE public.profile_sites (
+  profile_id uuid NOT NULL,
+  site_id uuid NOT NULL,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT profile_sites_pkey PRIMARY KEY (profile_id, site_id),
+  CONSTRAINT profile_sites_profile_id_fkey FOREIGN KEY (profile_id) REFERENCES public.profiles(id),
+  CONSTRAINT profile_sites_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id)
 );
