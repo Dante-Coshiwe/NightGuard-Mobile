@@ -30,6 +30,7 @@ import SelectSiteScreen from './screens/SelectSiteScreen';
 import NotificationService from './services/notificationService';
 import KioskService from './services/kioskService';
 import { hasAdminPinHash } from './services/kioskPinService';
+import { ensureDeviceRecord } from './services/schemaData';
 import { recordAppLeft } from './lib/appDepartureLog';
 
 const isNative = typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.();
@@ -115,6 +116,34 @@ const AppRuntimeBridge = () => {
       window.removeEventListener('nightguard_open_patrol_alert', openPatrol);
     };
   }, [location.pathname, navigate]);
+
+  // Put this handset in the `devices` table as soon as its site is known, so the dashboard can
+  // show which device is bound where.
+  //
+  // Registration used to ride along inside recordDeviceSyncLog, which only runs when the offline
+  // queue actually had something to drain. A device that is simply healthy and online never has a
+  // queue to drain, so it never registered and the roster stayed empty — being well-behaved was
+  // exactly what kept a phone invisible. It must not depend on there being unsynced work.
+  useEffect(() => {
+    if (needsSiteBinding) return undefined;
+
+    let cancelled = false;
+    // Cheap to repeat: returns immediately once the device is in the cached site settings.
+    const register = () => {
+      if (!cancelled) ensureDeviceRecord().catch(() => null);
+    };
+
+    register();
+    // Also on resume — the first launch after install often has no site binding or no network yet.
+    const resumed = CapacitorApp.addListener('appStateChange', ({ isActive }) => {
+      if (isActive) register();
+    });
+
+    return () => {
+      cancelled = true;
+      resumed.then((handler) => handler.remove()).catch(() => null);
+    };
+  }, [needsSiteBinding]);
 
   useEffect(() => {
     let cancelled = false;
