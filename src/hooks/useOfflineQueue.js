@@ -34,6 +34,14 @@ let syncInFlight = null;
 let lastOnlineSyncTriggerAt = 0;
 const ONLINE_SYNC_DEBOUNCE_MS = 4000;
 
+// How often a device that still has items waiting tries again on its own.
+//
+// The queue used to drain only on mount and on a connectivity CHANGE. A device that was already
+// online when a write failed transiently therefore sat there with a full queue and nothing to
+// re-trigger it — the only way out was a human pressing "Sync Now". Site admins are not technical
+// and should never be asked to; the device has everything it needs to retry by itself.
+const AUTO_RETRY_INTERVAL_MS = 60000;
+
 // A queued write must never disappear because the server said "no" once. Items that are rejected
 // keep retrying up to MAX_SYNC_ATTEMPTS, then move to a dead-letter list instead of being deleted,
 // so a guard's patrol is always recoverable. Dead letters are revived on app launch (conditions
@@ -601,6 +609,13 @@ function useOfflineQueueController() {
       syncQueue();
     }
 
+    // Keep trying on our own. Nothing here waits for the guard or the admin to notice a banner:
+    // if the device is online and still holding writes, it retries until the queue is empty.
+    const autoRetry = setInterval(() => {
+      if (!isAppOnline() || getQueue().length === 0) return;
+      syncQueue();
+    }, AUTO_RETRY_INTERVAL_MS);
+
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
     window.addEventListener('nightguard_queue_updated', updateCount);
@@ -608,6 +623,7 @@ function useOfflineQueueController() {
     window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
 
     return () => {
+      clearInterval(autoRetry);
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
       window.removeEventListener('nightguard_queue_updated', updateCount);

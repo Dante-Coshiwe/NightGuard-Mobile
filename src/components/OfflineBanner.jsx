@@ -1,8 +1,15 @@
 import React from 'react';
 import { useOfflineQueue } from '../hooks/useOfflineQueue';
 
+// Status only — never a request for action.
+//
+// This used to offer a "Sync Now" button whenever items were waiting, which read to a
+// non-technical site admin as a chore they had to remember to do, and made an ordinary few
+// seconds of catching up look like a fault. The device retries by itself (see
+// AUTO_RETRY_INTERVAL_MS in useOfflineQueue), so the only job here is to reassure: the work is
+// saved, and it is going up on its own.
 export default function OfflineBanner() {
-  const { isOnline, queueCount, syncing, syncQueue } = useOfflineQueue();
+  const { isOnline, queueCount, syncing } = useOfflineQueue();
 
   if (isOnline && queueCount === 0 && !syncing) {
     return null;
@@ -37,30 +44,14 @@ export default function OfflineBanner() {
       <span style={{ lineHeight: 1.25 }}>
         {isOnline
           ? syncing
-            ? `Syncing ${queueCount} pending item${queueCount !== 1 ? 's' : ''}...`
+            ? `Uploading ${queueCount} item${queueCount !== 1 ? 's' : ''}…`
             : queueCount > 0
-              ? `Online • ${queueCount} item${queueCount !== 1 ? 's' : ''} waiting to sync`
+              // Not a warning and not a to-do: it uploads by itself, and saying so stops an admin
+              // hunting for the button that used to be here.
+              ? `${queueCount} item${queueCount !== 1 ? 's' : ''} saved — uploading automatically`
               : 'Online • All data synced'
-          : `Offline • ${queueCount} item${queueCount !== 1 ? 's' : ''} saved locally`}
+          : `Offline • ${queueCount} item${queueCount !== 1 ? 's' : ''} saved on this device`}
       </span>
-      {isOnline && queueCount > 0 && !syncing && (
-        <button
-          onClick={syncQueue}
-          style={{
-            padding: '2px 8px',
-            background: '#fff',
-            color: '#166534',
-            border: 'none',
-            borderRadius: 5,
-            fontSize: 11,
-            fontWeight: 700,
-            cursor: 'pointer',
-            whiteSpace: 'nowrap',
-          }}
-        >
-          Sync Now
-        </button>
-      )}
     </div>
   );
 }
