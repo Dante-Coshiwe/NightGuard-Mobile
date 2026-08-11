@@ -6,6 +6,20 @@ on Supabase.
 
 For agent/contributor gotchas that will bite you, read [CLAUDE.md](CLAUDE.md) first.
 
+## The three surfaces
+
+This repo is only the guard's handset. Two others sit beside it on the Desktop and are not in this
+repository:
+
+| Surface | Where | Ships by |
+|---|---|---|
+| **Guard app** (this repo) | `Desktop/nightguardtrackAPPFINAL` | OTA bundle, or a signed APK for native changes |
+| **Manager dashboard** | `Desktop/NightGuardTrackApp` — Express backend on Render, plus a single-file `frontend/public/index.html` | Netlify (frontend), Render (backend) |
+| **Public download page** | `Desktop/NightGuard-webdownlaod` — one static `index.html`, not a git repo | `firebase deploy --only hosting --project test-deb3a34e` |
+
+The dashboard frontend reads Supabase directly and never calls its own Express backend; check
+whether a controller is still reachable before fixing it.
+
 ## Two version numbers, and they are not the same thing
 
 This trips people up constantly:

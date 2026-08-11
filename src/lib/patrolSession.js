@@ -197,11 +197,15 @@ export function endPatrolSession(status = 'completed', fallback = {}) {
   session.endedAt = new Date().toISOString();
   session.status = status;
 
+  // Built once and used for BOTH the outbox and the local cache below, so the number the guard
+  // sees in "My Patrols" can never disagree with the one the server is given for the same patrol.
+  const completion = buildPatrolCompletionPayload(session, fallback);
+
   // Park the ready-to-send completion BEFORE the active session is cleared. Android kills
   // backgrounded apps aggressively, and the old order (clear session -> then POST) meant a kill in
   // that gap lost the patrol and its entire walked route with nothing left to recover from.
   const pending = [
-    { id: session.id, payload: buildPatrolCompletionPayload(session, fallback), queuedAt: new Date().toISOString() },
+    { id: session.id, payload: completion, queuedAt: new Date().toISOString() },
     ...getPendingPatrolCompletions().filter((entry) => String(entry.id) !== String(session.id)),
   ].slice(0, OUTBOX_LIMIT);
   writeJson(OUTBOX_KEY, pending);
@@ -219,7 +223,11 @@ export function endPatrolSession(status = 'completed', fallback = {}) {
     actual_start: session.startedAt,
     actual_end: session.endedAt,
     status: session.status,
-    steps_taken: (session.reachedCheckpointIds || []).length,
+    // steps_taken is the distance-derived step ESTIMATE everywhere (see estimateStepsFromDistance).
+    // It used to be written here as the checkpoint count, so the same patrol showed one number in
+    // "My Patrols" and a completely different one in the report and on the manager dashboard.
+    // Checkpoint counts belong in the two fields below, which is where every reader looks for them.
+    steps_taken: completion.steps_taken,
     checkpoints_completed: (session.reachedCheckpointIds || []).length,
     total_checkpoints: session.requiredCount || (session.reachedCheckpointIds || []).length,
     created_at: session.startedAt,

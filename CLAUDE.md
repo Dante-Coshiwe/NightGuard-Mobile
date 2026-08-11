@@ -162,6 +162,67 @@ screen on. Currently **10 m**: 1.0.16 tightened it to 3 m, which plus the 5 m ma
 ~8 m effective radius that consumer GPS beside a building routinely misses — guards walked whole
 routes that registered nothing.
 
+## Three tables were empty, and every failure was silent
+
+**`devices` — nothing ever inserted a row.** The app only ever *read* it, matching against rows an
+admin was expected to type into the dashboard by hand. Nobody ever did, so `getCurrentDeviceRecord()`
+always returned null, both `latest_sync_update` writes were dead code against a record that did not
+exist, and the dashboard's device roster and "devices online" counter sat permanently at zero.
+`ensureDeviceRecord()` in [src/services/schemaData.js](src/services/schemaData.js) now self-registers
+on the hardware-bound id (`NG-<ANDROID_ID>`, survives reinstall), called from `recordDeviceSyncLog`
+so it happens after every offline-queue drain. Select-then-insert rather than upsert on purpose:
+with no DDL access a unique index on `device_id` cannot be assumed. It is best-effort — a handset
+that cannot register must still be able to work a shift.
+
+**`guards` — empty, so nothing is attributable to a person.** With no guards provisioned every
+device signs in as the built-in General Guard, which is *deliberately* local-only and never synced
+(`enqueueOfflineItem` skips it explicitly). `resolveGuardRefs` therefore correctly returns
+`{ guard_id: null, local_guard_id: null }`, and every scan, patrol and shift lands with no guard
+attached — 253 of 253 scans and 40 of 40 patrols as of 2026-08-11. **This is not a code bug and no
+code change fixes it**: someone has to create guards in the admin panel. Don't go hunting for the
+broken join. The dashboard's Settings → System page now states this out loud instead of leaving it
+invisible.
+
+**`shifts` — they accumulate forever.** Starting a shift was a bare insert that never looked at what
+was already open, so a guard who did not tap End Shift left an `active` row behind permanently; 14
+had piled up (oldest 28 days) and were closed by hand on 2026-08-11 with
+`end_reason: 'abandoned_backfill'`. `startShiftRecord` now stamps `shifts.device_id` and closes what
+that handset left open (`end_reason: 'superseded_by_new_shift'`). Scoped to the device deliberately —
+a site can legitimately run several guards at once, and closing a colleague's live shift would be
+worse than the bug being fixed.
+
+## Two different words for a finished shift
+
+The guard app writes `status: 'closed'` (`endShiftRecord` in [src/services/api.js](src/services/api.js));
+the Express backend in `Desktop/NightGuardTrackApp` writes `'completed'`. Both mean finished. A read
+that filters on one silently loses every shift ended by the other — which is exactly why the manager
+dashboard's completed-shifts list was permanently empty. Always filter
+`.in("status", ["completed", "closed"])`.
+
+## `steps_taken` is an estimate and it has ONE meaning
+
+There is no pedometer. `steps_taken` is `distance walked / 0.75 m` — see `estimateStepsFromDistance`
+in [src/lib/geo.js](src/lib/geo.js), derived from the GPS trail and never counted.
+
+It used to be written three different ways for the same patrol: the distance estimate to the server,
+the **checkpoint count** into the local cache, and rendered as "N points" on the dashboard. Guards
+and managers saw three different numbers for one walk. `endPatrolSession` now builds the completion
+payload once and uses that single `steps_taken` for both the outbox and the cached patrol, so they
+cannot drift apart again. Checkpoint counts belong in `checkpoints_completed` / `total_checkpoints`.
+
+A real step count would be Android's `TYPE_STEP_COUNTER` inside the foreground service that is
+already running — not a change to this number.
+
+## The manager dashboard is a separate repo
+
+`Desktop/NightGuardTrackApp`: an Express backend (Render), a Supabase `functions/` + `migrations/`
+folder, and a frontend that is **one 160 KB `frontend/public/index.html`** published by Netlify.
+
+That frontend talks to Supabase directly and **never calls the Express backend** — no `API_BASE`, no
+`/api/` fetch anywhere in it. Before "fixing" a backend controller, check whether anything still
+calls it. Leaflet is vendored into `frontend/public/vendor/leaflet/` rather than loaded from unpkg,
+because a blocked CDN left `L` undefined and took the whole Patrol Routes page down with it.
+
 ## Rollout order: APK before any bundle that needs it
 
 A bundle whose feature depends on a native plugin must not be published until the APK carrying that

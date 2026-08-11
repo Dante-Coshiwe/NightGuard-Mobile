@@ -19,6 +19,7 @@ import {
   saveLastSyncAt,
   saveCachedGuards,
   saveCachedPedestrians,
+  saveCachedSiteSettings,
   saveCachedVehicles,
   saveDeviceSettings,
   saveLookupData,
@@ -986,6 +987,85 @@ export async function refreshOperationalCachesFromDatabase(siteSettings = getCac
   return { refreshed: true };
 }
 
+/**
+ * Make sure this phone has a row in `devices`, creating it the first time.
+ *
+ * Nothing in the app ever inserted one: `getCurrentDeviceRecord` only ever matched against rows
+ * an admin was expected to type into the dashboard by hand, and nobody ever did. So the table sat
+ * empty, every `latest_sync_update` write below was dead code against a record that did not exist,
+ * and the dashboard's device roster and "devices online" count were permanently zero.
+ *
+ * Keyed on the hardware-bound id (`NG-<ANDROID_ID>`, survives reinstall), so a handset registers
+ * once and keeps that row for its life. Select-then-insert rather than upsert on purpose: there is
+ * no DDL access here (see CLAUDE.md), so a unique index on device_id cannot be assumed.
+ *
+ * Best effort by design — a device that cannot register must still be able to work a shift, so
+ * every failure path returns null quietly rather than throwing into the caller's sync.
+ */
+export async function ensureDeviceRecord(siteSettings = getCachedSiteSettings()) {
+  const siteId = getSiteId(siteSettings);
+  const hardwareId = getDeviceId();
+  if (!siteId || !hardwareId || !navigator.onLine) return null;
+
+  const known = getCurrentDeviceRecord(siteSettings);
+  if (known?.id) return known;
+
+  const rememberDevice = (record) => {
+    if (!record?.id) return null;
+    const devices = Array.isArray(siteSettings?.devices) ? siteSettings.devices : [];
+    saveCachedSiteSettings({
+      ...siteSettings,
+      devices: [...devices.filter((device) => String(device.id) !== String(record.id)), record],
+    });
+    return record;
+  };
+
+  try {
+    // Someone may have registered it already — an admin by hand, or this handset before a
+    // reinstall wiped the local cache. Adopt that row instead of creating a duplicate.
+    const { data: existing, error: findError } = await supabase
+      .from('devices')
+      .select('*')
+      .eq('site_id', siteId)
+      .eq('device_id', hardwareId)
+      .limit(1)
+      .maybeSingle();
+
+    if (findError) {
+      console.warn('[NightGuard] device lookup failed:', getSupabaseErrorMessage(findError));
+      return null;
+    }
+    if (existing?.id) return rememberDevice(existing);
+
+    const now = new Date().toISOString();
+    const { data: created, error: createError } = await supabase
+      .from('devices')
+      .insert({
+        site_id: siteId,
+        device_id: hardwareId,
+        device_name: getDeviceSettings()?.deviceDescription || hardwareId,
+        is_active: true,
+        latest_sync_update: now,
+        site_bound_at: now,
+      })
+      .select('*')
+      .maybeSingle();
+
+    if (createError) {
+      // RLS may not grant guards insert on devices. Nothing is lost by failing here — this is
+      // exactly today's behaviour — so log it and let the shift carry on.
+      console.warn('[NightGuard] device self-registration refused:', getSupabaseErrorMessage(createError));
+      return null;
+    }
+
+    console.info(`[NightGuard] registered this device as ${hardwareId}`);
+    return rememberDevice(created);
+  } catch (err) {
+    console.warn('[NightGuard] device self-registration failed:', err?.message || err);
+    return null;
+  }
+}
+
 export async function recordDeviceSyncLog({
   syncType = 'full_sync',
   syncStatus = 'completed',
@@ -997,7 +1077,10 @@ export async function recordDeviceSyncLog({
   const siteId = getSiteId(siteSettings);
   if (!navigator.onLine || !siteId) return null;
 
-  const deviceRecord = getCurrentDeviceRecord(siteSettings);
+  // Register on the way past. This runs after every successful offline-queue drain, so a phone
+  // that has never been seen before appears in the dashboard the first time it syncs rather than
+  // waiting for an admin to add it by hand.
+  const deviceRecord = await ensureDeviceRecord(siteSettings);
   if (!deviceRecord?.id) return null;
 
   const payload = {

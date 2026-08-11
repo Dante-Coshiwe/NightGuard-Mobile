@@ -18,6 +18,7 @@ import {
 } from '../lib/deviceStore';
 
 import { getBoundSiteIdSync, getSiteBinding } from '../lib/siteResolver';
+import { ensureDeviceRecord } from './schemaData';
 
 const CACHED_USER_KEY = 'nightguard_cached_user';
 
@@ -431,9 +432,33 @@ async function startShiftRecord(payload) {
   const guardId = payload.guard_id || payload.guardId || null;
   const guardRefs = resolveGuardRefs(payload, guardId);
 
+  // Stamp the shift with the handset that opened it, and retire anything that handset left
+  // open. Starting a shift used to be a bare insert, so a guard who never tapped End Shift left
+  // an `active` row behind for good — they accumulate for months and make "guards on duty"
+  // meaningless. Scoped to this device on purpose: sites can legitimately run several guards at
+  // once, and closing a colleague's shift would be worse than the problem being fixed.
+  const deviceRecord = await ensureDeviceRecord().catch(() => null);
+  if (deviceRecord?.id) {
+    const { error: supersedeError } = await supabase
+      .from('shifts')
+      .update({
+        ended_at: new Date().toISOString(),
+        status: 'closed',
+        end_reason: 'superseded_by_new_shift',
+      })
+      .eq('device_id', deviceRecord.id)
+      .eq('status', 'active');
+
+    if (supersedeError) {
+      // Not fatal: the guard is trying to come on duty and must be allowed to.
+      console.warn('[api] could not close previous shift on this device:', supersedeError.message);
+    }
+  }
+
   const insertPayload = {
     ...(isUuid(payload.id) ? { id: payload.id } : {}),
     site_id: siteId,
+    device_id: deviceRecord?.id || null,
     guard_id: guardRefs.guard_id,
     local_guard_id: guardRefs.local_guard_id,
     shift_name: shiftName,
