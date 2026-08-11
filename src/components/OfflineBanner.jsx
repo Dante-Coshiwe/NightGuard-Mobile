@@ -1,5 +1,10 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { useOfflineQueue } from '../hooks/useOfflineQueue';
+
+// A write that uploads in a second is not news. Anything queued clears well inside this, so the
+// banner stays out of the way during normal use and only appears when there is something a person
+// would actually want to know about.
+const SETTLE_DELAY_MS = 5000;
 
 // Status only — never a request for action.
 //
@@ -10,8 +15,21 @@ import { useOfflineQueue } from '../hooks/useOfflineQueue';
 // saved, and it is going up on its own.
 export default function OfflineBanner() {
   const { isOnline, queueCount, syncing } = useOfflineQueue();
+  const hasBacklog = queueCount > 0 || syncing;
+  // Offline is worth saying immediately — it changes what the guard should expect. A backlog that
+  // is busy clearing itself is not, so it has to persist before it earns any screen space.
+  const [backlogSettled, setBacklogSettled] = useState(false);
 
-  if (isOnline && queueCount === 0 && !syncing) {
+  useEffect(() => {
+    if (!hasBacklog) {
+      setBacklogSettled(false);
+      return undefined;
+    }
+    const timer = setTimeout(() => setBacklogSettled(true), SETTLE_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [hasBacklog]);
+
+  if (isOnline && !(hasBacklog && backlogSettled)) {
     return null;
   }
 

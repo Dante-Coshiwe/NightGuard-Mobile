@@ -31,7 +31,7 @@ import NotificationService from './services/notificationService';
 import KioskService from './services/kioskService';
 import { hasAdminPinHash } from './services/kioskPinService';
 import { ensureDeviceRecord } from './services/schemaData';
-import { recordAppLeft } from './lib/appDepartureLog';
+import { markAppBackgrounded, reconcileAppDeparture } from './lib/appDepartureLog';
 
 const isNative = typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.();
 
@@ -78,16 +78,19 @@ const AppRuntimeBridge = () => {
       if (mounted) setPermissionDenied(permission === 'denied');
     });
 
+    // A departure is only worth reporting once we know how long it lasted, so leaving marks the
+    // moment locally and returning decides whether it was a real absence. See appDepartureLog.
+    reconcileAppDeparture();
+
     const foreground = CapacitorApp.addListener('appStateChange', ({ isActive }) => {
       if (isActive) {
         window.dispatchEvent(new Event('nightguard_notifications_updated'));
         // Re-assert kiosk lock whenever the app returns to the foreground — Android may have
         // dropped screen-pinning while backgrounded.
         KioskService.ensureActive().catch(() => null);
+        reconcileAppDeparture();
       } else {
-        // The guard has left the app while on duty. Recorded here rather than on return, so the
-        // report survives Android killing the process while they are away.
-        recordAppLeft({ user: userRef.current });
+        markAppBackgrounded({ user: userRef.current });
       }
     });
 
