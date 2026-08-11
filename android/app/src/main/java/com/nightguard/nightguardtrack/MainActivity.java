@@ -26,9 +26,6 @@ public class MainActivity extends BridgeActivity {
         // Native tag reading. Web NFC (NDEFReader) does not exist in a WebView, so without this
         // plugin NFC check-ins cannot fire at all inside the APK.
         registerPlugin(NfcReaderPlugin.class);
-        // Continuous device location. Uploads itself rather than handing points to the WebView,
-        // which is frozen whenever the screen is off.
-        registerPlugin(DeviceTrackerPlugin.class);
         super.onCreate(savedInstanceState);
 
         getWindow().addFlags(

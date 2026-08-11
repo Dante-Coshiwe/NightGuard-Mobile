@@ -21,13 +21,12 @@
          with ordinary while-in-use location permission — ACCESS_BACKGROUND_LOCATION is deliberately
          NOT requested, so no guard is ever sent to system Settings to grant "Allow all the time". -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
-    <!-- Continuous device tracking (DeviceTrackerService) is the ONE thing that needs "Allow all
-         the time": it must keep reporting with the app closed and must come back after a reboot,
-         and a while-in-use grant cannot start a location foreground service with no visible
-         activity. It cannot be granted from a dialog on Android 11+ — the admin has to switch it
-         on in system Settings per device, which DeviceTrackerPlugin.openSettings() opens for them.
-         Patrol recording still works on the plain while-in-use grant without this. -->
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <!-- ACCESS_BACKGROUND_LOCATION is deliberately NOT requested, and must not be added back
+         casually. Briefly in 1.16 it was, for a continuous device tracker, and Google Play Protect
+         blocked the install outright as harmful: background location + a boot receiver + uploading
+         location to a server + an activity hidden from recents is the signature it classifies as
+         stalkerware. Patrol recording works on the plain while-in-use grant because the service is
+         only ever started while the app is in the foreground. Keep it that way. -->
     <uses-permission android:name="android.permission.REORDER_TASKS" />
 
     <!-- NFC relaxed to optional so GPS-only (no-NFC) devices can install and patrol by GPS. -->
@@ -91,25 +90,6 @@
             android:foregroundServiceType="location"
         />
 
-        <!-- Continuous location trail. Separate from the patrol service on purpose: this one runs
-             for the life of the device at a fraction of the cadence and power. -->
-        <service
-            android:name=".DeviceTrackerService"
-            android:enabled="true"
-            android:exported="false"
-            android:foregroundServiceType="location"
-        />
-
-        <!-- "Always on" that stops at the first reboot is not always on. -->
-        <receiver
-            android:name=".BootReceiver"
-            android:enabled="true"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
-            </intent-filter>
-        </receiver>
 
         <provider
             android:name="androidx.core.content.FileProvider"

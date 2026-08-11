@@ -31,7 +31,6 @@ import NotificationService from './services/notificationService';
 import KioskService from './services/kioskService';
 import { hasAdminPinHash } from './services/kioskPinService';
 import { ensureDeviceRecord } from './services/schemaData';
-import { startDeviceTracking } from './lib/deviceTracker';
 import { markAppBackgrounded, reconcileAppDeparture } from './lib/appDepartureLog';
 
 const isNative = typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.();
@@ -137,21 +136,10 @@ const AppRuntimeBridge = () => {
       if (!cancelled) ensureDeviceRecord().catch(() => null);
     };
 
-    // Continuous location goes on at the same moment and for the same reason: the site is known,
-    // so a point can be attributed. Idempotent — the service ignores a start it is already
-    // running, and it is feature-detected, so shells without the plugin simply skip it.
-    const track = () => {
-      if (!cancelled) startDeviceTracking().catch(() => null);
-    };
-
     register();
-    track();
     // Also on resume — the first launch after install often has no site binding or no network yet.
     const resumed = CapacitorApp.addListener('appStateChange', ({ isActive }) => {
-      if (isActive) {
-        register();
-        track();
-      }
+      if (isActive) register();
     });
 
     return () => {
