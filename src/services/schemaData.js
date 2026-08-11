@@ -1002,13 +1002,118 @@ export async function refreshOperationalCachesFromDatabase(siteSettings = getCac
  * Best effort by design — a device that cannot register must still be able to work a shift, so
  * every failure path returns null quietly rather than throwing into the caller's sync.
  */
+// How often the handset refreshes what it reports about itself. It registers on launch and on
+// every resume, and a write on each of those would be pointlessly chatty.
+const DEVICE_TELEMETRY_REFRESH_MS = 5 * 60 * 1000;
+const DEVICE_TELEMETRY_KEY = 'nightguard_device_telemetry_at';
+// app_started_at means what it says: stamped once per JS session, not on every refresh.
+let telemetryStartStamped = false;
+
+/**
+ * Everything the handset can say about itself without a native change.
+ *
+ * All of this comes from @capacitor/device, which is already registered in every shipped APK —
+ * it is what mints the hardware-bound device id — so this ships over the air and needs no
+ * reinstall. Anything requiring a plugin that is NOT already in the APK could not.
+ *
+ * Battery is a SNAPSHOT taken at this moment, not a live reading: the dashboard's "last seen"
+ * column is what tells a manager how old it is. A phone that has not opened the app in a day is
+ * reporting yesterday's battery, and no amount of polling here changes that.
+ */
+async function collectDeviceTelemetry() {
+  const telemetry = {};
+
+  try {
+    const { Device } = await import('@capacitor/device');
+    const info = await Device.getInfo();
+    telemetry.model = [info?.manufacturer, info?.model].filter(Boolean).join(' ') || null;
+    telemetry.os_version = info?.osVersion ? `Android ${info.osVersion}` : null;
+
+    const free = Number(info?.realDiskFree);
+    const total = Number(info?.realDiskTotal);
+    if (Number.isFinite(free) && Number.isFinite(total) && total > 0) {
+      telemetry.storage_available_percent = Math.round((free / total) * 100);
+    }
+
+    const battery = await Device.getBatteryInfo();
+    const level = Number(battery?.batteryLevel);
+    // Reported 0..1 by the plugin; the column holds a whole percentage.
+    if (Number.isFinite(level)) telemetry.battery_level = Math.round(level * 100);
+  } catch (err) {
+    console.warn('[NightGuard] device telemetry unavailable:', err?.message || err);
+  }
+
+  // The version a manager actually needs: which web bundle is running, and which APK shell it is
+  // running inside. They are numbered on separate schemes and both matter, so report both in the
+  // one column the dashboard shows.
+  try {
+    const { getRunningVersion } = await import('./liveUpdate');
+    const bundleVersion = await getRunningVersion();
+    let nativeVersion = null;
+    try {
+      const { App } = await import('@capacitor/app');
+      nativeVersion = (await App.getInfo())?.version || null;
+    } catch { /* web build, or no App plugin */ }
+    telemetry.app_version = nativeVersion ? `${bundleVersion} (APK ${nativeVersion})` : bundleVersion;
+  } catch (err) {
+    console.warn('[NightGuard] version telemetry unavailable:', err?.message || err);
+  }
+
+  if (!telemetryStartStamped) {
+    telemetry.app_started_at = new Date().toISOString();
+  }
+
+  return telemetry;
+}
+
+function telemetryIsDue() {
+  try {
+    const last = Number(localStorage.getItem(DEVICE_TELEMETRY_KEY));
+    return !Number.isFinite(last) || Date.now() - last > DEVICE_TELEMETRY_REFRESH_MS;
+  } catch {
+    return true;
+  }
+}
+
+function markTelemetryWritten() {
+  try {
+    localStorage.setItem(DEVICE_TELEMETRY_KEY, String(Date.now()));
+  } catch { /* storage full or blocked; the throttle is an optimisation, not a guarantee */ }
+  telemetryStartStamped = true;
+}
+
+/** Refresh what a already-registered handset reports about itself, throttled. */
+async function refreshDeviceTelemetry(deviceRowId) {
+  if (!deviceRowId || !telemetryIsDue()) return;
+  try {
+    const telemetry = await collectDeviceTelemetry();
+    const now = new Date().toISOString();
+    const { error } = await supabase
+      .from('devices')
+      .update({ ...telemetry, latest_sync_update: now, updated_at: now })
+      .eq('id', deviceRowId);
+    if (error) {
+      console.warn('[NightGuard] device telemetry update refused:', getSupabaseErrorMessage(error));
+      return;
+    }
+    markTelemetryWritten();
+  } catch (err) {
+    console.warn('[NightGuard] device telemetry update failed:', err?.message || err);
+  }
+}
+
 export async function ensureDeviceRecord(siteSettings = getCachedSiteSettings()) {
   const siteId = getSiteId(siteSettings);
   const hardwareId = getDeviceId();
   if (!siteId || !hardwareId || !navigator.onLine) return null;
 
   const known = getCurrentDeviceRecord(siteSettings);
-  if (known?.id) return known;
+  if (known?.id) {
+    // Already registered — keep model, battery and version current rather than frozen at the
+    // moment of first registration.
+    await refreshDeviceTelemetry(known.id);
+    return known;
+  }
 
   const rememberDevice = (record) => {
     if (!record?.id) return null;
@@ -1035,18 +1140,26 @@ export async function ensureDeviceRecord(siteSettings = getCachedSiteSettings())
       console.warn('[NightGuard] device lookup failed:', getSupabaseErrorMessage(findError));
       return null;
     }
-    if (existing?.id) return rememberDevice(existing);
+    if (existing?.id) {
+      // Adopted a row someone else created (an admin by hand, or this handset before a reinstall
+      // wiped the local cache). It may hold nothing but a name, so fill in what we know.
+      await refreshDeviceTelemetry(existing.id);
+      return rememberDevice(existing);
+    }
 
     const now = new Date().toISOString();
+    const telemetry = await collectDeviceTelemetry();
     const { data: created, error: createError } = await supabase
       .from('devices')
       .insert({
         site_id: siteId,
         device_id: hardwareId,
-        device_name: getDeviceSettings()?.deviceDescription || hardwareId,
+        // Prefer something a manager can recognise on sight over the raw hardware id.
+        device_name: getDeviceSettings()?.deviceDescription || telemetry.model || hardwareId,
         is_active: true,
         latest_sync_update: now,
         site_bound_at: now,
+        ...telemetry,
       })
       .select('*')
       .maybeSingle();
@@ -1058,7 +1171,8 @@ export async function ensureDeviceRecord(siteSettings = getCachedSiteSettings())
       return null;
     }
 
-    console.info(`[NightGuard] registered this device as ${hardwareId}`);
+    markTelemetryWritten();
+    console.info(`[NightGuard] registered this device as ${hardwareId} (${telemetry.model || 'unknown model'})`);
     return rememberDevice(created);
   } catch (err) {
     console.warn('[NightGuard] device self-registration failed:', err?.message || err);
