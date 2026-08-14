@@ -94,6 +94,20 @@ function getQueue() {
   }
 }
 
+// ⚠ CRUCIAL DATA PATH — this is the outbox. Everything a guard captures offline (patrols, scans,
+// gate entries, incidents and their photos) exists ONLY here until it reaches Supabase.
+//
+// Two things to know before touching it:
+//
+//  * The failure handling below is a console.error and nothing else. A failed write loses the delta
+//    silently — no user-visible signal, no retry. That is precisely why a queued photo's bytes must
+//    live in exactly ONE storage key: duplicating megabytes into a second key is what makes this
+//    write fail in the first place.
+//  * On Android this `localStorage` is not the browser's — nativeStorage.js replaces it with a
+//    filesystem-backed proxy, and QUEUE_KEY is in its CRITICAL_KEYS, so every call here rewrites
+//    the ENTIRE storage state to disk. Cost grows with queue size; the outbox has no cap.
+//
+// See README.md, "Data capture and upload", risks 4 and 5.
 function saveQueue(queue) {
   try {
     localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
@@ -167,6 +181,17 @@ export function reviveDeadLetteredItems() {
 //             dead-lettering. Never delete.
 //   'drop'  — terminal and safe to forget: the write already landed (409), the target is gone
 //             (410), or the route does not exist (404). Retrying cannot change the outcome.
+// ⚠ CRUCIAL: this decides whether a guard's record is kept or thrown away.
+//
+// 'drop' is terminal AND silent — the caller `continue`s without dead-lettering, so a dropped item
+// leaves no record anywhere and cannot be inspected or replayed later. 409 (conflict) currently
+// lands here, which is the one worth revisiting: a conflict may mean the record is genuinely a
+// duplicate, or that something else moved underneath it.
+//
+// 'retry' must stay the default for anything with no HTTP status: no status means the request never
+// reached the server, so the attempt says NOTHING about whether the payload is acceptable and must
+// not be counted against MAX_SYNC_ATTEMPTS.
+// See README.md, "Data capture and upload", risk 7.
 function classifySyncFailure(err) {
   const status = err?.response?.status;
   if (!status) return 'retry';

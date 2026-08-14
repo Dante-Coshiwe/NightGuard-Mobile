@@ -43,7 +43,15 @@ final class PatrolBuffer {
                 raf.readFully(bytes);
                 return new JSONObject(new String(bytes, StandardCharsets.UTF_8));
             } catch (IOException | JSONException e) {
-                // A corrupt buffer is worse than an empty one: it would block every future write.
+                // ⚠ CRUCIAL: this discards the entire recorded walk.
+                //
+                // Returning empty() is deliberate — a corrupt buffer would otherwise block every
+                // future write and the guard would record nothing at all for the rest of the shift.
+                // But note the asymmetry with the JS side: atomicFile.js keeps a .bak AND a staged
+                // .tmp and recovers from either, while this has neither, even though the background
+                // service is the half most likely to be killed mid-write. A backup copy here would
+                // turn "lost the whole patrol" into "lost the last few points".
+                // See README.md, "Data capture and upload", risk 3.
                 android.util.Log.w("PatrolBuffer", "unreadable buffer, starting fresh: " + e.getMessage());
                 return empty();
             }

@@ -240,6 +240,19 @@ export default function VehicleTab() {
     }).catch(() => setError('Could not load the selected photo'));
   };
 
+  // ⚠ CRUCIAL / KNOWN RISK — opening the picker launches an external activity, which backgrounds
+  // this app. On a low-RAM handset Android routinely reclaims it there, and everything the guard
+  // typed (driverName, personVisiting, visitorType) plus any photo already taken lives ONLY in
+  // React state: it is gone, silently, and the entry is never made.
+  //
+  // The exposure here is worse than the incident wizard's, not better. A photo is REQUIRED to
+  // submit (see validateForm), so every single gate entry passes through this moment — and the
+  // text fields sit ABOVE the photo button, so the guard has typed everything before reaching it.
+  //
+  // IncidentScreen was fixed with two mechanisms that both apply directly here:
+  //   1. holdLiveUpdates('...') while the form is open, so no bundle reloads the app under it.
+  //   2. A draft persisted to the filesystem (see src/lib/incidentDraft.js) and offered back.
+  // Neither is wired up in this tab yet. See README.md, "Data capture and upload", risk 1.
   const openPhotoPicker = (inputId) => {
     document.getElementById(inputId)?.click();
   };

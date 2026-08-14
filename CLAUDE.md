@@ -2,6 +2,29 @@
 
 Hard-won gotchas. Read before touching the Android shell or the keyboard/layout code.
 
+## Read this first: what this app is actually for
+
+Everything below is detail. The thing that matters is that **this app captures evidence on a handset
+that is offline half the time and that Android kills without warning.** Patrol trails, checkpoint
+captures, gate entries, incident reports and their photos. A lost record is not a cosmetic bug — it
+is a hole in a security record somebody will later be asked to account for, and the guard will not
+know it happened, because every one of these failures is silent.
+
+So: **before changing anything on the capture or upload path, read the risk register in
+[README.md](README.md#data-capture-and-upload--where-a-guards-work-can-be-lost).** It lists the eight
+places work can currently go missing, ranked, with the current state of each. The seams between the
+durability layers are where the bugs live — the layers themselves are sound.
+
+Four rules that have each already been learned the hard way here:
+
+1. **A record must be durable before the guard is told it is saved.**
+2. **Never clear a source before the destination has acknowledged it** (the native patrol drain still
+   breaks this — README risk 2).
+3. **Treat corruption and emptiness as different things.** A parse failure read as "new device" is
+   how a whole shift disappears.
+4. **A camera intent is a process-death event.** Anything unsaved when the picker opens must already
+   be on disk — this is what cost a real incident report on 2026-08-14.
+
 ## AndroidManifest.xml — comments may NOT sit between attributes
 
 XML comments are **elements**, not attribute-level annotations. This is a parse error and fails the
@@ -470,6 +493,46 @@ so `guards` has always had 0 rows and always will. That is the design, not a gap
 `device_id`. The dashboard's Guards module is gone, and the Settings health check now reports
 **Device registration** instead of "Guards provisioned" — the old check warned an admin to go and
 fix something that was working as intended. Anything that joins on `guard_id` will match nothing.
+
+## The patrol drain hands over the walk and forgets it in the same breath
+
+`PatrolBuffer.drain()` (native) returns `route` and `captures` **and clears them inside the same
+`synchronized` block**, then `drainBackgroundPatrol()` persists them JS-side. Between those two the
+walk exists only in a JS variable. A process kill there, or a throw from `persistPatrolScan`, loses
+it — it is already gone from the buffer and was never handed to the outbox. The catch at
+[backgroundPatrol.js:176](src/lib/backgroundPatrol.js#L176) only warns, because by then there is
+nothing left to put back.
+
+This is at-most-once delivery on the one path specifically designed for a phone in a pocket with the
+screen off — the case where a kill is *expected*, not exceptional. Fixing it means a two-phase drain:
+hand the data over, let JS persist, then acknowledge and clear. Don't "fix" it by removing the clear;
+without one, every drain re-delivers the whole walk and the trail duplicates.
+
+Related asymmetry worth knowing: `PatrolBuffer.read()` returns `empty()` on unparseable JSON and has
+**no `.bak`**, while the JS [atomicFile.js](src/lib/atomicFile.js) keeps a backup and a staged temp
+and recovers from either. The half of the system most likely to be killed mid-write has the weaker
+recovery.
+
+## The outbox is uncapped, and every write to it rewrites the whole store
+
+Two facts that are fine alone and expensive together:
+
+1. `enqueueOfflineItem` appends without any size limit, and a queued incident carries its photos as
+   base64 in `_pendingPhotos`.
+2. `nightguard_offline_queue` is in `CRITICAL_KEYS` in
+   [nativeStorage.js](src/lib/nativeStorage.js), so every mutation calls `flushPersistNow()` →
+   `serialiseState()` → **the entire storage state serialised to one file.**
+
+So the cost of saving any record grows with how much is already queued. A handset offline for a long
+stretch with photos makes every subsequent capture slower, on the device least able to afford it.
+
+Also note `flushPersistNow()` is **not awaited** — including on `appStateChange(false)` and
+`pagehide`, which is the last moment before Android may kill the app. The write can still be in
+flight when the process dies.
+
+And `saveQueue()`'s only failure handling is a `console.error`: a failed write loses the outbox delta
+with no user-visible signal and no retry. That is the reason queued photo bytes must live in exactly
+one storage key, never two.
 
 ## Rollout order: APK before any bundle that needs it
 

@@ -4,6 +4,21 @@ import { readJsonFileWithRecovery, writeJsonFileAtomic } from './atomicFile';
 const STORAGE_FILE = 'nightguard-storage.json';
 const WRITE_DEBOUNCE_MS = 120;
 
+// ⚠ CRUCIAL DATA PATH — on Android this module REPLACES window.localStorage with a
+// filesystem-backed proxy, so everything the app "saves to localStorage" actually lands here.
+// The whole offline capture story rests on it.
+//
+// Two costs to know before adding a key below:
+//
+//  * A critical write calls flushPersistNow() -> serialiseState(), which serialises the ENTIRE
+//    storage state to one file. Adding a large key makes EVERY critical write more expensive, for
+//    every other key. The outbox already carries base64 photos and has no size cap.
+//  * flushPersistNow() is fire-and-forget. Nothing awaits it, including the appStateChange/pagehide
+//    handlers below — which are the last moment before Android may kill the app, so the write can
+//    still be in flight when the process dies.
+//
+// See README.md, "Data capture and upload", risks 4 and 6.
+//
 // Keys whose loss would cost a guard's work. These skip the debounce and hit the disk
 // immediately, because Android can kill a backgrounded app between one tick and the next.
 const CRITICAL_KEYS = new Set([

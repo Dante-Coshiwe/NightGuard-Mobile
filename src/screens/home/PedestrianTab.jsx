@@ -233,6 +233,15 @@ export default function PedestrianTab() {
     }).catch(() => setError('Could not load the selected photo'));
   };
 
+  // ⚠ CRUCIAL / KNOWN RISK — same exposure as VehicleTab, see the longer note there.
+  //
+  // Opening the picker backgrounds the app; the typed fields (name, visitorType, unitVisiting) and
+  // any captured photo live ONLY in React state, so an Android reclaim loses the entry silently. A
+  // photo is REQUIRED to submit, so every pedestrian entry passes through this moment.
+  //
+  // Not yet carrying the two fixes IncidentScreen has: holdLiveUpdates() while the form is open,
+  // and a filesystem-persisted draft (src/lib/incidentDraft.js).
+  // See README.md, "Data capture and upload", risk 1.
   const openPhotoPicker = (inputId) => {
     document.getElementById(inputId)?.click();
   };

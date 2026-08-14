@@ -117,6 +117,18 @@ export async function drainBackgroundPatrol({ post, context = {} } = {}) {
   const result = { routePoints: 0, captures: 0 };
   if (!isBackgroundPatrolAvailable() || typeof post !== 'function') return result;
 
+  // ⚠ CRUCIAL DATA PATH — this is how a walk done with the screen off reaches the server, and it
+  // is the ONLY copy while it is in flight.
+  //
+  // PatrolBuffer.drain() returns the route and captures AND CLEARS THEM in the same locked step,
+  // so from here until persistPatrolScan() has written them, the walk exists only in the local
+  // `drained` variable. A process kill in that window loses it: it is already gone natively and
+  // was never handed to the outbox. This is at-most-once delivery on the one path built for a
+  // phone in a pocket, where a kill is expected rather than exceptional.
+  //
+  // The fix is a two-phase drain (hand over → JS persists → acknowledge → clear), NOT removing the
+  // clear: without one, every drain re-delivers the whole walk and the trail duplicates.
+  // See README.md, "Data capture and upload", risk 2.
   let drained;
   try {
     drained = await PatrolTracker.drain();
