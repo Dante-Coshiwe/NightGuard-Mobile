@@ -1,6 +1,6 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import api from '../services/api';
-import { getCachedSiteSettings } from '../lib/deviceStore';
+import { getCachedSiteSettings, reconcileShiftSessionId } from '../lib/deviceStore';
 import {
   NIGHTGUARD_CONNECTIVITY_CHANGE_EVENT,
   NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT,
@@ -9,7 +9,7 @@ import {
   isAppOnline,
 } from '../lib/connectivity';
 import { recordDeviceSyncLog, refreshOperationalCachesFromDatabase } from '../services/schemaData';
-import { uploadPendingPhoto } from '../lib/photoCapture';
+import { uploadPendingPhoto, uploadPendingPhotos } from '../lib/photoCapture';
 import { getCachedIncidents, setCachedIncidents, getCachedObEntries, setCachedObEntries } from '../lib/reportCache';
 import {
   getCachedPedestrians,
@@ -50,6 +50,16 @@ const AUTO_RETRY_INTERVAL_MS = 60000;
 const MAX_SYNC_ATTEMPTS = 8;
 const DEAD_LETTER_LIMIT = 200;
 const DEAD_LETTER_REVIVALS = 3;
+
+// An entry photo that cannot be uploaded must not hold the entry hostage. The upload throws a
+// plain Error with no HTTP status, so classifySyncFailure() reads it as 'retry' and re-queues the
+// item *without* counting an attempt — a permanently broken upload (a missing storage bucket, a
+// storage policy that rejects the anon role) therefore retried every 60s forever and the
+// pedestrian/vehicle never reached the dashboard at all. Worse, the post-sync cache refresh wiped
+// the local row, so the entry vanished from the guard's screen while still stuck in the outbox.
+// Photo attempts are counted separately from MAX_SYNC_ATTEMPTS: exhausting them drops the *photo*
+// and posts the entry with picture_url null, rather than dead-lettering the entry.
+const MAX_PHOTO_ATTEMPTS = 3;
 
 // The Supabase facade ignores axios-style { timeout }. Without this, one stalled write blocks the
 // whole queue forever and `syncInFlight` never clears, so nothing syncs again until the app is
@@ -230,6 +240,14 @@ async function applySuccessfulSync(item, response) {
 
   const resolvedUrl = normaliseQueueUrl(item);
   const guardPayload = extractGuardPayload(responseData);
+
+  // The device session was opened offline with a local `shift_<ts>` id; the server minted a real
+  // UUID. Adopt it now, or every record written from here on sends the local id, nullableUuid()
+  // nulls it on insert, and nothing is attributable to the session. createdIdMap only remaps
+  // within a single drain, so it cannot cover records logged in later batches.
+  if (item.url === '/shifts/start' && responseData.id) {
+    reconcileShiftSessionId(item.clientTempId, responseData.id);
+  }
 
   // Update pedestrians with synced IDs
   if (item.method === 'post' && (responseData.id || guardPayload?.id) && item.clientTempId) {
@@ -468,18 +486,82 @@ export async function syncOfflineQueueNow() {
         let remappedData = remapPayloadReferences(item.data, createdIdMap);
 
         // Upload any photo captured while offline, then post the entry with the resulting URL.
-        // If the upload fails it throws, keeping the item queued so the picture is never lost.
+        // A few retries are worth it so a transient storage blip does not cost the picture, but
+        // the upload must never gate the entry itself: the guard's record of who came on site is
+        // worth more than the photo of them. See MAX_PHOTO_ATTEMPTS.
+        // An incident carries a set of photos rather than the single entry picture a vehicle or a
+        // pedestrian has. Same contract as below: retried a few times, then posted without them —
+        // the guard's account of the incident must reach the dashboard either way.
+        if (remappedData && remappedData._pendingPhotos?.length) {
+          const photoAttempts = (item.photoAttempts || 0) + 1;
+          let uploadedUrls = [];
+          let photoFailure = null;
+
+          try {
+            uploadedUrls = await uploadPendingPhotos({
+              pendingPhotos: remappedData._pendingPhotos,
+              type: 'incidents',
+              tempId: item.clientTempId || String(item.id),
+              siteId: remappedData.site_id,
+            });
+          } catch (photoErr) {
+            photoFailure = photoErr;
+          }
+
+          if (photoFailure && photoAttempts < MAX_PHOTO_ATTEMPTS) {
+            failed.push({ ...item, photoAttempts, lastError: photoFailure.message || 'photo upload failed' });
+            console.log(`[OfflineQueue] SYNC - incident photo upload failed (attempt ${photoAttempts}/${MAX_PHOTO_ATTEMPTS}), incident kept queued: ${photoFailure.message}`);
+            continue;
+          }
+
+          if (photoFailure) {
+            console.warn(`[OfflineQueue] SYNC - Giving up on incident photos after ${photoAttempts} attempts, posting incident without them: ${photoFailure.message}`);
+          }
+
+          const { _pendingPhotos, ...rest } = remappedData;
+          const mergedUrls = uploadedUrls.length
+            ? uploadedUrls
+            : (Array.isArray(rest.photo_urls) ? rest.photo_urls : []);
+          remappedData = { ...rest, photo_urls: mergedUrls, picture_url: mergedUrls[0] || rest.picture_url || null };
+          if (!photoFailure) {
+            console.log(`[OfflineQueue] SYNC - Uploaded ${uploadedUrls.length} queued incident photo(s)`);
+          }
+        }
+
         if (remappedData && remappedData._pendingPhoto) {
           const photoType = item.url.includes('/vehicles') ? 'vehicles' : 'pedestrians';
-          const uploadedUrl = await uploadPendingPhoto({
-            pendingPhoto: remappedData._pendingPhoto,
-            type: photoType,
-            tempId: item.clientTempId || String(item.id),
-            siteId: remappedData.site_id,
-          });
+          const photoAttempts = (item.photoAttempts || 0) + 1;
+          let uploadedUrl = null;
+          let photoFailure = null;
+
+          try {
+            uploadedUrl = await uploadPendingPhoto({
+              pendingPhoto: remappedData._pendingPhoto,
+              type: photoType,
+              tempId: item.clientTempId || String(item.id),
+              siteId: remappedData.site_id,
+            });
+          } catch (photoErr) {
+            photoFailure = photoErr;
+          }
+
+          if (photoFailure && photoAttempts < MAX_PHOTO_ATTEMPTS) {
+            // Keep the photo and try again on the next drain. Counted, unlike a transient
+            // network failure, so a permanently broken upload cannot spin here forever.
+            failed.push({ ...item, photoAttempts, lastError: photoFailure.message || 'photo upload failed' });
+            console.log(`[OfflineQueue] SYNC - ${photoType} photo upload failed (attempt ${photoAttempts}/${MAX_PHOTO_ATTEMPTS}), entry kept queued: ${photoFailure.message}`);
+            continue;
+          }
+
+          if (photoFailure) {
+            console.warn(`[OfflineQueue] SYNC - Giving up on ${photoType} photo after ${photoAttempts} attempts, posting entry without it: ${photoFailure.message}`);
+          }
+
           const { _pendingPhoto, ...rest } = remappedData;
           remappedData = { ...rest, picture_url: uploadedUrl || rest.picture_url || null };
-          console.log(`[OfflineQueue] SYNC - Uploaded queued ${photoType} photo -> ${uploadedUrl ? 'ok' : 'no url'}`);
+          if (!photoFailure) {
+            console.log(`[OfflineQueue] SYNC - Uploaded queued ${photoType} photo -> ${uploadedUrl ? 'ok' : 'no url'}`);
+          }
         }
 
         const response = await withSyncTimeout(api[item.method](resolvedUrl, remappedData), resolvedUrl);

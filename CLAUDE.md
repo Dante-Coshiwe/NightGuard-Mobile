@@ -153,6 +153,214 @@ read, and GPS remains the recorder for a pocketed phone.
 Compare tag UIDs with separators stripped (`normaliseTagUid`): native reports bare hex
 (`045a1b2c`) while a `tag_uid` typed into the admin panel is usually `04:5A:1B:2C`.
 
+## Kiosk lock blocks launching any other app — release it first, on purpose
+
+Android lock task mode refuses to start an activity outside the pinned task, and it refuses
+*silently*. `WhatsAppScreen` navigated to `whatsapp://send` and nothing happened at all — no error,
+no launch — and the "Open WhatsApp" fallback button was the same blocked navigation, so it did
+nothing either. This is not a WhatsApp problem; it is true of the camera, the dialler and every
+other app while the device is pinned.
+
+The fix is a time-boxed **suspension**, not an exit: `KioskService.suspendForExternalApp(label)`
+writes a grace marker (`nightguard_kiosk_suspended_until`, 3 min) **before** calling
+`stopKioskMode`, then releases the lock. The marker matters — `ensureActive()` runs on a 20-second
+watchdog and on every resume, and would otherwise re-pin the device in the gap before Android
+switches tasks. `resumeFromExternalApp()` (wired into the `appStateChange` handler in
+[App.jsx](src/App.jsx)) clears the marker and re-locks the moment the guard comes back.
+
+The shift, the foreground service and the departure log are untouched by a suspension — the guard is
+still on duty. `markAppBackgrounded` records `authorised: KioskService.isSuspended()` so the OB entry
+says "opened WhatsApp from the app" rather than "the device lock was bypassed"; without that, every
+sanctioned trip filed itself as a security incident.
+
+### Letting them out is half the job — there must be a way back IN
+
+Releasing the lock got the guard into WhatsApp and then stranded them there. Three separate things
+were shutting the door behind them; fixed together in APK **1.21** / bundle **1.1.22**.
+
+1. **`android:excludeFromRecents="true"` on MainActivity** (set in 1.8, removed in 1.21). It hid the
+   whole NightGuard task from the overview screen, so Recents was empty of it and Back out of
+   WhatsApp landed on the launcher. The only way back was to find the icon and start the app again —
+   exactly what the guard reported. It bought nothing while pinned (lock task mode already disables
+   the recents button), so the sole thing it ever changed was the sanctioned trip out. Do not add it
+   back; it is also one leg of the Play Protect stalkerware signature noted further up.
+2. **`GuardForegroundService`'s notification had no `setContentIntent`.** "Guard Session Active" sits
+   in the shade for the whole shift and is the one route back that is visible *from inside WhatsApp*,
+   and tapping it did nothing. It now uses the same `openAppIntent()` as `PatrolTrackingService`
+   (`NEW_TASK | CLEAR_TOP`, which with `launchMode="singleTask"` resumes the shift rather than
+   starting a second copy).
+3. **The deep-link fallback fired even when the deep link worked.** `WhatsAppScreen` set a 2.5 s
+   timer and then unconditionally loaded `https://wa.me/`. Capacitor's `Bridge.launchIntent` starts an
+   external `ACTION_VIEW` for any URL outside the app's own origin — so ~2.5 s after WhatsApp came up,
+   a *browser* opened on top of it. That is the "it opens WhatsApp in a new tab" complaint. The timer
+   now bails if the app has lost the foreground (`visibilitychange` / `pagehide` / `appStateChange`);
+   the fallback is only for the case it was written for — WhatsApp not installed, so the scheme went
+   nowhere and we are still visible.
+
+`WhatsAppScreen` also navigates home on resume. React Router does not remount a route you are already
+on, so a guard who came back to a stale "Opening WhatsApp" screen found the sidebar's WhatsApp button
+apparently dead.
+
+There is no way to open WhatsApp *inside* the app: it is a native app, and `web.whatsapp.com` needs a
+QR pairing and refuses to run in a WebView. Leaving the app is unavoidable — make coming back cheap.
+
+## Incident photos: the wizard captured them and threw them away
+
+Steps 3 and 4 of Report Incident ("Photo of Vehicle", "Incident Images") were **entirely
+decorative**. `handlePhotoCapture` put data URLs in form state and rendered the thumbnails, and
+`handleSubmit` never referenced them — no upload, no payload field. The `incidents` table had no
+photo column either, so there was nowhere to put a URL even if something had uploaded one. The same
+submit dropped `offenderDetails`, `offenderAddress`, `registration`, `makeModel` and `colour`:
+collected, validated, never sent. A guard photographed a broken gate, saw the previews, tapped
+Submit, and none of it existed.
+
+Fixed end to end (2026-08-13). Four things had to line up:
+
+1. **The columns.** `supabase/migrations/20260813_incident_photos.sql` in the *dashboard* repo adds
+   `picture_url text` and `photo_urls jsonb`. **This requires a manual run in the SQL editor** —
+   there is no DDL path from here: PostgREST cannot run DDL, no `exec_sql` RPC exists, and the CLI
+   has no access token. Until it is run, incidents still save; they just save without photos.
+2. **`createIncident` must survive the columns being absent.** PostgREST answers an insert naming an
+   unknown column with `PGRST204` and a **400**, which `classifySyncFailure` counts as a rejection
+   and eventually dead-letters — so shipping the bundle before the migration would have cost the
+   *incident*, not just its pictures. It detects that one error and retries without the two columns.
+   Do not broaden the detection: an RLS denial or a not-null violation must still fail loudly.
+3. **Storage needed no change.** Files go to `entry-pictures/<site_id>/incidents/<tempId>[-n].jpg`
+   next to `vehicles/` and `pedestrians/`. The bucket is public-read and the anon insert policy is
+   path-agnostic — verified by uploading to an `incidents/` key with the anon key.
+4. **Reading them back is deliberately forgiving.** One reader,
+   [src/lib/incidentPhotos.js](src/lib/incidentPhotos.js), because the same incident arrives as a
+   jsonb array, a stringified array, an offline copy holding local data URLs, or a pre-migration row
+   with neither.
+
+### A queued photo must never be written to two localStorage keys
+
+The offline queue (`nightguard_offline_queue`) and the incident display cache (`cached_incidents`,
+mirrored by [reportCache.js](src/lib/reportCache.js)) are **both localStorage**. Putting a queued
+incident's base64 photos in both puts multiple megabytes in the same quota twice, and `saveQueue()`'s
+only failure handling is a `console.error` — a quota exception there silently discards the entire
+outbox. The bytes live in the queue alone; the cache keeps `_pendingPhotoCount` so the card can still
+say the photos exist. Photos are also downscaled to 1600 px on capture and capped at 6 per incident.
+
+Use `createImageBitmap(blob, { imageOrientation: 'from-image' })` to decode before drawing to the
+canvas. Drawing the raw file bakes in the *unrotated* pixels and every portrait photo comes out
+sideways, because the rotation lives in an EXIF flag that only the renderer honours.
+
+### `forceQueue` is what makes a pending photo actually upload
+
+`_pendingPhoto` / `_pendingPhotos` are only ever consumed by the offline-queue drain. If the entry
+posts **directly** instead, `createIncident` / `createVehicle` / `createPedestrian` strip them as
+non-columns and the picture is gone with no error anywhere. That is not a hypothetical: it happens
+whenever the storage upload fails while the database is still reachable. Every screen that can hold a
+pending photo now passes `forceQueue: Boolean(pendingPhoto)` to `post()`.
+
+Related: gate the upload attempt on `isAppOnline()`, not `navigator.onLine`. `useOfflineApi.shouldQueue`
+uses the former, and when the two disagree nothing uploads while the post goes straight online.
+
+## A refresh is not a page load — never re-raise `loading` on a background reload
+
+**Symptom:** the OB and Incident pages "keep switching on and off" — the list vanishes to black and
+then the content comes back, over and over. Every other page looked fine.
+
+**Cause:** those two screens refreshed by calling the same loader they use on mount, and it opens
+with `setLoading(true)`. That swaps the whole list for a bare "Loading entries…" div on a dark page,
+which reads as the screen going black. The report screens never re-raised `loading` after the first
+paint (`run()` only ever calls `setLoading(false)`) — that, and nothing else, is why they were fine.
+
+It fires far more often than it looks. `NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT` is dispatched with
+`forceRecheck` on every `visibilitychange`, `focus`, `pageshow` and native network change (see
+`refreshConnectivityState` in [src/lib/connectivity.js](src/lib/connectivity.js)), **and** from
+`confirmAppOnline()` after *each* successfully synced queue item — debounced to one every 1.5 s, so
+draining a dozen queued entries strobes the list for as long as the drain lasts. The queue's own 60 s
+auto-retry keeps that going while anything is pending.
+
+[src/hooks/useLiveRefresh.js](src/hooks/useLiveRefresh.js) is now the one way to wire those three
+events (`nightguard_sync_complete`, `online`, recheck) to a screen. It coalesces the burst — 600 ms
+trailing debounce, no overlapping runs, 5 s floor between completed reads — and the handler it takes
+must be **silent**:
+
+- `loadX({ silent: true })` — do not touch `loading`.
+- Render the spinner as `loading && rows.length === 0`, never `loading` alone.
+- A failed refresh must not blank the list. What is on screen is still true, and offline is the
+  expected condition on a guard's handset, not a fault worth shouting about.
+- Read the cache **first**, before any network work and whatever `isAppOnline()` says, so the page is
+  readable the instant it opens with no signal.
+
+Load errors need their own state (`listError` on the OB screen). Sharing `error` with the form let a
+background refresh wipe "Nature of Occurrence cannot be empty" out from under the guard mid-typing.
+
+A refresh in flight when the guard hits Save used to resolve with server data that predated the
+entry and overwrite both the list and the display cache — the entry appeared to vanish. Both screens
+now bump a `submitSeq` ref when a save starts and discard any load answer from before it.
+
+### `device_id` on ob_entries/incidents — two traps, both live in the data
+
+The lists filter to this handset's own rows, with the per-device breakdown below
+([src/lib/deviceAttribution.js](src/lib/deviceAttribution.js),
+[src/components/DeviceBreakdown.jsx](src/components/DeviceBreakdown.jsx)). Two things will bite:
+
+1. **It is the `devices` table ROW id (a uuid), not the hardware `NG-<ANDROID_ID>`.** `createObEntry`
+   and `createIncident` write `device_id: currentDeviceRowId()`, which is
+   `getCurrentDeviceRecord()?.id`. Matching on `getDeviceId()` matches nothing.
+2. **It is null on everything written before `ensureDeviceRecord()` existed** — 14 of the 17 OB
+   entries on record as of 2026-08-14 (incidents: 0 of 3, they are all newer). Those rows are
+   history, **not a second device**. Counting the null bucket as a device makes a one-handset site
+   claim two; filtering them out wipes most of the occurrence book off the guard's screen.
+
+So the filter only engages when a second device has *genuinely* written (`writingDeviceCount > 1`),
+and never when this handset has not resolved its own device record. On the current single-device
+site it is a no-op: all 17 entries show and the breakdown panel renders nothing.
+
+## Shift durations are DERIVED — those columns do not exist
+
+`shifts` stores `started_at` and `ended_at` and nothing else about length. Both shift reports used to
+read `shift.duration_hours`, `duration_minutes`, `duration_ms` and `is_sunday` straight off the row.
+**Nothing has ever written any of them.** Every duration rendered as `undefinedm`, the total-hours
+tile read `0h`, and the per-guard rollup added zeroes together.
+
+Everything is computed at read time in [src/lib/shiftAnalytics.js](src/lib/shiftAnalytics.js), which
+is the only place a shift number may be derived. Two rules it encodes:
+
+- **A shift over 16 h, or closed with `superseded_by_new_shift` / `abandoned_backfill`, is not worked
+  time.** It is still listed — it is evidence of a handover problem — but its hours are excluded from
+  any total a client sees, or a single forgotten End Shift adds days of phantom cover.
+- **Activity is attributed by `shift_id` first, then by time window.** An id-only join reports "0
+  patrols" for shifts that were fully walked, because `shift_id` is null on a lot of history (the
+  local `shift_<ts>` id is dropped by `nullableUuid()` until the server id is adopted — see
+  `reconcileShiftSessionId`).
+
+`endShiftRecord` now writes `payload.ended_at` rather than `new Date()`. A shift ended offline sits in
+the queue until the handset finds signal, so "now" stretched a 12 h night into whatever time the phone
+next saw a tower.
+
+## "Checkpoint coverage 100%" was measuring the scan list against itself
+
+The patrol dashboard computed `scanned / totalCheckpoints` where both came from the **scan** list — a
+scan row exists precisely because somebody scanned, so the numerator was the whole list, `missed` was
+`length - length`, and every device reported 100% coverage and 0 missed points forever.
+
+Coverage needs the configured points as the denominator: distinct points reached, over
+`getPatrolConfig().checkpoints`. A site with no points configured has **no measurable coverage** —
+render `n/a` and say why. Never fall back to a percentage there; 100% of nothing is the bug above,
+wearing a different mask.
+
+Same rule for charts: "Acknowledged" and "Missing" are complements, so plotting both is one fact
+drawn twice. The space belongs to *which* points were missed.
+
+## There is no email delivery, and there never was
+
+The "Email delivery" panel on every report collected recipients, a subject and a nightly send time,
+and wrote them to a `report_schedules` table nothing has ever read. Its Send button did not send: it
+opened the Android share sheet and pasted the recipient list into the message body as text. An admin
+who typed the client's address in and switched it to Enabled had every reason to think reports went
+out nightly. They never did.
+
+It is gone — panel, `loadReportSchedules`, `saveReportSchedule`, and the local settings behind them.
+Each report now has one `ShareButton` that builds the PDF and hands it to the OS share sheet
+(`exportPdfDocument(..., { preferShare: true })`), where the admin picks WhatsApp, Gmail or Drive.
+**Do not add scheduled email back without a server-side sender that actually sends it** — a form that
+implies delivery is worse than no form.
+
 ## Checkpoint radius lives in TWO places
 
 `GEOFENCE_RADIUS_METERS` exists in both [src/lib/geo.js](src/lib/geo.js) and
@@ -223,6 +431,46 @@ That frontend talks to Supabase directly and **never calls the Express backend**
 calls it. Leaflet is vendored into `frontend/public/vendor/leaflet/` rather than loaded from unpkg,
 because a blocked CDN left `L` undefined and took the whole Patrol Routes page down with it.
 
+### Cover & Activity is a PORT, not a second implementation
+
+The dashboard's Cover & Activity panel computes the same figures as
+[src/lib/shiftAnalytics.js](src/lib/shiftAnalytics.js), and that file is the source of truth for the
+rules. **Change one, change both**, or a manager and a guard read different numbers off the same
+shift. Both apply the same two rules, and both need to:
+
+- Shifts left `active`, closed with `superseded_by_new_shift` / `abandoned_backfill`, or longer than
+  16 h do not count toward hours. On 2026-08-12 that was **27 of 33** shifts on record, the longest
+  running **621 hours**. Counting them would have claimed roughly 1,500 hours of cover nobody worked.
+- Activity attaches by `shift_id` if it has one and by **time window** if it does not — only 12 of
+  272 scans carry a `shift_id`.
+
+Two traps the dashboard hit that the app did not:
+
+1. **Never compute the "all locations" row from a pooled row set.** Time-window attribution then
+   lets a visitor logged at site A fall inside site B's night shift, and the collective came out
+   with more people in it than the sites it was made of. `sumCoverRows` adds the per-site rows up.
+2. **`nfc_scans` is not a check-in list.** 190 of 272 rows are `method: 'route_point'` — breadcrumbs
+   from the walked GPS trail. Filter them out (`method.is.null,method.neq.route_point`, same as
+   `listNfcScans` does) or coverage runs past 100%.
+
+### What the dashboard must NOT show
+
+- **Dockets, Deliveries, Wheel Clamps.** No screen in the guard app creates any of them; all three
+  tables have always held 0 rows. Removed 2026-08-12 — nav, tiles, shift-report sections and
+  exports. Don't add them back without an app screen that writes them.
+- **`ob_entries.entry_text`.** The app writes the occurrence into `nature_of_occurrence`; 0 of 17
+  rows have ever had an `entry_text`.
+- **A Guards page.** See below.
+
+### One guard, and attribution is by device
+
+The app runs a single built-in **General Guard** that is deliberately local-only and never synced,
+so `guards` has always had 0 rows and always will. That is the design, not a gap: since bundle
+1.1.19 the handset opens its own session and every patrol, scan and gate entry is filed against a
+`device_id`. The dashboard's Guards module is gone, and the Settings health check now reports
+**Device registration** instead of "Guards provisioned" — the old check warned an admin to go and
+fix something that was working as intended. Anything that joins on `guard_id` will match nothing.
+
 ## Rollout order: APK before any bundle that needs it
 
 A bundle whose feature depends on a native plugin must not be published until the APK carrying that
@@ -236,8 +484,57 @@ the JS context and reloads — so a mandatory bundle force-reloads every device 
 on shift. Correct order: ship the APK, confirm check-ins show the new `native_version`, then publish
 the bundle.
 
-(The on-shift exemption at [liveUpdate.js:285-286](src/services/liveUpdate.js#L285-L286) is
-deliberate — never reload out from under a guard on duty. Don't "fix" it.)
+(The on-shift exemption is deliberate — never reload out from under a guard on duty. Don't "fix" it.)
+
+### `mandatory` does not bypass the version check
+
+`ota-check` decides whether an update exists **before** it ever reads `is_mandatory`: `isNewer(target,
+current)` runs first, and `mandatory` only appears in the response payload afterwards. So publishing
+a bundle whose version is equal to — or below — what the handset already runs does nothing at all,
+whatever flags are on it.
+
+The trap is the **built-in** bundle. An APK bakes in the bundle that was current when it was built,
+and `resetWhenUpdate` makes a fresh install run that one. APK 1.21 carries bundle 1.1.22, so
+production's newest published bundle (1.1.21) was correctly refused as a *downgrade* and every
+device on that APK logged `up_to_date` forever. Always publish above the built-in version.
+
+### The JS auto-apply never fires any more — Capgo's native swap is what delivers
+
+`applyStagedUpdateIfSafe()` returns `deferred: shift_running` while `getShiftSession()` is truthy,
+and under the device-session model `ensureDeviceSession()` opens a session on boot that only
+`logout()` or an admin unbind ever clears. That gate therefore never opens, and neither does
+`applyNow` at [liveUpdate.js:291](src/services/liveUpdate.js#L291) — the rationale recorded above
+("a kiosk between shifts is idle") stopped holding when shifts stopped ending.
+
+Staged bundles still install, because `next()` hands the decision to the plugin, which activates the
+new bundle **natively on the next background event**. Screen off is enough. Two things that are not:
+`am force-stop` + relaunch (the process dies before the lifecycle event), and the Settings override —
+the guard sidebar has no Settings entry, so on a kiosk handset there is no manual route at all.
+
+Verify a rollout by watching `ota_update_logs` go `check` → `download_started` → `downloaded` →
+(background event) → the device reporting the new version as its `from_version`.
+
+### Bundles now install themselves — the Settings button is the override
+
+Staging was never a rollout. `next()` applies on the next app **start**, and a gatehouse tablet is
+launched once and left running for weeks, so a published bundle sat downloaded-but-dormant until
+somebody walked over and tapped "Check for updates now".
+
+`installLiveUpdateAutomation()` (called once from [main.jsx](src/main.jsx)) checks on launch, on
+resume and every 30 minutes, and calls `applyStagedUpdateIfSafe()` on resume and on a 60-second
+timer. Two gates guard the apply, and **neither may be relaxed**:
+
+1. **Never while a shift is running.** `set()` destroys the JS context and reloads. Nothing is lost —
+   shift session, offline queue and Supabase session all live in storage that survives — but a screen
+   going blank mid-patrol reads as a crash to the guard holding it.
+2. **Never mid-interaction.** 90 s of no touch input first, tracked by capture-phase listeners on
+   `pointerdown`/`keydown`/`touchstart`/`wheel`. A reload while somebody is typing a visitor's name
+   throws the form away. Coming back from the background skips this gate (`requireIdle: false`) —
+   nothing is half-typed there.
+
+Both open by themselves on a real device: a kiosk between shifts is idle, and a pocketed phone is
+backgrounded. `getNextBundle()` is optional-chained, so an APK carrying an older updater plugin
+simply never auto-applies rather than throwing.
 
 ## Release build
 

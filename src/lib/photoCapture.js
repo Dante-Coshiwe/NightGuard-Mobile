@@ -29,15 +29,92 @@ export function fileToDataUrl(file) {
   });
 }
 
+// A photo straight off a phone camera is 3–5 MB. That is slow to upload over a gate's signal and,
+// worse, it has to survive the offline queue as a base64 data URL (~1.37x the bytes) inside the same
+// storage the shift session and outbox live in — a couple of full-size incident photos is enough to
+// blow the quota and take the queue down with it. Everything is downscaled on capture instead.
+const MAX_PHOTO_EDGE_PX = 1600;
+const PHOTO_JPEG_QUALITY = 0.82;
+
+// EXIF orientation is the trap here: the raw file carries a rotation flag that browsers honour when
+// they render it, but drawing to a canvas bakes in the *unrotated* pixels and every portrait photo
+// comes out sideways. createImageBitmap with imageOrientation 'from-image' applies the flag for us.
+async function decodeImage(blob) {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      return await createImageBitmap(blob, { imageOrientation: 'from-image' });
+    } catch {
+      // Older WebViews reject the options bag rather than ignoring it.
+      try {
+        return await createImageBitmap(blob);
+      } catch {
+        /* fall through to the <img> path */
+      }
+    }
+  }
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    return await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('Could not decode image'));
+      img.src = objectUrl;
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+// Best-effort: any failure returns the original file untouched. A photo that cannot be shrunk is
+// still a photo, and losing it to a canvas quirk on one handset would be the worse outcome.
+export async function compressPhoto(file) {
+  try {
+    const source = await decodeImage(file);
+    const width = source.width || source.naturalWidth;
+    const height = source.height || source.naturalHeight;
+    if (!width || !height) throw new Error('Image has no dimensions');
+
+    const scale = Math.min(1, MAX_PHOTO_EDGE_PX / Math.max(width, height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(width * scale));
+    canvas.height = Math.max(1, Math.round(height * scale));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('No 2d context');
+    ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+    if (typeof source.close === 'function') source.close();
+
+    const dataUrl = canvas.toDataURL('image/jpeg', PHOTO_JPEG_QUALITY);
+    if (!dataUrl.startsWith('data:image/jpeg')) throw new Error('Canvas export failed');
+    const blob = dataUrlToBlob(dataUrl);
+    // A tiny already-optimised image can come out *larger* after a re-encode. Keep the smaller one.
+    if (scale === 1 && file.size && blob.size >= file.size) throw new Error('Re-encode not smaller');
+    return { dataUrl, blob, extension: 'jpg', mimeType: 'image/jpeg' };
+  } catch (err) {
+    console.warn('[photoCapture] Compression skipped, using original file:', err?.message);
+    return {
+      dataUrl: await fileToDataUrl(file),
+      blob: file,
+      extension: getFileExtension(file.name || file.type),
+      mimeType: file.type || 'image/jpeg',
+    };
+  }
+}
+
 export async function normaliseSelectedPhoto(file) {
   if (!file) return null;
-  const dataUrl = await fileToDataUrl(file);
-  return {
-    dataUrl,
-    blob: file,
-    extension: getFileExtension(file.name || file.type),
-    mimeType: file.type || 'image/jpeg',
-  };
+  return compressPhoto(file);
+}
+
+// Camera/gallery pickers with `multiple` hand back a FileList. Compressed in sequence rather than
+// in parallel: several full-size decodes at once is what makes a mid-range handset drop the tab.
+export async function normaliseSelectedPhotos(fileList) {
+  const files = Array.from(fileList || []);
+  const photos = [];
+  for (const file of files) {
+    if (!file) continue;
+    photos.push(await compressPhoto(file));
+  }
+  return photos;
 }
 
 // Build a JSON-serialisable photo descriptor that can be stored in the offline queue
@@ -66,6 +143,43 @@ export async function uploadPendingPhoto({ pendingPhoto, type, tempId, siteId })
     tempId,
     siteId,
   });
+}
+
+export function buildPendingPhotos(photos) {
+  return (photos || []).map(buildPendingPhoto).filter(Boolean);
+}
+
+// An incident carries several photos, so the tempId alone is not a unique object key — the index
+// makes each one its own path. Serial rather than Promise.all so an incident with eight photos does
+// not open eight concurrent uploads on a gate's connection.
+export async function uploadPendingPhotos({ pendingPhotos, type, tempId, siteId }) {
+  const urls = [];
+  const list = (pendingPhotos || []).filter((p) => p?.dataUrl);
+  for (let i = 0; i < list.length; i += 1) {
+    const url = await uploadPendingPhoto({
+      pendingPhoto: list[i],
+      type,
+      tempId: `${tempId}-${i + 1}`,
+      siteId,
+    });
+    if (url) urls.push(url);
+  }
+  return urls;
+}
+
+export async function uploadEntryPhotos({ photos, type, tempId, siteId }) {
+  const urls = [];
+  const list = (photos || []).filter((p) => p?.blob);
+  for (let i = 0; i < list.length; i += 1) {
+    const url = await uploadEntryPhoto({
+      photo: list[i],
+      type,
+      tempId: `${tempId}-${i + 1}`,
+      siteId,
+    });
+    if (url) urls.push(url);
+  }
+  return urls;
 }
 
 export async function uploadEntryPhoto({ photo, type, tempId, siteId }) {

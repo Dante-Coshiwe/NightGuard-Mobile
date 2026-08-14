@@ -68,14 +68,22 @@ export default function ShiftManagementScreen() {
   const endShift = async () => {
     setLoading(true);
     try {
+      // Carry the sign-off time in the payload, not just in the optimistic response —
+      // it is what endShiftRecord writes, and without it a shift ended with no signal is
+      // stamped with whenever the queue happened to drain.
+      const endedAt = new Date().toISOString();
       const result = await post(
         '/shifts/end',
-        currentShift?.id ? { shift_id: currentShift.id } : {},
+        {
+          ...(currentShift?.id ? { shift_id: currentShift.id } : {}),
+          ended_at: endedAt,
+          end_reason: 'guard_ended_shift',
+        },
         {
           clientTempId: `shift_end_${Date.now()}`,
           offlineResponse: {
             shift_id: currentShift?.id || null,
-            ended_at: new Date().toISOString(),
+            ended_at: endedAt,
             _offline: true,
           },
         }

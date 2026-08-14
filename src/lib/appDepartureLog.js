@@ -65,6 +65,10 @@ export function markAppBackgrounded({ user } = {}) {
     // Leaving a device that was supposed to be locked is a different event from leaving one the
     // admin deliberately unlocked, so the admin gets to see which happened.
     kiosk: KioskService.isEnabled(),
+    // ...and a guard who tapped WhatsApp and was let out by the app is a third thing again.
+    // Reporting that as "the device lock was bypassed" would put a security incident in the
+    // Occurrence Book for a trip the app itself authorised.
+    authorised: KioskService.isSuspended(),
   };
 
   try {
@@ -104,9 +108,11 @@ export function reconcileAppDeparture() {
 
   const left = new Date(Number(marker.at));
   const back = new Date();
-  const context = marker.kiosk
-    ? 'kiosk mode was ON — the device lock was bypassed'
-    : 'kiosk mode is off for this device';
+  const context = marker.authorised
+    ? 'opened WhatsApp from the app — the lock was released for the trip and re-applied on return'
+    : marker.kiosk
+      ? 'kiosk mode was ON — the device lock was bypassed'
+      : 'kiosk mode is off for this device';
 
   const payload = {
     site_id: marker.siteId || null,

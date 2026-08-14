@@ -4,8 +4,14 @@ import { getDeviceSettings } from '../lib/deviceStore';
 
 const KIOSK_STATE_KEY = 'kiosk_session_state';
 const KIOSK_ACTIVE_KEY = 'nightguard_kiosk_active';
+const KIOSK_SUSPEND_KEY = 'nightguard_kiosk_suspended_until';
 const END_SHIFT_SECURITY_KEY = 'end_shift_security_state';
 const KioskPlugin = registerPlugin('KioskPlugin');
+
+// How long the lock stays off after the guard asks to open another app. Long enough
+// for Android to actually switch tasks on a slow handset, short enough that a device
+// left on the WhatsApp screen re-locks itself instead of staying open all night.
+const EXTERNAL_APP_GRACE_MS = 3 * 60 * 1000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -34,12 +40,6 @@ async function prefGetJson(key, fallback) {
       return fallback;
     }
   }
-}
-
-async function callNative(method) {
-  if (!Capacitor.isNativePlatform?.() || !KioskPlugin?.[method]) return false;
-  await KioskPlugin[method]();
-  return true;
 }
 
 async function callNativeWithRetry(method, transitionLabel) {
@@ -83,6 +83,10 @@ const KioskService = {
     let kioskModeStarted = false;
     let foregroundServiceStarted = false;
     const lockWanted = this.isEnabled();
+
+    // A new shift starts locked, whatever the last one left behind. Without this, a
+    // grace window opened seconds before a handover would keep the next guard unlocked.
+    this.clearSuspension();
 
     try {
       if (!lockWanted) {
@@ -132,6 +136,7 @@ const KioskService = {
   async stopSession() {
     const errors = [];
     console.info('[KioskService] exiting kiosk mode');
+    this.clearSuspension();
     try {
       // NightGuard fix: retry kiosk deactivation once and report failure to the end-shift UI.
       await callNativeWithRetry('stopForegroundService', 'exiting kiosk foreground service');
@@ -232,11 +237,80 @@ const KioskService = {
     }
   },
 
+  // ---------------------------------------------------------------------------
+  //  Letting the guard out to another app, on purpose
+  // ---------------------------------------------------------------------------
+  //
+  //  Lock task mode blocks starting any other activity, so tapping WhatsApp on a
+  //  kiosked handset did nothing at all: the screen said "Opening WhatsApp", the
+  //  navigation was swallowed by the lock, and the guard was left staring at a page
+  //  with a button that also did nothing. Worse, the 20-second watchdog below would
+  //  have re-pinned the device the moment it did work.
+  //
+  //  So a trip out is an explicit, time-boxed SUSPENSION rather than an exit: the
+  //  lock comes off, the watchdog is told to leave it off, and the shift, the
+  //  foreground service and the departure log all carry on exactly as before. The
+  //  guard is still on duty and still accountable — they are just allowed out.
+
+  isSuspended() {
+    const until = Number(localStorage.getItem(KIOSK_SUSPEND_KEY) || 0);
+    return Number.isFinite(until) && until > Date.now();
+  },
+
+  clearSuspension() {
+    try {
+      localStorage.removeItem(KIOSK_SUSPEND_KEY);
+    } catch { /* best effort */ }
+  },
+
+  /**
+   * Release the lock so another app can be launched. Safe to call when kiosk is off
+   * or unsupported — it just marks the grace window and returns.
+   *
+   * The marker is written BEFORE the unlock, not after: `ensureActive` runs on a
+   * timer and on every resume, and either could otherwise re-pin the device in the
+   * gap between releasing the lock and Android switching tasks.
+   */
+  async suspendForExternalApp(label = 'another app') {
+    try {
+      localStorage.setItem(KIOSK_SUSPEND_KEY, String(Date.now() + EXTERNAL_APP_GRACE_MS));
+    } catch { /* best effort — the unlock below still runs */ }
+
+    if (!this.isNativeAvailable()) return { released: false, reason: 'unsupported' };
+
+    const lockState = await this.getLockState();
+    if (lockState !== 'locked' && lockState !== 'pinned') {
+      return { released: false, reason: 'not_locked' };
+    }
+
+    console.info(`[KioskService] releasing lock to open ${label}`);
+    try {
+      await callNativeWithRetry('stopKioskMode', `releasing kiosk for ${label}`);
+      return { released: true };
+    } catch (err) {
+      console.warn('[KioskService] could not release lock:', err?.message || err);
+      return { released: false, reason: 'failed', error: err?.message || String(err) };
+    }
+  },
+
+  /**
+   * Called when the app comes back to the foreground. Ends any grace window and puts
+   * the lock back — the guard's trip out is over the moment they return.
+   */
+  async resumeFromExternalApp() {
+    this.clearSuspension();
+    return this.ensureActive();
+  },
+
   // Re-assert kiosk mode if the session is active but the device is no longer locked
   // (Android can drop screen-pinning after a task switch, notification, or app kill/restart).
   async ensureActive() {
     const state = await this.getSessionState();
     if (!state?.active || !this.isNativeAvailable()) return state;
+
+    // Deliberately unlocked for a trip to another app — leave it alone until the grace
+    // window expires or the guard comes back.
+    if (this.isSuspended()) return state;
 
     // The watchdog is what makes kiosk mode stick, so it is also what makes turning kiosk
     // OFF stick: with the lock disabled it releases any lock still held instead of

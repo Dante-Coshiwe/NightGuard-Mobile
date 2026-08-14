@@ -9,7 +9,6 @@ import { enqueueOfflineItem, syncOfflineQueueNow } from '../hooks/useOfflineQueu
 import {
   loadDeviceConfiguration,
   loadPatrolConfiguration,
-  loadReportSchedules,
   loadSiteLookupData,
   syncPendingSchemaData,
 } from '../services/schemaData';
@@ -28,6 +27,7 @@ import {
   GENERAL_GUARD,
   GENERAL_GUARD_ID,
   isGeneralGuardId,
+  NIGHTGUARD_SHIFT_SESSION_EVENT,
 } from '../lib/deviceStore';
 import { confirmAppOnline, isAppOnline, NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
 import { clearAdminDeviceBinding, getAdminDeviceBinding, saveAdminDeviceBinding } from '../lib/deviceBinding';
@@ -248,12 +248,18 @@ export const AuthProvider = ({ children }) => {
             loadSiteLookupData(getCachedSiteSettings()),
             loadPatrolConfiguration(getCachedSiteSettings()),
             loadDeviceConfiguration(getCachedSiteSettings()),
-            loadReportSchedules(getCachedSiteSettings()),
           ]);
         } catch (err) {
           console.warn('[Auth] Background refresh failed:', err?.message || err);
         }
       })();
+
+      // The device, not a person, is the unit of work: handsets are passed from one guard to the
+      // next with no login and no shift ceremony. So if the app comes up on a provisioned device
+      // with no open session, open one silently rather than making the guard tap anything. This
+      // is also the recovery path — a session lost to a reinstall or a cleared cache used to
+      // leave the handset logging everything with no session at all.
+      void ensureDeviceSession();
 
       // NightGuard fix: restore persisted kiosk mode after app boot without touching keyboard/inset code.
       KioskService.restoreActiveSession().catch((err) => {
@@ -272,7 +278,6 @@ export const AuthProvider = ({ children }) => {
         loadSiteLookupData(latestSite),
         loadPatrolConfiguration(latestSite),
         loadDeviceConfiguration(latestSite),
-        loadReportSchedules(latestSite),
       ]);
     };
 
@@ -296,6 +301,15 @@ export const AuthProvider = ({ children }) => {
     const syncQuickSwitch = () => setQuickSwitchEnabledState(getQuickSwitchEnabled());
     window.addEventListener('nightguard_device_settings_updated', syncQuickSwitch);
     return () => window.removeEventListener('nightguard_device_settings_updated', syncQuickSwitch);
+  }, []);
+
+  // The offline queue swaps the local `shift_<ts>` id for the server UUID once /shifts/start
+  // syncs. Screens read `shiftSession?.id` (this state) before falling back to storage, so
+  // without mirroring the change here they would keep stamping records with the dead local id.
+  useEffect(() => {
+    const adoptStoredSession = () => setShiftSession(getShiftSession());
+    window.addEventListener(NIGHTGUARD_SHIFT_SESSION_EVENT, adoptStoredSession);
+    return () => window.removeEventListener(NIGHTGUARD_SHIFT_SESSION_EVENT, adoptStoredSession);
   }, []);
 
   const loginOffline = async () => {
@@ -369,7 +383,6 @@ export const AuthProvider = ({ children }) => {
       loadSiteLookupData(latestSite),
       loadPatrolConfiguration(latestSite),
       loadDeviceConfiguration(latestSite),
-      loadReportSchedules(latestSite),
     ]);
     return binding;
   };
@@ -408,6 +421,27 @@ export const AuthProvider = ({ children }) => {
     await syncOfflineQueueNow();
     await syncPendingSchemaData(getCachedSiteSettings());
     return { user: userData, needsSiteBinding: false };
+  };
+
+  // Opens the device session if this provisioned handset does not already have one. Deliberately
+  // silent and best-effort: a guard picking the device up must never be blocked by it, and a
+  // handset that cannot open a session still works — the records simply carry no session id,
+  // which is the behaviour that shipped for months before this.
+  const ensureDeviceSession = async () => {
+    const existing = getShiftSession();
+    if (existing) return existing;
+
+    const siteId = getBoundSiteIdSync() || getCachedSiteSettings().id || null;
+    if (!siteId) return null; // not provisioned yet — the admin still has to bind a site
+
+    try {
+      const result = await startShiftLogin({ createShift: true });
+      console.info('[Auth] Opened device session automatically');
+      return result?.shift || getShiftSession();
+    } catch (err) {
+      console.warn('[Auth] Could not open device session automatically:', err?.message || err);
+      return null;
+    }
   };
 
   const startShiftLogin = async ({ guardId, pin, shiftLabel, createShift = true } = {}) => {

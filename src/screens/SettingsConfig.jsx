@@ -323,10 +323,15 @@ export default function SettingsConfig() {
         <Field label="Running App Version">
           <input value={runningVersion || '-'} readOnly style={inputStyle(true)} />
         </Field>
-        {/* OTA smoke-test marker: first shipped over-the-air in 1.0.8. Seeing a version
-            here HIGHER than the APK's baked-in bundle proves updates land without reinstalls. */}
-        <div style={{ margin: '0 0 14px', padding: '10px 12px', background: '#052e16', border: '1px solid #166534', borderRadius: 8, color: '#86efac', fontSize: 13, fontWeight: 600 }}>
-          🚀 Live update test passed — bundle v{runningVersion}, pushed with zero reinstall
+        {/* This button is the OVERRIDE, not the mechanism — installLiveUpdateAutomation
+            already checks on launch, on resume and every 30 minutes, and installs what it
+            downloads as soon as the device is idle and no shift is running. Say so, or an
+            admin assumes updates only arrive when somebody remembers to come in here. */}
+        <div style={{ margin: '0 0 14px', padding: '10px 12px', background: '#052e16', border: '1px solid #166534', borderRadius: 8, color: '#86efac', fontSize: 13, lineHeight: 1.5 }}>
+          <strong>Updates install themselves.</strong> This device checks for a new version on
+          launch, when it wakes, and every 30 minutes, then installs it once the screen has been
+          idle for a minute and no shift is running. A guard on duty is never interrupted. Use the
+          button below only to pull an update immediately.
         </div>
         <button
           type="button"
@@ -339,7 +344,7 @@ export default function SettingsConfig() {
               // code after this point does not run in that case.
               const result = await runOtaUpdate({ immediate: true });
               if (result?.status === 'up_to_date') setOtaResult(`Up to date (${runningVersion}).`);
-              else if (result?.status === 'staged') setOtaResult(`Update ${result.version} downloaded — restart the app to apply.`);
+              else if (result?.status === 'staged') setOtaResult(`Update ${result.version} downloaded — it installs automatically once the shift ends.`);
               else if (result?.status === 'skipped') setOtaResult('Updates are unavailable in this build (web preview or missing updater).');
               else if (result?.status === 'error') setOtaResult(`Update failed: ${result.error}`);
             } catch (err) {

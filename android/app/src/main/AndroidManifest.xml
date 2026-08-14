@@ -40,7 +40,15 @@
          IME by padding its parent. adjustPan made the window ALSO slide up, so the keyboard height
          was subtracted twice and the black decor background showed through as a bar above the
          keyboard. Paired with Keyboard.resizeOnFullScreen=false in capacitor.config.json, which is
-         the other half of that double-resize (it shrank the content view a second time). -->
+         the other half of that double-resize (it shrank the content view a second time).
+
+         android:excludeFromRecents must stay OFF (1.8-1.20 set it to "true"). It hid the whole
+         NightGuard task from the overview screen, so a guard who stepped out to WhatsApp had no
+         way back: Recents was empty of it, and Back from WhatsApp landed on the launcher rather
+         than returning to the shift. They had to go and find the launcher icon. It bought nothing
+         while pinned either — lock task mode already blocks the recents button — so the only
+         thing it ever affected was the sanctioned trip out. It is also one leg of the Play
+         Protect stalkerware signature described in the comment above. -->
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -56,7 +64,6 @@
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize"
             android:lockTaskMode="if_whitelisted"
-            android:excludeFromRecents="true"
             android:noHistory="false"
             android:alwaysRetainTaskState="true"
             android:exported="true">

@@ -24,7 +24,7 @@ import { getSiteBinding } from '../lib/siteResolver';
 // Web bundle version currently shipped. Bump this on every release you publish
 // (it must match the `version` you pass to `ota:publish`). It is what the
 // server compares against to decide if a newer bundle exists.
-export const OTA_CURRENT_VERSION = '1.1.17';
+export const OTA_CURRENT_VERSION = '1.1.24';
 
 const OTA_CHECK_FN = 'ota-check';
 const OTA_REPORT_FN = 'ota-report';
@@ -309,4 +309,114 @@ async function doRunOtaUpdate({ immediate = false } = {}) {
     await reportOta({ ...base, status: 'failed', errorMessage: message });
     return { status: 'error', error: message };
   }
+}
+
+// ---------------------------------------------------------------------------
+//  Applying a staged bundle without anyone pressing a button
+// ---------------------------------------------------------------------------
+//
+//  Staging alone was not a rollout. `next()` applies on the next app START, and a
+//  gatehouse tablet is launched once and left running for weeks — so a published
+//  bundle sat downloaded-but-dormant until somebody walked over and hit "Check for
+//  updates now" in Settings. That button is now the manual override, not the
+//  mechanism.
+//
+//  Two rules make auto-applying safe, and neither may be relaxed:
+//
+//   1. NEVER while a shift is running. set() destroys the JS context and reloads;
+//      nothing is lost (the shift session, the offline queue and the Supabase
+//      session all survive in storage) but a screen going blank mid-patrol reads
+//      as a crash to the guard holding it.
+//   2. Never mid-interaction. A reload while somebody is typing a visitor's name
+//      throws the form away. So the device must have been untouched for
+//      IDLE_BEFORE_APPLY_MS first — on resume that is implicit, the app was just
+//      in the background.
+//
+//  Both gates open on their own on any real device: a kiosk between shifts is idle
+//  by definition, and a phone that is pocketed is backgrounded.
+
+const IDLE_BEFORE_APPLY_MS = 90 * 1000;
+const AUTO_APPLY_POLL_MS = 60 * 1000;
+
+let lastInteractionAt = Date.now();
+let automationInstalled = false;
+
+// The bundle downloaded and waiting, or null. Cheap enough to poll.
+async function getStagedBundle() {
+  const { plugin: updater } = await loadUpdaterBox();
+  if (!updater?.getNextBundle) return null;
+  try {
+    return await withTimeout(updater.getNextBundle(), 5000, 'updater.getNextBundle()');
+  } catch {
+    return null;
+  }
+}
+
+// Apply the staged bundle if — and only if — it is safe to reload right now.
+// Returns { status } describing what it decided, so callers can log the reason.
+export async function applyStagedUpdateIfSafe({ requireIdle = true } = {}) {
+  if (!Capacitor.isNativePlatform?.()) return { status: 'skipped' };
+
+  // Rule 1. A guard on duty is never interrupted, however long the bundle waits.
+  if (getShiftSession()) return { status: 'deferred', reason: 'shift_running' };
+
+  // Rule 2.
+  if (requireIdle && Date.now() - lastInteractionAt < IDLE_BEFORE_APPLY_MS) {
+    return { status: 'deferred', reason: 'in_use' };
+  }
+
+  const staged = await getStagedBundle();
+  if (!staged?.id) return { status: 'nothing_staged' };
+
+  const { plugin: updater } = await loadUpdaterBox();
+  if (!updater) return { status: 'skipped' };
+
+  try {
+    console.info('[LiveUpdate] applying staged bundle', staged.version || staged.id);
+    // Terminal: destroys the JS context and reloads into the new bundle.
+    await updater.set({ id: staged.id });
+    return { status: 'applied', version: staged.version };
+  } catch (err) {
+    console.warn('[LiveUpdate] could not apply staged bundle:', err?.message || err);
+    return { status: 'error', error: err?.message || String(err) };
+  }
+}
+
+// Everything the app needs to keep itself current: check on launch, on resume and
+// on a timer, and apply what has been downloaded as soon as the device is free.
+// Call once from bootstrap.
+export function installLiveUpdateAutomation({ periodicCheckMs = 30 * 60 * 1000 } = {}) {
+  if (automationInstalled || !Capacitor.isNativePlatform?.()) return;
+  automationInstalled = true;
+
+  const touch = () => { lastInteractionAt = Date.now(); };
+  ['pointerdown', 'keydown', 'touchstart', 'wheel'].forEach((event) => {
+    window.addEventListener(event, touch, { passive: true, capture: true });
+  });
+
+  const check = () => runOtaUpdate()
+    .then((result) => {
+      if (result?.status === 'staged') console.info('[LiveUpdate] update staged:', result.version);
+    })
+    .catch(() => { /* handled inside runOtaUpdate */ });
+
+  check();
+
+  import('@capacitor/app').then(({ App }) => {
+    App.addListener('appStateChange', ({ isActive }) => {
+      if (!isActive) return;
+      touch();
+      check();
+      // Coming back from the background is the cleanest moment there is: nothing is
+      // half-typed, so the idle requirement does not apply.
+      applyStagedUpdateIfSafe({ requireIdle: false }).catch(() => null);
+    });
+  }).catch(() => { /* @capacitor/app unavailable */ });
+
+  // Kiosked devices can stay foregrounded for days and never fire a resume event, so
+  // poll for both halves: is there anything new, and is it safe to install it yet.
+  setInterval(check, periodicCheckMs);
+  setInterval(() => {
+    applyStagedUpdateIfSafe().catch(() => null);
+  }, AUTO_APPLY_POLL_MS);
 }

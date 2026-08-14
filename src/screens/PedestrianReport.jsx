@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import jsPDF from 'jspdf';
 import 'jspdf-autotable';
-import ReportEmailPanel from '../components/ReportEmailPanel';
+import { ShareButton } from '../components/ReportKit';
 import { buildDatedReportFileName, exportPdfDocument, getSiteDisplayName } from '../lib/reportUtils';
-import { NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
+import { useLiveRefresh } from '../hooks/useLiveRefresh';
 import { getCachedPedestrians } from '../lib/deviceStore';
 import { getPedestrianReport } from '../services/api';
 import { logApiError, logApiAttempt, logApiSuccess, logOfflineUsage } from '../lib/apiErrorLogger';
@@ -23,18 +23,9 @@ export default function PedestrianReport() {
     loadData();
   }, []);
 
-  useEffect(() => {
-    const handleOnline = () => {
-      console.log('[PedestrianReport] Coming online - reloading pedestrian report from server');
-      loadData();
-    };
-    window.addEventListener('online', handleOnline);
-    window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
-    };
-  }, []);
+  // Silently — a refresh that re-raises `loading` swaps the whole report for "Loading…", which is
+  // the flicker the other list screens had. See useLiveRefresh.
+  useLiveRefresh(() => loadData({ silent: true }));
 
   const getCachedPedestrianRows = () => getCachedPedestrians().map((person) => ({
     id: person.id,
@@ -57,8 +48,8 @@ export default function PedestrianReport() {
     return [...cachedOnlyRows, ...(serverRows || [])];
   };
 
-  const loadData = async () => {
-    setLoading(true);
+  const loadData = async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
     setError('');
     let pedestrians = [];
     let source = 'offline-cache';
@@ -169,17 +160,17 @@ export default function PedestrianReport() {
     return doc;
   };
 
-  const handleExportPDF = async (shareOptions = {}) => {
+  const handleSharePDF = async () => {
     setExporting(true);
     setError('');
     try {
       await exportPdfDocument(buildPdfDocument(), buildDatedReportFileName('PedestrianReport'), {
-        shareTitle: 'Pedestrian Report',
-        shareText: 'NightGuard pedestrian report PDF.',
-        ...shareOptions,
+        preferShare: true,
+        shareTitle: `Pedestrian Report — ${getSiteDisplayName()}`,
+        shareText: 'NightGuard pedestrian report.',
       });
     } catch (err) {
-      setError(err.message || 'Failed to export PDF');
+      setError(err.message || 'Failed to share the PDF');
     } finally {
       setExporting(false);
     }
@@ -187,34 +178,9 @@ export default function PedestrianReport() {
 
   return (
     <div style={{ padding: 20, background: '#000', minHeight: '100vh', color: '#fff' }}>
-      <ReportEmailPanel
-        reportKey="pedestrian-report"
-        reportLabel="Pedestrian Report"
-        onShareReport={({ recipients, subject, body, senderEmail }) => handleExportPDF({
-          preferShare: true,
-          shareTitle: subject,
-          shareText: `${body}\n\nRecipients: ${recipients}\nSender account: ${senderEmail}`,
-        })}
-      />
-
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
         <h1 style={{ margin: 0, fontSize: 18 }}>Pedestrian Report</h1>
-        <button
-          onClick={() => handleExportPDF()}
-          disabled={filtered.length === 0 || exporting}
-          style={{
-            padding: '8px 16px',
-            background: filtered.length === 0 || exporting ? '#444' : '#dc2626',
-            color: '#fff',
-            border: 'none',
-            borderRadius: 8,
-            fontSize: 13,
-            fontWeight: 600,
-            cursor: filtered.length === 0 || exporting ? 'not-allowed' : 'pointer',
-          }}
-        >
-          {exporting ? 'Preparing PDF...' : 'Export PDF'}
-        </button>
+        <ShareButton onClick={handleSharePDF} disabled={filtered.length === 0} busy={exporting} />
       </div>
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>

@@ -13,8 +13,6 @@ import {
   getPatrolConfig,
   getPendingSchemaSync,
   getNfcScans,
-  getReportEmailSetting,
-  getReportEmailSettings,
   markPendingSchemaSync,
   saveLastSyncAt,
   saveCachedGuards,
@@ -25,7 +23,6 @@ import {
   saveLookupData,
   savePatrolConfig,
   saveQuickSwitchEnabled,
-  saveReportEmailSettings,
 } from '../lib/deviceStore';
 import { setCachedIncidents, setCachedObEntries } from '../lib/reportCache';
 import { isValidCoordinate } from '../lib/geo';
@@ -59,14 +56,6 @@ function shouldFallbackToLocal(error) {
 
 function markPendingAndReturn(key, value) {
   markPendingSchemaSync(key, true);
-  return { ...value, _offline: true };
-}
-
-function markPendingReportSchedule(reportType, value) {
-  markPendingSchemaSync('reportSchedules', {
-    ...(getPendingSchemaSync().reportSchedules || {}),
-    [reportType]: true,
-  });
   return { ...value, _offline: true };
 }
 
@@ -173,20 +162,6 @@ function validatePatrolConfig(localConfig = {}) {
     }
     if (!Number(checkpoint.checkpoint_order || index + 1)) throw new Error(`Checkpoint ${index + 1}: order is required.`);
   });
-}
-
-function buildReportSchedulePayload(siteId, reportType, settings) {
-  return {
-    site_id: siteId,
-    report_type: reportType,
-    send_time_utc: settings.time || '06:00',
-    subject_line: settings.subject || '',
-    recipient_emails: String(settings.recipients || '')
-      .split(',')
-      .map((value) => value.trim())
-      .filter(Boolean),
-    is_active: settings.enabled !== false,
-  };
 }
 
 async function writeCache(key, value) {
@@ -328,7 +303,7 @@ export async function saveSiteLookupData(localData, siteSettings = getCachedSite
 
   // site_lookup_data has PK `id` and no unique constraint on `site_id`, so upsert(onConflict:
   // 'site_id') fails with Postgres 42P10. Select the existing row then update by id, else insert
-  // — matching saveDeviceConfiguration / saveReportSchedule below.
+  // — matching saveDeviceConfiguration below.
   const { data: existingRows, error: selectError } = await supabase
     .from('site_lookup_data')
     .select('id')
@@ -740,109 +715,6 @@ export async function saveDeviceConfiguration(localSettings, siteSettings = getC
   return localSettings;
 }
 
-export async function loadReportSchedules(siteSettings = getCachedSiteSettings()) {
-  const siteId = getSiteId(siteSettings);
-  if (!siteId || !navigator.onLine) {
-    return getReportEmailSettings();
-  }
-
-  const { data, error } = await supabase
-    .from('report_schedules')
-    .select('*')
-    .eq('site_id', siteId);
-
-  if (error) {
-    if (shouldFallbackToLocal(error)) {
-      return getReportEmailSettings();
-    }
-    throw new Error(error.message);
-  }
-
-  const mapped = (data || []).reduce((acc, row) => {
-    acc[row.report_type] = {
-      enabled: row.is_active !== false,
-      time: row.send_time_utc || '06:00',
-      subject: row.subject_line || '',
-      recipients: Array.isArray(row.recipient_emails) ? row.recipient_emails.join(', ') : '',
-    };
-    return acc;
-  }, {});
-
-  saveReportEmailSettings({
-    ...getReportEmailSettings(),
-    ...mapped,
-  });
-
-  return getReportEmailSettings();
-}
-
-export async function saveReportSchedule(reportType, settings, siteSettings = getCachedSiteSettings()) {
-  const siteId = getSiteId(siteSettings);
-  const localSchedules = {
-    ...getReportEmailSettings(),
-    [reportType]: settings,
-  };
-
-  saveReportEmailSettings(localSchedules);
-
-  if (!siteId || !navigator.onLine) {
-    markPendingSchemaSync('reportSchedules', {
-      ...(getPendingSchemaSync().reportSchedules || {}),
-      [reportType]: true,
-    });
-    return { ...settings, _offline: true };
-  }
-
-  const { data: existingRows, error: existingError } = await supabase
-    .from('report_schedules')
-    .select('*')
-    .eq('site_id', siteId)
-    .eq('report_type', reportType);
-
-  if (existingError) {
-    if (shouldFallbackToLocal(existingError)) {
-      return markPendingReportSchedule(reportType, settings);
-    }
-    markPendingSchemaSync('reportSchedules', {
-      ...(getPendingSchemaSync().reportSchedules || {}),
-      [reportType]: true,
-    });
-    throw new Error(existingError.message);
-  }
-
-  const existing = existingRows?.[0] || null;
-  const payload = {
-    ...(existing?.id ? { id: existing.id } : {}),
-    ...buildReportSchedulePayload(siteId, reportType, settings),
-  };
-
-  const query = existing?.id
-    ? supabase.from('report_schedules').update(payload).eq('id', existing.id)
-    : supabase.from('report_schedules').insert(payload);
-
-  const { error } = await query;
-  if (error) {
-    if (shouldFallbackToLocal(error)) {
-      return markPendingReportSchedule(reportType, settings);
-    }
-    markPendingSchemaSync('reportSchedules', {
-      ...(getPendingSchemaSync().reportSchedules || {}),
-      [reportType]: true,
-    });
-    throw new Error(error.message);
-  }
-
-  const pending = { ...(getPendingSchemaSync().reportSchedules || {}) };
-  delete pending[reportType];
-  if (Object.keys(pending).length) {
-    markPendingSchemaSync('reportSchedules', pending);
-  } else {
-    clearPendingSchemaSync('reportSchedules');
-  }
-
-  return settings;
-}
-
 export async function syncPendingSchemaData(siteSettings = getCachedSiteSettings()) {
   if (!navigator.onLine) {
     return { syncedCount: 0 };
@@ -879,16 +751,11 @@ export async function syncPendingSchemaData(siteSettings = getCachedSiteSettings
     }
   }
 
-  if (pending.reportSchedules && typeof pending.reportSchedules === 'object') {
-    const reportTypes = Object.keys(pending.reportSchedules);
-    for (const reportType of reportTypes) {
-      try {
-        const result = await saveReportSchedule(reportType, getReportEmailSetting(reportType), siteSettings);
-        if (!result?._offline) syncedCount += 1;
-      } catch {
-        // Leave pending state in place and continue.
-      }
-    }
+  // A device upgrading from a build that still had the report-email screen can carry a
+  // `reportSchedules` pending marker for a table nothing writes any more. Clear it so
+  // the sync does not stay permanently "pending" against work that no longer exists.
+  if (pending.reportSchedules) {
+    clearPendingSchemaSync('reportSchedules');
   }
 
   if (syncedCount > 0) {
@@ -964,7 +831,6 @@ export async function refreshOperationalCachesFromDatabase(siteSettings = getCac
     loadSiteLookupData(siteSettings),
     loadPatrolConfiguration(siteSettings),
     loadDeviceConfiguration(siteSettings),
-    loadReportSchedules(siteSettings),
   ]);
 
   const completedAt = new Date().toISOString();

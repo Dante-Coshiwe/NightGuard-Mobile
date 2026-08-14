@@ -1,654 +1,559 @@
-import React, { useState, useEffect } from 'react';
-import api from '../services/api';
-import { useAuth } from '../contexts/AuthContext';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import jsPDF from 'jspdf';
 import 'jspdf-autotable';
+import api from '../services/api';
+import { useAuth } from '../contexts/AuthContext';
 import { getCachedPatrols, getNfcScans, getPatrolConfig } from '../lib/deviceStore';
-import ReportEmailPanel from '../components/ReportEmailPanel';
 import CheckpointMap from '../components/CheckpointMap';
+import {
+  BarList,
+  DataFreshness,
+  DateRangeFilter,
+  EmptyState,
+  KpiRow,
+  Meter,
+  Panel,
+  ReportHeader,
+  ShareButton,
+  StatTile,
+  StatusPill,
+} from '../components/ReportKit';
+import { REPORT_COLORS, reportPageStyle } from '../lib/reportTheme';
 import { NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
 import { buildDatedReportFileName, exportPdfDocument, getSiteDisplayName } from '../lib/reportUtils';
 import { logApiError, logApiAttempt, logOfflineUsage } from '../lib/apiErrorLogger';
 
+// ============================================================================
+//  Guard Patrol Dashboard.
+//
+//  What was wrong with the numbers here, and what replaced them:
+//
+//  * "Scanned checkpoints 100%" and "Missed checkpoints 0%" on every device, always.
+//    Both were computed over the SCAN list — and a scan row exists precisely because
+//    somebody scanned, so `scanned` was the whole list and `missed` was `length -
+//    length`. The denominator has to be the points the site actually configured, and
+//    the numerator the distinct ones reached. That is what "Checkpoint coverage" is now.
+//
+//  * Four donuts carrying two facts. "Acknowledged" and "Missing" are complements —
+//    the second chart is 100 minus the first and adds nothing — and the same for the
+//    checkpoint pair. Two meters now carry both, and the space went to the thing that
+//    was missing: WHICH points were missed.
+//
+//  * The guard table counted each guard twice. Patrols were keyed on `guard_id` and
+//    scans on `scanned_by`, two different id spaces, so one person became two rows —
+//    one with patrols and no scans, one with scans and no patrols. Keyed on name now.
+//
+//  * The admin "My patrols / All guards" selector did nothing: loadData ignored it
+//    and `/patrols/summary` is site-wide either way. Removed rather than left as a
+//    control that changes nothing.
+// ============================================================================
+
+// A scan names its checkpoint by id when the point came from the server and by name
+// when it came from the local patrol config (`cp-1`, `cp-2`…). Match on either.
+function checkpointKeys(point, index) {
+  return {
+    id: String(point.id ?? `idx-${index}`),
+    name: String(point.name || point.checkpoint_name || '').trim().toLowerCase(),
+  };
+}
+
+function scanMatchesPoint(scan, keys) {
+  if (scan.checkpoint_id && String(scan.checkpoint_id) === keys.id) return true;
+  const scanName = String(scan.checkpoint_name || scan.point_name || '').trim().toLowerCase();
+  return Boolean(keys.name) && scanName === keys.name;
+}
+
+// No setState in here on purpose — see the effect below.
+async function fetchPatrolDataSafely() {
+  const loadedAt = new Date().toISOString();
+  let usedCache = false;
+
+  logApiAttempt('GuardPatrolReport', 'GET', '/patrols/summary');
+  logApiAttempt('GuardPatrolReport', 'GET', '/nfc/scans');
+
+  const [summary, scanRows] = await Promise.all([
+    api.get('/patrols/summary').then((res) => res.data).catch((err) => {
+      logApiError(navigator.onLine, err, 'GuardPatrolReport-summary');
+      usedCache = true;
+      return getCachedPatrols();
+    }),
+    api.get('/nfc/scans').then((res) => res.data).catch((err) => {
+      logApiError(navigator.onLine, err, 'GuardPatrolReport-scans');
+      usedCache = true;
+      return getNfcScans();
+    }),
+  ]);
+
+  if (usedCache) logOfflineUsage('GuardPatrolReport', 'device cache');
+
+  return {
+    patrols: Array.isArray(summary) ? summary : [],
+    scans: Array.isArray(scanRows) ? scanRows : [],
+    fromCache: usedCache || !navigator.onLine,
+    // Falling back offline is normal and gets no error text; falling back while
+    // online means something is actually wrong and is worth saying out loud.
+    error: usedCache && navigator.onLine
+      ? 'Could not reach the server — showing patrol data saved on this device.'
+      : '',
+    loadedAt,
+  };
+}
+
 export default function GuardPatrolDashboard() {
   const { user } = useAuth();
   const [patrols, setPatrols] = useState([]);
-  const [checkpoints, setCheckpoints] = useState([]);
+  const [scans, setScans] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [servedFromCache, setServedFromCache] = useState(false);
+  const [loadedAt, setLoadedAt] = useState(null);
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
-  const [viewMode, setViewMode] = useState('own'); // 'own' or 'all' (for admin)
   const [exporting, setExporting] = useState(false);
 
-  useEffect(() => { loadData(); }, [viewMode]);
-
-  useEffect(() => { loadData(); }, []);
-
+  // One effect, one load. There used to be two — one keyed on the (unused) view mode
+  // and one on mount — so every visit ran the whole fetch twice.
   useEffect(() => {
-    const handleOnline = () => {
-      console.log('[GuardPatrolReport] Coming online - reloading patrol data from server');
-      loadData();
+    let active = true;
+
+    const run = async () => {
+      const result = await fetchPatrolDataSafely();
+      if (!active) return;
+      setPatrols(result.patrols);
+      setScans(result.scans);
+      setServedFromCache(result.fromCache);
+      setError(result.error);
+      setLoadedAt(result.loadedAt);
+      setLoading(false);
     };
-    window.addEventListener('nightguard_sync_complete', handleOnline);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
+
+    run();
+    window.addEventListener('nightguard_sync_complete', run);
+    window.addEventListener('online', run);
+    window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, run);
     return () => {
-      window.removeEventListener('nightguard_sync_complete', handleOnline);
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
+      active = false;
+      window.removeEventListener('nightguard_sync_complete', run);
+      window.removeEventListener('online', run);
+      window.removeEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, run);
     };
   }, []);
 
-  const loadData = async () => {
-    setLoading(true);
-    setError('');
-    try {
-      logApiAttempt('GuardPatrolReport', 'GET', '/patrols/summary');
-      logApiAttempt('GuardPatrolReport', 'GET', '/nfc/scans');
-      
-      const [summary, scans] = await Promise.all([
-        api.get('/patrols/summary').then(res => res.data).catch((err) => {
-          logApiError(navigator.onLine, err, 'GuardPatrolReport-summary');
-          // Fall back to what the device holds — a failed refresh must not blank the report.
-          return getCachedPatrols();
-        }),
-        api.get('/nfc/scans').then(res => res.data).catch((err) => {
-          logApiError(navigator.onLine, err, 'GuardPatrolReport-scans');
-          return getNfcScans();
-        }),
-      ]);
-      
-      setPatrols(summary?.length ? summary : getCachedPatrols());
-      setCheckpoints((scans || []).map(scan => ({
-        ...scan,
-        scanned: scan.scanned !== false,
-        status: scan.status || 'scanned',
-        checkpoint_name: scan.checkpoint_name || scan.point_name,
-        guard_name: scan.guard_name || scan.full_name,
-      })));
-      
-      if (!summary?.length) {
-        logOfflineUsage('GuardPatrolReport', 'local NFC scans');
-      }
-    } catch (err) {
-      logApiError(navigator.onLine, err, 'GuardPatrolReport');
-      setPatrols(getCachedPatrols());
-      setCheckpoints(getNfcScans());
-      console.warn('[GuardPatrolReport] Using cached NFC scans from device');
-      setError('Showing saved patrol scans from this device');
-    } finally {
-      setLoading(false);
-    }
-  };
+  const patrolConfig = useMemo(() => getPatrolConfig(), []);
+  const configuredPoints = useMemo(() => (
+    (patrolConfig.checkpoints || []).filter((point) => String(point?.name || '').trim())
+  ), [patrolConfig]);
 
-  // Filter by date range
-  const filterByDate = (items) => {
-    if (!dateFrom && !dateTo) return items;
-    return items.filter(item => {
-      const itemDate = new Date(item.date || item.created_at || item.actual_start || item.scanned_at);
-      const fromMatch = dateFrom ? itemDate >= new Date(dateFrom) : true;
-      const toMatch = dateTo ? itemDate <= new Date(dateTo + 'T23:59:59') : true;
-      return fromMatch && toMatch;
-    });
-  };
+  const withinPeriod = useCallback((value) => {
+    const time = new Date(value || 0).getTime();
+    if (!Number.isFinite(time) || !time) return false;
+    if (dateFrom && time < new Date(dateFrom).getTime()) return false;
+    if (dateTo && time > new Date(`${dateTo}T23:59:59`).getTime()) return false;
+    return true;
+  }, [dateFrom, dateTo]);
 
-  const filteredPatrols = filterByDate(patrols);
-  const filteredCheckpoints = filterByDate(checkpoints);
+  const filteredPatrols = useMemo(
+    () => patrols.filter((patrol) => withinPeriod(patrol.actual_start || patrol.created_at)),
+    [patrols, withinPeriod],
+  );
+  const filteredScans = useMemo(
+    () => scans
+      .filter((scan) => withinPeriod(scan.scanned_at || scan.created_at))
+      .sort((a, b) => new Date(b.scanned_at || b.created_at || 0) - new Date(a.scanned_at || a.created_at || 0)),
+    [scans, withinPeriod],
+  );
 
-  // Calculate stats per guard
-  const guardStats = React.useMemo(() => {
-    const stats = {};
+  // Per configured point: how many times it was reached in the period. A point with
+  // zero visits is the finding — it is the one thing this page exists to surface.
+  const pointStats = useMemo(() => configuredPoints.map((point, index) => {
+    const keys = checkpointKeys(point, index);
+    const hits = filteredScans.filter((scan) => scanMatchesPoint(scan, keys));
+    const lastHit = hits[0]?.scanned_at || hits[0]?.created_at || null;
+    return {
+      id: keys.id,
+      name: point.name || point.checkpoint_name || `Point ${index + 1}`,
+      zone: point.zone || '',
+      visits: hits.length,
+      lastHit,
+    };
+  }).sort((a, b) => a.visits - b.visits), [configuredPoints, filteredScans]);
 
-    filteredPatrols.forEach(p => {
-      const guardId = p.guard_id || p.guard_name || 'Unknown';
-      if (!stats[guardId]) {
-        stats[guardId] = {
-          guardId,
-          guardName: p.guard_name || p.profiles?.full_name || 'Unknown',
-          total: 0,
-          acknowledged: 0,
-          missing: 0,
-          scanned: 0,
-          missed: 0
-        };
-      }
-      stats[guardId].total++;
-      if (p.acknowledged || p.status === 'completed') {
-        stats[guardId].acknowledged++;
-      } else {
-        stats[guardId].missing++;
-      }
-    });
+  const pointsReached = pointStats.filter((point) => point.visits > 0);
+  const pointsMissed = pointStats.filter((point) => point.visits === 0);
+  const coveragePercent = configuredPoints.length
+    ? Math.round((pointsReached.length / configuredPoints.length) * 100)
+    : null;
 
-    filteredCheckpoints.forEach(c => {
-      const guardId = c.scanned_by || c.guard_id || c.guard_name || 'Unknown';
-      if (!stats[guardId]) {
-        stats[guardId] = {
-          guardId,
-          guardName: c.guard_name || c.profiles?.full_name || 'Unknown',
-          total: 0,
-          acknowledged: 0,
-          missing: 0,
-          scanned: 0,
-          missed: 0
-        };
+  const patrolsCompleted = filteredPatrols.filter(
+    (patrol) => patrol.status === 'completed' || patrol.acknowledged,
+  ).length;
+  const completionPercent = filteredPatrols.length
+    ? Math.round((patrolsCompleted / filteredPatrols.length) * 100)
+    : null;
+
+  // Adherence needs a real denominator: the site's schedule × days covered. Without
+  // a schedule there is nothing to be adherent to, so it says so rather than inventing one.
+  const scheduleAdherence = useMemo(() => {
+    const perDay = (patrolConfig.patrolTimes || []).length;
+    if (!perDay || !filteredPatrols.length) return null;
+    const stamps = filteredPatrols.map((patrol) => new Date(patrol.actual_start || patrol.created_at).getTime());
+    const spanDays = Math.max(1, Math.ceil((Math.max(...stamps) - Math.min(...stamps)) / 86400000) || 1);
+    const expected = perDay * spanDays;
+    return {
+      expected,
+      perDay,
+      spanDays,
+      percent: Math.min(100, Math.round((filteredPatrols.length / expected) * 100)),
+    };
+  }, [patrolConfig.patrolTimes, filteredPatrols]);
+
+  // One row per guard, keyed on the NAME so patrols and scans land on the same person.
+  const guardStats = useMemo(() => {
+    const stats = new Map();
+    const ensure = (name) => {
+      const key = name || 'Unassigned guard';
+      if (!stats.has(key)) {
+        stats.set(key, { guardName: key, patrols: 0, completed: 0, scans: 0, points: new Set() });
       }
-      if (c.scanned || c.status === 'scanned') {
-        stats[guardId].scanned++;
-      } else {
-        stats[guardId].missed++;
-      }
+      return stats.get(key);
+    };
+
+    filteredPatrols.forEach((patrol) => {
+      const entry = ensure(patrol.guard_name || patrol.profiles?.full_name);
+      entry.patrols += 1;
+      if (patrol.status === 'completed' || patrol.acknowledged) entry.completed += 1;
     });
 
-    return Object.values(stats);
-  }, [filteredPatrols, filteredCheckpoints]);
+    filteredScans.forEach((scan) => {
+      const entry = ensure(scan.guard_name || scan.profiles?.full_name);
+      entry.scans += 1;
+      const label = String(scan.checkpoint_name || scan.point_name || scan.checkpoint_id || '').trim().toLowerCase();
+      if (label) entry.points.add(label);
+    });
 
-  // Overall stats
-  const totalPatrols = filteredPatrols.length;
-  const acknowledged = filteredPatrols.filter(p => p.acknowledged || p.status === 'completed').length;
-  const missing = totalPatrols - acknowledged;
-  const ackPercent = totalPatrols ? Math.round((acknowledged / totalPatrols) * 100) : 0;
-  const missPercent = totalPatrols ? Math.round((missing / totalPatrols) * 100) : 0;
+    return [...stats.values()]
+      .map((entry) => ({ ...entry, distinctPoints: entry.points.size }))
+      .sort((a, b) => (b.patrols + b.scans) - (a.patrols + a.scans));
+  }, [filteredPatrols, filteredScans]);
 
-  const totalCheckpoints = filteredCheckpoints.length;
-  const scanned = filteredCheckpoints.filter(c => c.scanned || c.status === 'scanned').length;
-  const missed = totalCheckpoints - scanned;
-  const scanPercent = totalCheckpoints ? Math.round((scanned / totalCheckpoints) * 100) : 0;
-  const missedPercent = totalCheckpoints ? Math.round((missed / totalCheckpoints) * 100) : 0;
-  const lastScan = filteredCheckpoints[0] || null;
-  const activeGuards = guardStats.filter((guard) => guard.total || guard.scanned).length;
-  const queuedScans = filteredCheckpoints.filter((checkpoint) => checkpoint.offline || checkpoint._offline).length;
-  const patrolCheckpoints = getPatrolConfig().checkpoints || [];
+  const queuedScans = filteredScans.filter((scan) => scan.offline || scan._offline).length;
+  const nfcScanCount = filteredScans.filter((scan) => scan.method !== 'gps').length;
+  const latestScan = filteredScans[0] || null;
+  const periodLabel = dateFrom || dateTo ? `${dateFrom || 'start'} to ${dateTo || 'today'}` : 'All time';
+  const reachedIds = useMemo(() => pointsReached.map((point) => point.id), [pointsReached]);
 
-  // Donut Chart Component
-  const DonutChart = ({ percentage, color, label, count, total, sublabel }) => {
-    const size = 140;
-    const strokeWidth = 12;
-    const radius = (size - strokeWidth) / 2;
-    const circumference = radius * 2 * Math.PI;
-    const offset = circumference - (percentage / 100) * circumference;
-
-    return (
-      <div style={{
-        display: 'flex',
-        flexDirection: 'column',
-        alignItems: 'center',
-        background: '#0a0a0a',
-        border: '1px solid #1f1f1f',
-        borderRadius: 12,
-        padding: '20px',
-        minWidth: 160,
-        flex: 1
-      }}>
-        <div style={{ position: 'relative', width: size, height: size, marginBottom: 12 }}>
-          <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>
-            <circle
-              cx={size / 2}
-              cy={size / 2}
-              r={radius}
-              fill="none"
-              stroke="#2a2a2a"
-              strokeWidth={strokeWidth}
-            />
-            <circle
-              cx={size / 2}
-              cy={size / 2}
-              r={radius}
-              fill="none"
-              stroke={color}
-              strokeWidth={strokeWidth}
-              strokeDasharray={circumference}
-              strokeDashoffset={offset}
-              strokeLinecap="round"
-              style={{ transition: 'stroke-dashoffset 0.6s ease' }}
-            />
-          </svg>
-          <div style={{
-            position: 'absolute',
-            top: '50%',
-            left: '50%',
-            transform: 'translate(-50%, -50%)',
-            textAlign: 'center'
-          }}>
-            <div style={{ fontSize: 28, fontWeight: 800, color: color }}>{percentage}%</div>
-            <div style={{ fontSize: 11, color: '#666' }}>{count}/{total}</div>
-          </div>
-        </div>
-        <span style={{ fontSize: 13, color: '#aaa', fontWeight: 600 }}>{label}</span>
-        {sublabel && <span style={{ fontSize: 11, color: '#666', marginTop: 4 }}>{sublabel}</span>}
-      </div>
-    );
-  };
-
-  const handleExportPDF = async (shareOptions = {}) => {
+  const handleSharePDF = async () => {
     setExporting(true);
     setError('');
     const doc = new jsPDF({ orientation: 'landscape' });
     const siteName = getSiteDisplayName();
 
-    doc.setFontSize(16);
-    doc.text(`Guard Patrol Dashboard - ${siteName}`, 14, 20);
-
-    doc.setFontSize(10);
+    doc.setFontSize(15);
+    doc.text(`Guard Patrol Report — ${siteName}`, 14, 16);
+    doc.setFontSize(9);
     doc.setTextColor(100);
-    const dateText = dateFrom || dateTo
-      ? `Period: ${dateFrom || 'All'} to ${dateTo || 'All'}`
-      : `Exported: ${new Date().toLocaleString()}`;
-    doc.text(dateText, 14, 28);
-    doc.text(`Generated by: ${user?.name || user?.username || 'Unknown'}`, 14, 34);
+    doc.text(`Period: ${periodLabel}   |   Exported: ${new Date().toLocaleString()}   |   By: ${user?.name || user?.username || 'Unknown'}`, 14, 22);
+    doc.text([
+      `Checkpoint coverage: ${coveragePercent === null ? 'no points configured' : `${coveragePercent}% (${pointsReached.length} of ${configuredPoints.length} points reached)`}`,
+      `Patrols: ${patrolsCompleted} completed of ${filteredPatrols.length} started   ·   Check-ins recorded: ${filteredScans.length}`,
+      pointsMissed.length
+        ? `Points never reached in this period: ${pointsMissed.map((point) => point.name).join(', ')}`
+        : 'Every configured checkpoint was reached at least once.',
+    ], 14, 28);
 
-    // Stats summary
-    doc.setFontSize(12);
-    doc.setTextColor(0);
-    doc.text('Patrol Statistics', 14, 45);
-    doc.setFontSize(10);
-    doc.text(`Acknowledged: ${acknowledged} (${ackPercent}%) | Missing: ${missing} (${missPercent}%)`, 14, 52);
-    doc.text(`Scanned Points: ${scanned} (${scanPercent}%) | Missed Points: ${missed} (${missedPercent}%)`, 14, 58);
+    doc.autoTable({
+      head: [['Checkpoint', 'Zone', 'Visits', 'Last reached']],
+      body: pointStats.map((point) => [
+        point.name,
+        point.zone || '-',
+        point.visits,
+        point.lastHit ? new Date(point.lastHit).toLocaleString() : 'Never in this period',
+      ]),
+      startY: 46,
+      styles: { fontSize: 9, cellPadding: 3 },
+      headStyles: { fillColor: [59, 130, 246], textColor: 255, fontStyle: 'bold' },
+      alternateRowStyles: { fillColor: [245, 245, 245] },
+    });
 
-    // Guard summary table
     if (guardStats.length > 0) {
       doc.autoTable({
-        head: [['Guard', 'Patrols Total', 'Acknowledged', 'Missing', 'Points Scanned', 'Points Missed']],
-        body: guardStats.map(g => [
-          g.guardName,
-          g.total,
-          g.acknowledged,
-          g.missing,
-          g.scanned,
-          g.missed
+        head: [['Guard', 'Patrols started', 'Patrols completed', 'Check-ins', 'Distinct points']],
+        body: guardStats.map((guard) => [
+          guard.guardName, guard.patrols, guard.completed, guard.scans, guard.distinctPoints,
         ]),
-        startY: 65,
+        startY: doc.lastAutoTable.finalY + 10,
         styles: { fontSize: 9, cellPadding: 3 },
         headStyles: { fillColor: [220, 38, 38], textColor: 255, fontStyle: 'bold' },
         alternateRowStyles: { fillColor: [245, 245, 245] },
       });
     }
 
-    // Detailed patrols
-    if (filteredPatrols.length > 0) {
-      const finalY = doc.lastAutoTable ? doc.lastAutoTable.finalY + 10 : 75;
-      if (finalY > 160) doc.addPage();
-
+    if (filteredScans.length > 0) {
+      doc.addPage();
       doc.setFontSize(12);
-      doc.text('Detailed Patrol Log', 14, finalY > 160 ? 20 : finalY);
-
+      doc.setTextColor(0);
+      doc.text('Check-in log', 14, 18);
       doc.autoTable({
-        head: [['Guard', 'Date/Time', 'Patrol Name', 'Location', 'Status', 'Est. steps']],
-        body: filteredPatrols.map(p => [
-          p.guard_name || p.profiles?.full_name || '-',
-          new Date(p.actual_start || p.created_at).toLocaleString(),
-          p.patrol_name || '-',
-          'Site Patrol',
-          p.status || (p.acknowledged ? 'completed' : 'pending'),
-          p.steps_taken || 0
+        head: [['Date/Time', 'Checkpoint', 'Method', 'Guard', 'Position']],
+        body: filteredScans.slice(0, 400).map((scan) => [
+          new Date(scan.scanned_at || scan.created_at).toLocaleString(),
+          scan.checkpoint_name || scan.point_name || '-',
+          scan.method === 'gps' ? 'GPS' : 'NFC',
+          scan.guard_name || '-',
+          Number.isFinite(Number(scan.latitude))
+            ? `${Number(scan.latitude).toFixed(4)}, ${Number(scan.longitude).toFixed(4)}`
+            : '-',
         ]),
-        startY: finalY > 160 ? 25 : finalY + 5,
-        styles: { fontSize: 8, cellPadding: 3 },
-        headStyles: { fillColor: [34, 197, 94], textColor: 255, fontStyle: 'bold' },
-        alternateRowStyles: { fillColor: [245, 245, 245] },
-      });
-    }
-
-    // Checkpoints table
-    if (filteredCheckpoints.length > 0) {
-      const finalY = doc.lastAutoTable ? doc.lastAutoTable.finalY + 10 : 75;
-      if (finalY > 160) doc.addPage();
-
-      doc.setFontSize(12);
-      doc.text('Checkpoint Scan Log', 14, finalY > 160 ? 20 : finalY);
-
-      doc.autoTable({
-        head: [['Guard', 'Date/Time', 'Checkpoint', 'Location', 'Status', 'Scanned By']],
-        body: filteredCheckpoints.map(c => [
-          c.guard_name || c.profiles?.full_name || '-',
-          new Date(c.scanned_at || c.created_at).toLocaleString(),
-          c.checkpoint_name || c.pointId || '-',
-          `Lat: ${c.latitude?.toFixed(4) || '-'}, Lng: ${c.longitude?.toFixed(4) || '-'}`,
-          c.status || (c.scanned ? 'scanned' : 'pending'),
-          c.scanned_by ? 'Yes' : 'No'
-        ]),
-        startY: finalY > 160 ? 25 : finalY + 5,
-        styles: { fontSize: 8, cellPadding: 3 },
-        headStyles: { fillColor: [59, 130, 246], textColor: 255, fontStyle: 'bold' },
+        startY: 24,
+        styles: { fontSize: 8, cellPadding: 2.5 },
+        headStyles: { fillColor: [25, 158, 112], textColor: 255, fontStyle: 'bold' },
         alternateRowStyles: { fillColor: [245, 245, 245] },
       });
     }
 
     try {
-      await exportPdfDocument(doc, buildDatedReportFileName(`GuardPatrol-${user?.username || 'report'}`), {
-        shareTitle: 'Guard Patrol Report',
-        shareText: 'NightGuard guard patrol report PDF.',
-        ...shareOptions,
+      await exportPdfDocument(doc, buildDatedReportFileName('GuardPatrolReport'), {
+        preferShare: true,
+        shareTitle: `Guard Patrol Report — ${siteName}`,
+        shareText: `NightGuard patrol report, ${periodLabel}.`,
       });
     } catch (err) {
-      setError(err.message || 'Failed to export PDF');
+      setError(err.message || 'Failed to share the PDF');
     } finally {
       setExporting(false);
     }
   };
 
+  const hasAnything = filteredPatrols.length > 0 || filteredScans.length > 0;
+
   return (
-    <div style={{ padding: '20px', color: '#fff', background: '#000', minHeight: '100vh', boxSizing: 'border-box' }}>
-      <ReportEmailPanel
-        reportKey="guard-patrol-report"
-        reportLabel="Guard Patrol Report"
-        onShareReport={({ recipients, subject, body, senderEmail }) => handleExportPDF({
-          preferShare: true,
-          shareTitle: subject,
-          shareText: `${body}\n\nRecipients: ${recipients}\nSender account: ${senderEmail}`,
-        })}
+    <div style={reportPageStyle}>
+      <ReportHeader
+        title="Guard Patrol Dashboard"
+        purpose="Which checkpoints were actually reached, how many patrols were walked, and what is still waiting to upload."
+      >
+        <ShareButton onClick={handleSharePDF} disabled={!hasAnything} busy={exporting} />
+      </ReportHeader>
+
+      <DataFreshness
+        online={!servedFromCache}
+        generatedAt={loadedAt}
+        note={servedFromCache ? 'Reconnect to pull patrols walked on other devices' : null}
       />
 
-      {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
-        <div>
-          <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}> Guard Patrol Dashboard</h1>
-          <p style={{ margin: '4px 0 0 0', fontSize: 13, color: '#888' }}>
-            {user?.role === 'guard' ? `Viewing your patrol data only` : `Viewing ${viewMode === 'own' ? 'your' : 'all guards'} data`}
-          </p>
-        </div>
-        <div style={{ display: 'flex', gap: 10 }}>
-          {user?.role === 'admin' && (
-            <select
-              value={viewMode}
-              onChange={e => setViewMode(e.target.value)}
-              style={{
-                padding: '10px 14px',
-                background: '#111',
-                border: '1px solid #2a2a2a',
-                borderRadius: 8,
-                color: '#fff',
-                fontSize: 14,
-                cursor: 'pointer'
-              }}
-            >
-              <option value="own">My Patrols</option>
-              <option value="all">All Guards</option>
-            </select>
-          )}
-          <button
-            onClick={() => handleExportPDF()}
-            disabled={loading || exporting || (filteredPatrols.length === 0 && filteredCheckpoints.length === 0)}
-            style={{
-              padding: '10px 20px',
-              background: (loading || exporting || (filteredPatrols.length === 0 && filteredCheckpoints.length === 0)) ? '#444' : '#dc2626',
-              color: '#fff',
-              border: 'none',
-              borderRadius: 8,
-              fontSize: 14,
-              fontWeight: 600,
-              cursor: (loading || exporting || (filteredPatrols.length === 0 && filteredCheckpoints.length === 0)) ? 'not-allowed' : 'pointer'
-            }}
-          >
-            {exporting ? 'Preparing PDF...' : 'Export PDF'}
-          </button>
-        </div>
-      </div>
+      <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
 
-      {/* Filters */}
-      <div style={{ display: 'flex', gap: 10, marginBottom: 24, flexWrap: 'wrap', alignItems: 'center' }}>
-        <span style={{ color: '#666', fontSize: 13 }}>Filter by date:</span>
-        <input
-          type="date"
-          value={dateFrom}
-          onChange={e => setDateFrom(e.target.value)}
-          style={{ padding: '10px 14px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, color: '#fff', fontSize: 14 }}
-        />
-        <span style={{ color: '#666' }}>to</span>
-        <input
-          type="date"
-          value={dateTo}
-          onChange={e => setDateTo(e.target.value)}
-          style={{ padding: '10px 14px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, color: '#fff', fontSize: 14 }}
-        />
+      {error && <div style={{ color: REPORT_COLORS.warning, marginBottom: 12, fontSize: 13 }}>{error}</div>}
 
-        {(dateFrom || dateTo) && (
-          <button
-            onClick={() => { setDateFrom(''); setDateTo(''); }}
-            style={{
-              padding: '10px 16px',
-              background: '#1a1a1a',
-              border: '1px solid #333',
-              borderRadius: 8,
-              color: '#999',
-              fontSize: 13,
-              cursor: 'pointer',
-              fontWeight: 500
-            }}
-          >
-            Clear
-          </button>
-        )}
-      </div>
-
-      {error && <div style={{ color: '#ef4444', marginBottom: 16, fontSize: 14, padding: '10px 16px', background: '#450a0a', borderRadius: 8 }}>{error}</div>}
-
-      {!loading && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16, marginBottom: 24 }}>
-          {[
-            { label: 'Active Guards Seen', value: activeGuards || 0, hint: 'Guards with patrol or scan activity' },
-            { label: 'Latest Scan', value: lastScan ? new Date(lastScan.scanned_at || lastScan.created_at).toLocaleString() : 'No scans yet', hint: lastScan?.checkpoint_name || 'Waiting for patrol data' },
-            { label: 'Required Coverage', value: `${scanPercent}%`, hint: `${scanned} scanned of ${totalCheckpoints || 0} checkpoints` },
-            { label: 'Queued On Device', value: queuedScans, hint: 'Patrol scans waiting to sync' },
-          ].map((card) => (
-            <div key={card.label} style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: 18 }}>
-              <div style={{ color: '#888', fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8 }}>{card.label}</div>
-              <div style={{ color: '#fff', fontSize: 18, fontWeight: 700, marginBottom: 6 }}>{card.value}</div>
-              <div style={{ color: '#666', fontSize: 12 }}>{card.hint}</div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Checkpoint layout (GPS pins + NFC points) */}
-      {!loading && (
-        <div style={{ marginBottom: 28 }}>
-          <CheckpointMap checkpoints={patrolCheckpoints} scans={filteredCheckpoints} />
-        </div>
-      )}
-
-      {/* Patrol Times */}
-      {!loading && filteredCheckpoints.length > 0 && (
-        <div style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: 18, marginBottom: 28 }}>
-          <h2 style={{ fontSize: 15, margin: '0 0 12px' }}>Patrol Times</h2>
-          <div style={{ display: 'grid', gap: 8 }}>
-            {filteredCheckpoints.slice(0, 50).map((c, i) => (
-              <div key={c.id || i} style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', borderBottom: '1px solid #161616', paddingBottom: 6 }}>
-                <span style={{ color: '#d4d4d4', fontSize: 13 }}>
-                  {c.checkpoint_name || 'Checkpoint'} <span style={{ color: '#666' }}>· {c.method === 'gps' ? 'GPS' : 'NFC'}</span>
-                </span>
-                <span style={{ color: '#9ca3af', fontSize: 13 }}>
-                  {new Date(c.scanned_at || c.created_at).toLocaleString()} · {c.guard_name || 'Guard'}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Charts Grid */}
-      {!loading && (
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
-          gap: 20,
-          marginBottom: 32
-        }}>
-          <DonutChart
-            percentage={ackPercent}
-            color="#22c55e"
-            label="Acknowledged Patrols"
-            count={acknowledged}
-            total={totalPatrols}
-            sublabel={`${acknowledged} of ${totalPatrols} patrols`}
-          />
-          <DonutChart
-            percentage={missPercent}
-            color="#ef4444"
-            label="Missing Patrols"
-            count={missing}
-            total={totalPatrols}
-            sublabel={`${missing} of ${totalPatrols} patrols`}
-          />
-          <DonutChart
-            percentage={scanPercent}
-            color="#3b82f6"
-            label="Scanned Checkpoints"
-            count={scanned}
-            total={totalCheckpoints}
-            sublabel={`${scanned} of ${totalCheckpoints} points`}
-          />
-          <DonutChart
-            percentage={missedPercent}
-            color="#f59e0b"
-            label="Missed Checkpoints"
-            count={missed}
-            total={totalCheckpoints}
-            sublabel={`${missed} of ${totalCheckpoints} points`}
-          />
-        </div>
-      )}
-
-      {/* Guard Stats Summary (for admin view) */}
-      {user?.role === 'admin' && guardStats.length > 1 && !loading && (
-        <div style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: 20, marginBottom: 32 }}>
-          <h3 style={{ margin: '0 0 16px 0', fontSize: 16 }}> Guard Performance Summary</h3>
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-              <thead>
-                <tr style={{ borderBottom: '1px solid #2a2a2a' }}>
-                  <th style={{ padding: '10px', textAlign: 'left', color: '#888' }}>Guard</th>
-                  <th style={{ padding: '10px', textAlign: 'center', color: '#888' }}>Total Patrols</th>
-                  <th style={{ padding: '10px', textAlign: 'center', color: '#888' }}>Acknowledged</th>
-                  <th style={{ padding: '10px', textAlign: 'center', color: '#888' }}>Missing</th>
-                  <th style={{ padding: '10px', textAlign: 'center', color: '#888' }}>Points Scanned</th>
-                  <th style={{ padding: '10px', textAlign: 'center', color: '#888' }}>Points Missed</th>
-                </tr>
-              </thead>
-              <tbody>
-                {guardStats.map((g, idx) => (
-                  <tr key={idx} style={{ borderBottom: '1px solid #1a1a1a' }}>
-                    <td style={{ padding: '10px', fontWeight: 600 }}>{g.guardName}</td>
-                    <td style={{ padding: '10px', textAlign: 'center' }}>{g.total}</td>
-                    <td style={{ padding: '10px', textAlign: 'center', color: '#22c55e' }}>{g.acknowledged}</td>
-                    <td style={{ padding: '10px', textAlign: 'center', color: '#ef4444' }}>{g.missing}</td>
-                    <td style={{ padding: '10px', textAlign: 'center', color: '#3b82f6' }}>{g.scanned}</td>
-                    <td style={{ padding: '10px', textAlign: 'center', color: '#f59e0b' }}>{g.missed}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* Data Tables */}
       {loading ? (
-        <div style={{ textAlign: 'center', padding: 60, color: '#666' }}>Loading patrol data...</div>
+        <div style={{ textAlign: 'center', padding: 50, color: REPORT_COLORS.textMuted }}>Loading patrol data…</div>
       ) : (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
-          {/* Patrols List */}
-          <div style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: 20 }}>
-            <h3 style={{ margin: '0 0 16px 0', fontSize: 16, color: '#fff', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ color: '#22c55e' }}>?</span> Patrols ({filteredPatrols.length})
-            </h3>
-
-            {filteredPatrols.length === 0 ? (
-              <p style={{ color: '#666', textAlign: 'center', padding: 20 }}>No patrols found</p>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 400, overflowY: 'auto' }}>
-                {filteredPatrols.map((patrol, idx) => {
-                  const isAck = patrol.acknowledged || patrol.status === 'completed';
-                  const guardName = patrol.guard_name || patrol.profiles?.full_name || 'Unknown';
-                  return (
-                    <div
-                      key={idx}
-                      style={{
-                        padding: '12px 16px',
-                        background: '#111',
-                        borderRadius: 8,
-                        borderLeft: `4px solid ${isAck ? '#22c55e' : '#ef4444'}`,
-                      }}
-                    >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                        <span style={{ fontWeight: 600, fontSize: 14, color: '#fff' }}>{guardName}</span>
-                        <span style={{
-                          padding: '4px 10px',
-                          borderRadius: 12,
-                          fontSize: 10,
-                          fontWeight: 700,
-                          background: isAck ? '#166534' : '#7f1d1d',
-                          color: isAck ? '#86efac' : '#fca5a5'
-                        }}>
-                          {isAck ? '? ACK' : '? MISS'}
-                        </span>
-                      </div>
-                      <div style={{ fontSize: 12, color: '#888', marginBottom: 2 }}>
-                        {patrol.patrol_name || 'Unnamed Patrol'}
-                      </div>
-                      <div style={{ display: 'flex', gap: 12, fontSize: 11, color: '#666' }}>
-                        <span> {new Date(patrol.actual_start || patrol.created_at).toLocaleDateString()}</span>
-                        <span> Est. steps: {patrol.steps_taken || 0}</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: 10, marginBottom: 16 }}>
+            <Meter
+              percent={coveragePercent}
+              label="Checkpoint coverage"
+              caption={configuredPoints.length
+                ? `${pointsReached.length} of ${configuredPoints.length} configured points were reached at least once in this period.`
+                : 'No checkpoints are configured for this site. Add them under Config → Guard Patrol, or coverage cannot be measured.'}
+            />
+            <Meter
+              percent={completionPercent}
+              label="Patrols completed"
+              caption={filteredPatrols.length
+                ? `${patrolsCompleted} of ${filteredPatrols.length} started patrols were finished.`
+                : 'No patrols were started in this period.'}
+            />
           </div>
 
-          {/* Checkpoints List */}
-          <div style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 12, padding: 20 }}>
-            <h3 style={{ margin: '0 0 16px 0', fontSize: 16, color: '#fff', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ color: '#3b82f6' }}>?</span> Checkpoints ({filteredCheckpoints.length})
-            </h3>
+          <KpiRow min={140}>
+            <StatTile label="Patrols walked" value={filteredPatrols.length} hint={periodLabel} />
+            <StatTile label="Check-ins" value={filteredScans.length} hint={`${nfcScanCount} by NFC tag, ${filteredScans.length - nfcScanCount} by GPS`} />
+            <StatTile
+              label="Points never reached"
+              value={pointsMissed.length}
+              tone={pointsMissed.length ? 'warning' : 'good'}
+              hint={pointsMissed.length ? 'Listed below with the rest' : 'Full route was covered'}
+            />
+            <StatTile
+              label="Waiting to upload"
+              value={queuedScans}
+              tone={queuedScans ? 'info' : undefined}
+              hint="Check-ins saved here, not yet on the server"
+            />
+            <StatTile
+              label="Last check-in"
+              value={latestScan ? new Date(latestScan.scanned_at || latestScan.created_at).toLocaleString() : 'None yet'}
+              hint={latestScan?.checkpoint_name || 'No patrol activity in this period'}
+            />
+            <StatTile label="Guards active" value={guardStats.length} hint="With a patrol or a check-in in this period" />
+          </KpiRow>
 
-            {filteredCheckpoints.length === 0 ? (
-              <p style={{ color: '#666', textAlign: 'center', padding: 20 }}>No checkpoints found</p>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 400, overflowY: 'auto' }}>
-                {filteredCheckpoints.map((checkpoint, idx) => {
-                  const isScanned = checkpoint.scanned || checkpoint.status === 'scanned';
-                  const guardName = checkpoint.guard_name || checkpoint.profiles?.full_name || 'Unknown';
-                  return (
-                    <div
-                      key={idx}
-                      style={{
-                        padding: '12px 16px',
-                        background: '#111',
-                        borderRadius: 8,
-                        borderLeft: `4px solid ${isScanned ? '#3b82f6' : '#f59e0b'}`,
-                      }}
-                    >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                        <span style={{ fontWeight: 600, fontSize: 14, color: '#fff' }}>{checkpoint.checkpoint_name || `Point ${checkpoint.pointId || idx + 1}`}</span>
-                        <span style={{
-                          padding: '4px 10px',
-                          borderRadius: 12,
-                          fontSize: 10,
-                          fontWeight: 700,
-                          background: isScanned ? '#1e40af' : '#713f12',
-                          color: isScanned ? '#93c5fd' : '#fcd34d'
-                        }}>
-                          {isScanned ? '? SCAN' : '? MISS'}
+          {!hasAnything ? (
+            <EmptyState
+              title="No patrol activity in this period"
+              detail="Widen the date range, or check that patrols are being started on the device. Check-ins only record while a patrol is running."
+            />
+          ) : (
+            <>
+              <Panel
+                title="Checkpoints"
+                subtitle="Every configured point and how often it was reached, fewest visits first — so the gaps sit at the top."
+                right={pointsMissed.length
+                  ? <StatusPill tone="warning">{`${pointsMissed.length} never reached`}</StatusPill>
+                  : <StatusPill tone="good">All points reached</StatusPill>}
+              >
+                {configuredPoints.length === 0 ? (
+                  <div style={{ color: REPORT_COLORS.textMuted, fontSize: 13, lineHeight: 1.5 }}>
+                    No checkpoints are set up for this site yet, so there is nothing to measure coverage against.
+                    Add them under Config → Guard Patrol.
+                  </div>
+                ) : (
+                  <>
+                    <BarList
+                      rows={pointStats.map((point) => ({
+                        key: point.id,
+                        label: point.name,
+                        value: point.visits,
+                        color: point.visits === 0 ? REPORT_COLORS.critical : REPORT_COLORS.rampFill,
+                      }))}
+                      formatValue={(value) => (value === 0 ? '0' : value)}
+                    />
+                    {pointsMissed.length > 0 && (
+                      <p style={{ margin: '12px 0 0', color: '#fca5a5', fontSize: 12, lineHeight: 1.5 }}>
+                        Never reached in this period: {pointsMissed.map((point) => point.name).join(', ')}.
+                      </p>
+                    )}
+                  </>
+                )}
+              </Panel>
+
+              {scheduleAdherence && (
+                <Panel
+                  title="Against the schedule"
+                  subtitle={`This site is set to ${scheduleAdherence.perDay} patrol${scheduleAdherence.perDay === 1 ? '' : 's'} a day. Over the ${scheduleAdherence.spanDays} day${scheduleAdherence.spanDays === 1 ? '' : 's'} covered here that is ${scheduleAdherence.expected} expected.`}
+                  right={(
+                    <StatusPill tone={scheduleAdherence.percent >= 80 ? 'good' : scheduleAdherence.percent >= 50 ? 'warning' : 'critical'}>
+                      {`${scheduleAdherence.percent}% of schedule`}
+                    </StatusPill>
+                  )}
+                >
+                  <BarList
+                    rows={[
+                      { key: 'walked', label: 'Walked', value: filteredPatrols.length },
+                      { key: 'expected', label: 'Expected', value: scheduleAdherence.expected, color: REPORT_COLORS.series2 },
+                    ]}
+                  />
+                </Panel>
+              )}
+
+              <Panel title="Checkpoint layout" subtitle="Green points were reached in this period; blue dots are recorded check-in positions.">
+                <CheckpointMap
+                  checkpoints={configuredPoints}
+                  scans={filteredScans}
+                  reachedIds={reachedIds}
+                  title="Site layout"
+                />
+              </Panel>
+
+              {guardStats.length > 0 && (
+                <Panel title="Per guard" subtitle="Patrols and check-ins grouped by who recorded them.">
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, minWidth: 480 }}>
+                      <thead>
+                        <tr style={{ borderBottom: `1px solid ${REPORT_COLORS.borderStrong}` }}>
+                          {['Guard', 'Patrols', 'Completed', 'Check-ins', 'Points'].map((heading, index) => (
+                            <th key={heading} style={{
+                              padding: '9px 8px',
+                              textAlign: index === 0 ? 'left' : 'right',
+                              color: REPORT_COLORS.textMuted,
+                              fontSize: 11,
+                              textTransform: 'uppercase',
+                              letterSpacing: 0.5,
+                              whiteSpace: 'nowrap',
+                            }}
+                            >
+                              {heading}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {guardStats.map((guard) => (
+                          <tr key={guard.guardName} style={{ borderBottom: '1px solid #161616' }}>
+                            <td style={{ padding: '9px 8px', fontWeight: 600, color: REPORT_COLORS.textPrimary }}>{guard.guardName}</td>
+                            <NumberCell>{guard.patrols}</NumberCell>
+                            <NumberCell>{guard.completed}</NumberCell>
+                            <NumberCell>{guard.scans}</NumberCell>
+                            <NumberCell>{guard.distinctPoints}</NumberCell>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </Panel>
+              )}
+
+              <Panel
+                title={`Check-in log (${filteredScans.length})`}
+                subtitle="Newest first. This is the raw evidence behind every number above."
+              >
+                {filteredScans.length === 0 ? (
+                  <div style={{ color: REPORT_COLORS.textMuted, fontSize: 13 }}>No check-ins in this period.</div>
+                ) : (
+                  <div style={{ display: 'grid', gap: 6, maxHeight: 420, overflowY: 'auto' }}>
+                    {filteredScans.slice(0, 200).map((scan, index) => (
+                      <div
+                        key={scan.id || index}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          gap: 10,
+                          flexWrap: 'wrap',
+                          padding: '8px 10px',
+                          background: REPORT_COLORS.surfaceRaised,
+                          borderRadius: 8,
+                          borderLeft: `3px solid ${scan.method === 'gps' ? REPORT_COLORS.series3 : REPORT_COLORS.series1}`,
+                        }}
+                      >
+                        <span style={{ color: REPORT_COLORS.textPrimary, fontSize: 13, fontWeight: 600 }}>
+                          {scan.checkpoint_name || scan.point_name || 'Checkpoint'}
+                          <span style={{ color: REPORT_COLORS.textMuted, fontWeight: 400 }}>
+                            {` · ${scan.method === 'gps' ? 'GPS' : 'NFC'}`}
+                            {(scan.offline || scan._offline) && ' · not uploaded yet'}
+                          </span>
+                        </span>
+                        <span style={{ color: REPORT_COLORS.textMuted, fontSize: 12 }}>
+                          {new Date(scan.scanned_at || scan.created_at).toLocaleString()}
+                          {scan.guard_name ? ` · ${scan.guard_name}` : ''}
                         </span>
                       </div>
-                      <div style={{ fontSize: 12, color: '#888', marginBottom: 2 }}>
-                        Guard: {guardName}
+                    ))}
+                    {filteredScans.length > 200 && (
+                      <div style={{ color: REPORT_COLORS.textMuted, fontSize: 12, padding: '6px 2px' }}>
+                        Showing the newest 200 of {filteredScans.length}. The PDF export carries up to 400.
                       </div>
-                      <div style={{ display: 'flex', gap: 12, fontSize: 11, color: '#666' }}>
-                        <span> {checkpoint.latitude?.toFixed(4) || '-'}, {checkpoint.longitude?.toFixed(4) || '-'}</span>
-                        <span> {new Date(checkpoint.scanned_at || checkpoint.created_at).toLocaleTimeString()}</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        </div>
+                    )}
+                  </div>
+                )}
+              </Panel>
+            </>
+          )}
+        </>
       )}
     </div>
+  );
+}
+
+function NumberCell({ children }) {
+  return (
+    <td style={{
+      padding: '9px 8px',
+      textAlign: 'right',
+      color: REPORT_COLORS.textSecondary,
+      fontVariantNumeric: 'tabular-nums',
+    }}>
+      {children}
+    </td>
   );
 }

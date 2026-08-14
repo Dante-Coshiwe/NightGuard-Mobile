@@ -1,42 +1,44 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import jsPDF from 'jspdf';
 import 'jspdf-autotable';
-import ReportEmailPanel from '../components/ReportEmailPanel';
+import {
+  BarList,
+  DataFreshness,
+  DateRangeFilter,
+  EmptyState,
+  KpiRow,
+  Panel,
+  ReportHeader,
+  ShareButton,
+  StatTile,
+  StatusPill,
+} from '../components/ReportKit';
+import { REPORT_COLORS, reportPageStyle } from '../lib/reportTheme';
 import { buildDatedReportFileName, exportPdfDocument, getSiteDisplayName } from '../lib/reportUtils';
 import { NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
-import { getCachedVehicles } from '../lib/deviceStore';
+import { getCachedVehicles, getLastSyncAt } from '../lib/deviceStore';
 import { getVehicleReport } from '../services/api';
 import { logApiError, logApiAttempt, logApiSuccess, logOfflineUsage } from '../lib/apiErrorLogger';
 
-export default function VehicleReport() {
-  const [hourly, setHourly] = useState([]);
-  const [neverLeft, setNeverLeft] = useState([]);
-  const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
-  const [exporting, setExporting] = useState(false);
-  const [dataSource, setDataSource] = useState(''); // Track where data came from
+// ============================================================================
+//  Vehicle Report — gate traffic, and it has to open with no signal.
+//
+//  Offline it used to run the Supabase query anyway, throw, and fall back to
+//  whatever this handset had typed itself — usually nothing, so the page showed a
+//  red "No vehicle data available" as if something had broken. `listVehicles` now
+//  answers from the cache when offline and refills that cache on every online read,
+//  so this screen has something real to render either way. What is left here is
+//  making the page HONEST about which of the two it is showing.
+//
+//  The tiles also disagreed with each other: "Total Entered" respected the date
+//  filter while "Still Inside" and "All Time Total" ignored it, so filtering to
+//  yesterday showed 3 in and 40 inside. Every number below is filtered except the
+//  one that is meaningless filtered — on-site right now — which says so.
+// ============================================================================
 
-  useEffect(() => {
-    loadData();
-  }, []);
-
-  useEffect(() => {
-    const handleOnline = () => {
-      console.log('[VehicleReport] Coming online - reloading vehicle report from server');
-      loadData();
-    };
-    window.addEventListener('online', handleOnline);
-    window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
-    };
-  }, []);
-
-  const getCachedVehicleRows = () => getCachedVehicles().map((vehicle) => ({
+// The cache speaks VehicleTab's camelCase; this report speaks the server's snake_case.
+function cachedRows() {
+  return getCachedVehicles().map((vehicle) => ({
     id: vehicle.id,
     license_plate: vehicle.licensePlate,
     driver_name: vehicle.driverName,
@@ -49,256 +51,310 @@ export default function VehicleReport() {
     _offline: vehicle._offline,
     _pendingExit: vehicle._pendingExit,
   }));
+}
 
-  const mergeServerAndCachedRows = (serverRows) => {
-    const cachedRows = getCachedVehicleRows();
-    const serverIds = new Set((serverRows || []).map((vehicle) => String(vehicle?.id)));
-    const cachedOnlyRows = cachedRows.filter((vehicle) => !serverIds.has(String(vehicle?.id)));
-    return [...cachedOnlyRows, ...(serverRows || [])];
-  };
+// No setState in here on purpose — see the effect below.
+async function fetchVehiclesSafely() {
+  const loadedAt = new Date().toISOString();
+  try {
+    logApiAttempt('VehicleReport', 'GET', '/vehicles/report');
+    const rows = await getVehicleReport();
+    if (!Array.isArray(rows)) throw new Error('Unexpected response shape');
 
-  const loadData = async () => {
-    setLoading(true);
-    setError('');
-    let vehicles = [];
-    let source = 'offline-cache';
+    // Anything this handset holds that the server has not confirmed yet (queued
+    // entry, exit tapped offline) belongs in the report too — it happened.
+    const serverIds = new Set(rows.map((vehicle) => String(vehicle?.id)));
+    const localOnly = cachedRows().filter((vehicle) => !serverIds.has(String(vehicle?.id)));
 
-    try {
-      logApiAttempt('VehicleReport', 'GET', '/vehicles/report');
-      const apiData = await getVehicleReport();
-      if (Array.isArray(apiData)) {
-        vehicles = mergeServerAndCachedRows(apiData);
-        source = vehicles.some((vehicle) => vehicle?._offline || vehicle?._pendingExit) ? 'server+cache' : 'server';
-        logApiSuccess('VehicleReport', 'GET', '/vehicles/report', vehicles.length);
-      } else {
-        throw new Error('Invalid response from API');
-      }
-    } catch (apiError) {
-      logApiError(navigator.onLine, apiError, 'VehicleReport');
-      logOfflineUsage('VehicleReport', 'offline cache');
+    logApiSuccess('VehicleReport', 'GET', '/vehicles/report', rows.length + localOnly.length);
+    return { rows: [...localOnly, ...rows], fromCache: !navigator.onLine, error: '', loadedAt };
+  } catch (apiError) {
+    logApiError(navigator.onLine, apiError, 'VehicleReport');
+    logOfflineUsage('VehicleReport', 'offline cache');
+    return {
+      rows: cachedRows(),
+      fromCache: true,
+      // Online AND failing is a real fault worth naming; offline is not — offline is
+      // the expected condition on a gate phone, and the freshness line already says so.
+      error: navigator.onLine ? 'Could not reach the server — showing what is saved on this device.' : '',
+      loadedAt,
+    };
+  }
+}
 
-      vehicles = getCachedVehicleRows();
-    }
+export default function VehicleReport() {
+  const [vehicles, setVehicles] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [exporting, setExporting] = useState(false);
+  const [servedFromCache, setServedFromCache] = useState(false);
+  const [loadedAt, setLoadedAt] = useState(null);
 
-    setDataSource(source);
+  useEffect(() => {
+    let active = true;
 
-    if (vehicles.length === 0) {
-      setError('No vehicle data available');
-      console.warn(`[VehicleReport] No data available from either source`);
-    } else {
-      const activeVehicles = vehicles.filter((vehicle) => !vehicle.exited_at);
-      const buckets = {};
-      
-      for (const vehicle of vehicles) {
-        const hourKey = new Date(vehicle.entered_at);
-        hourKey.setMinutes(0, 0, 0);
-        const key = hourKey.toISOString();
+    const run = async () => {
+      const result = await fetchVehiclesSafely();
+      if (!active) return;
+      setVehicles(result.rows);
+      setServedFromCache(result.fromCache);
+      setError(result.error);
+      setLoadedAt(result.loadedAt);
+      setLoading(false);
+    };
 
-        if (!buckets[key]) {
-          buckets[key] = { hour: key, entered: 0, exited: 0, inside: 0 };
-        }
-        buckets[key].entered += 1;
-        if (vehicle.exited_at) buckets[key].exited += 1;
-        else buckets[key].inside += 1;
-      }
+    run();
+    window.addEventListener('nightguard_sync_complete', run);
+    window.addEventListener('online', run);
+    window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, run);
+    return () => {
+      active = false;
+      window.removeEventListener('nightguard_sync_complete', run);
+      window.removeEventListener('online', run);
+      window.removeEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, run);
+    };
+  }, []);
 
-      setHourly(Object.values(buckets).sort((a, b) => new Date(b.hour) - new Date(a.hour)));
-      setNeverLeft(activeVehicles);
-      setTotal(vehicles.length);
-    }
+  const inPeriod = useMemo(() => {
+    const fromTime = dateFrom ? new Date(dateFrom).getTime() : null;
+    const toTime = dateTo ? new Date(`${dateTo}T23:59:59`).getTime() : null;
+    return vehicles.filter((vehicle) => {
+      const entered = new Date(vehicle.entered_at || 0).getTime();
+      if (!Number.isFinite(entered) || !entered) return false;
+      if (fromTime && entered < fromTime) return false;
+      if (toTime && entered > toTime) return false;
+      return true;
+    });
+  }, [vehicles, dateFrom, dateTo]);
 
-    setLoading(false);
-  };
+  // Deliberately NOT filtered by date: "on site right now" is a live count, and a
+  // vehicle that drove in last Tuesday and never left is exactly the one a guard
+  // needs to see. Labelled so the difference is obvious rather than a trap.
+  const onSiteNow = useMemo(() => (
+    vehicles
+      .filter((vehicle) => !vehicle.exited_at)
+      .sort((a, b) => new Date(a.entered_at || 0) - new Date(b.entered_at || 0))
+  ), [vehicles]);
 
-  const filtered = hourly.filter((row) => {
-    const date = new Date(row.hour);
-    const fromMatch = dateFrom ? date >= new Date(dateFrom) : true;
-    const toMatch = dateTo ? date <= new Date(`${dateTo}T23:59:59`) : true;
-    return fromMatch && toMatch;
-  });
+  const hourly = useMemo(() => {
+    const buckets = new Map();
+    inPeriod.forEach((vehicle) => {
+      const stamp = new Date(vehicle.entered_at);
+      stamp.setMinutes(0, 0, 0);
+      const key = stamp.toISOString();
+      if (!buckets.has(key)) buckets.set(key, { hour: key, entered: 0, exited: 0, stillIn: 0 });
+      const bucket = buckets.get(key);
+      bucket.entered += 1;
+      if (vehicle.exited_at) bucket.exited += 1;
+      else bucket.stillIn += 1;
+    });
+    return [...buckets.values()].sort((a, b) => new Date(b.hour) - new Date(a.hour));
+  }, [inPeriod]);
+
+  // "On site for" is measured from when this page last loaded, not from a live clock.
+  // Reading Date.now() during render makes the component non-idempotent — the same
+  // props would render different text on every re-render — which React's rules of
+  // purity forbid. `loadedAt` is always set by the time the list renders.
+  const asOf = loadedAt ? new Date(loadedAt).getTime() : 0;
+  const exitedInPeriod = inPeriod.filter((vehicle) => vehicle.exited_at).length;
+  const pendingSync = vehicles.filter((vehicle) => vehicle._offline || vehicle._pendingExit).length;
+  const periodLabel = dateFrom || dateTo ? `${dateFrom || 'start'} to ${dateTo || 'today'}` : 'All time';
+
+  const averageStayMs = useMemo(() => {
+    const completed = inPeriod.filter((vehicle) => vehicle.exited_at && vehicle.entered_at);
+    if (!completed.length) return 0;
+    const total = completed.reduce((acc, vehicle) => (
+      acc + Math.max(0, new Date(vehicle.exited_at) - new Date(vehicle.entered_at))
+    ), 0);
+    return total / completed.length;
+  }, [inPeriod]);
 
   const formatHour = (timestamp) => new Date(timestamp).toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
+    month: 'short', day: 'numeric', hour: '2-digit',
   });
 
-  const totalEntered = filtered.reduce((acc, row) => acc + row.entered, 0);
-  const totalInside = neverLeft.length;
-
-  const buildPdfDocument = () => {
-    const doc = new jsPDF({ orientation: 'landscape' });
-    const siteName = getSiteDisplayName();
-
-    doc.setFontSize(14);
-    doc.text(`Vehicle Report - ${siteName}`, 14, 16);
-    doc.setFontSize(9);
-    doc.setTextColor(100);
-    doc.text(`Exported: ${new Date().toLocaleString()} | Total vehicles: ${total}`, 14, 23);
-
-    doc.autoTable({
-      head: [['Hour', 'Entered', 'Exited', 'Inside']],
-      body: filtered.map((row) => [formatHour(row.hour), row.entered, row.exited, row.inside]),
-      startY: 28,
-      styles: { fontSize: 9, cellPadding: 3 },
-      headStyles: { fillColor: [220, 38, 38], textColor: 255, fontStyle: 'bold' },
-      alternateRowStyles: { fillColor: [245, 245, 245] },
-    });
-
-    if (neverLeft.length > 0) {
-      const finalY = doc.lastAutoTable.finalY + 10;
-      doc.setFontSize(12);
-      doc.setTextColor(0);
-      doc.text('Vehicles Still Inside', 14, finalY);
-      doc.autoTable({
-        head: [['License Plate', 'Driver', 'Make', 'Color', 'Unit', 'Entry Time']],
-        body: neverLeft.map((vehicle) => [
-          vehicle.license_plate || '-',
-          vehicle.driver_name || '-',
-          vehicle.vehicle_make || '-',
-          vehicle.vehicle_color || '-',
-          vehicle.visiting_unit || '-',
-          new Date(vehicle.entered_at).toLocaleString(),
-        ]),
-        startY: finalY + 5,
-        styles: { fontSize: 8, cellPadding: 3 },
-        headStyles: { fillColor: [239, 68, 68], textColor: 255 },
-      });
-    }
-
-    return doc;
+  const formatStay = (ms) => {
+    if (!ms) return '—';
+    const minutes = Math.round(ms / 60000);
+    if (minutes < 60) return `${minutes}m`;
+    return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`;
   };
 
-  const handleExportPDF = async (shareOptions = {}) => {
+  const handleSharePDF = async () => {
     setExporting(true);
     setError('');
     try {
-      await exportPdfDocument(buildPdfDocument(), buildDatedReportFileName('VehicleReport'), {
-        shareTitle: 'Vehicle Report',
-        shareText: 'NightGuard vehicle report PDF.',
-        ...shareOptions,
+      const doc = new jsPDF({ orientation: 'landscape' });
+      const siteName = getSiteDisplayName();
+
+      doc.setFontSize(14);
+      doc.text(`Vehicle Report — ${siteName}`, 14, 16);
+      doc.setFontSize(9);
+      doc.setTextColor(100);
+      doc.text(`Period: ${periodLabel}   |   Exported: ${new Date().toLocaleString()}`, 14, 22);
+      doc.text(
+        `${inPeriod.length} entered · ${exitedInPeriod} left · ${onSiteNow.length} on site now · average stay ${formatStay(averageStayMs)}`
+        + (servedFromCache ? '   |   Prepared offline from data saved on this device' : ''),
+        14,
+        28,
+      );
+
+      doc.autoTable({
+        head: [['Hour', 'Entered', 'Left', 'Still inside']],
+        body: hourly.map((row) => [formatHour(row.hour), row.entered, row.exited, row.stillIn]),
+        startY: 33,
+        styles: { fontSize: 9, cellPadding: 3 },
+        headStyles: { fillColor: [220, 38, 38], textColor: 255, fontStyle: 'bold' },
+        alternateRowStyles: { fillColor: [245, 245, 245] },
+      });
+
+      if (onSiteNow.length > 0) {
+        const finalY = doc.lastAutoTable.finalY + 10;
+        doc.setFontSize(12);
+        doc.setTextColor(0);
+        doc.text('On site now (no exit recorded)', 14, finalY);
+        doc.autoTable({
+          head: [['Plate', 'Driver', 'Make', 'Colour', 'Unit', 'Entered', 'On site for']],
+          body: onSiteNow.map((vehicle) => [
+            vehicle.license_plate || '-',
+            vehicle.driver_name || '-',
+            vehicle.vehicle_make || '-',
+            vehicle.vehicle_color || '-',
+            vehicle.visiting_unit || '-',
+            new Date(vehicle.entered_at).toLocaleString(),
+            formatStay(Date.now() - new Date(vehicle.entered_at).getTime()),
+          ]),
+          startY: finalY + 5,
+          styles: { fontSize: 8, cellPadding: 3 },
+          headStyles: { fillColor: [239, 68, 68], textColor: 255 },
+        });
+      }
+
+      await exportPdfDocument(doc, buildDatedReportFileName('VehicleReport'), {
+        preferShare: true,
+        shareTitle: `Vehicle Report — ${siteName}`,
+        shareText: `NightGuard vehicle report, ${periodLabel}.`,
       });
     } catch (err) {
-      setError(err.message || 'Failed to export PDF');
+      setError(err.message || 'Failed to share the PDF');
     } finally {
       setExporting(false);
     }
   };
 
   return (
-    <div style={{ padding: 20, background: '#000', minHeight: '100vh', color: '#fff' }}>
-      <ReportEmailPanel
-        reportKey="vehicle-report"
-        reportLabel="Vehicle Report"
-        onShareReport={({ recipients, subject, body, senderEmail }) => handleExportPDF({
-          preferShare: true,
-          shareTitle: subject,
-          shareText: `${body}\n\nRecipients: ${recipients}\nSender account: ${senderEmail}`,
-        })}
+    <div style={reportPageStyle}>
+      <ReportHeader
+        title="Vehicle Report"
+        purpose="Vehicles logged at the gate, and which of them are still on site. Works with no signal — offline it shows the copy saved on this device."
+      >
+        <ShareButton onClick={handleSharePDF} disabled={vehicles.length === 0} busy={exporting} />
+      </ReportHeader>
+
+      <DataFreshness
+        online={!servedFromCache}
+        generatedAt={loadedAt}
+        note={servedFromCache
+          ? `Last synced ${getLastSyncAt() ? new Date(getLastSyncAt()).toLocaleString() : 'never'}`
+          : null}
       />
 
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-        <h1 style={{ margin: 0, fontSize: 18 }}>Vehicle Report</h1>
-        <button
-          onClick={() => handleExportPDF()}
-          disabled={filtered.length === 0 || exporting}
-          style={{
-            padding: '8px 16px',
-            background: filtered.length === 0 || exporting ? '#444' : '#dc2626',
-            color: '#fff',
-            border: 'none',
-            borderRadius: 8,
-            fontSize: 13,
-            fontWeight: 600,
-            cursor: filtered.length === 0 || exporting ? 'not-allowed' : 'pointer',
-          }}
-        >
-          {exporting ? 'Preparing PDF...' : 'Export PDF'}
-        </button>
-      </div>
+      <DateRangeFilter from={dateFrom} to={dateTo} onFrom={setDateFrom} onTo={setDateTo} />
 
-      <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
-        <input
-          type="date"
-          value={dateFrom}
-          onChange={(e) => setDateFrom(e.target.value)}
-          style={{ padding: '7px 10px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 6, color: '#fff', fontSize: 13 }}
-        />
-        <input
-          type="date"
-          value={dateTo}
-          onChange={(e) => setDateTo(e.target.value)}
-          style={{ padding: '7px 10px', background: '#111', border: '1px solid #2a2a2a', borderRadius: 6, color: '#fff', fontSize: 13 }}
-        />
-        {(dateFrom || dateTo) && (
-          <button
-            onClick={() => {
-              setDateFrom('');
-              setDateTo('');
-            }}
-            style={{ padding: '7px 12px', background: '#1a1a1a', border: '1px solid #333', borderRadius: 6, color: '#999', fontSize: 13, cursor: 'pointer' }}
-          >
-            Clear
-          </button>
-        )}
-      </div>
-
-      {!loading && (
-        <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
-          <div style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 8, padding: '8px 16px', fontSize: 13 }}>
-            <span style={{ color: '#666' }}>Total Entered: </span>
-            <span style={{ color: '#fff', fontWeight: 600 }}>{totalEntered}</span>
-          </div>
-          <div style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 8, padding: '8px 16px', fontSize: 13 }}>
-            <span style={{ color: '#f87171' }}>Still Inside: </span>
-            <span style={{ color: '#f87171', fontWeight: 600 }}>{totalInside}</span>
-          </div>
-          <div style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 8, padding: '8px 16px', fontSize: 13 }}>
-            <span style={{ color: '#666' }}>All Time Total: </span>
-            <span style={{ color: '#fff', fontWeight: 600 }}>{total}</span>
-          </div>
-        </div>
-      )}
-
-      {error && <div style={{ color: '#ef4444', marginBottom: 12 }}>{error}</div>}
+      {error && <div style={{ color: REPORT_COLORS.warning, marginBottom: 12, fontSize: 13 }}>{error}</div>}
 
       {loading ? (
-        <div style={{ textAlign: 'center', padding: 40, color: '#666' }}>Loading...</div>
+        <div style={{ textAlign: 'center', padding: 40, color: REPORT_COLORS.textMuted }}>Loading vehicles…</div>
       ) : (
         <>
-          <h2 style={{ fontSize: 15, color: '#fff', marginBottom: 12 }}>Hourly Breakdown</h2>
-          {filtered.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: 40, color: '#666' }}>No data for selected period</div>
-          ) : (
-            filtered.map((row, index) => (
-              <div key={index} style={{ background: '#0a0a0a', border: '1px solid #1f1f1f', borderRadius: 8, padding: '12px 16px', marginBottom: 8, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-                <div style={{ fontWeight: 600, color: '#fff' }}>{formatHour(row.hour)}</div>
-                <div style={{ display: 'flex', gap: 16 }}>
-                  <span style={{ color: '#22c55e' }}>In {row.entered}</span>
-                  <span style={{ color: '#60a5fa' }}>Out {row.exited}</span>
-                  <span style={{ color: '#f87171' }}>Inside {row.inside}</span>
-                </div>
-              </div>
-            ))
+          <KpiRow>
+            <StatTile label="Entered" value={inPeriod.length} hint={periodLabel} />
+            <StatTile label="Left" value={exitedInPeriod} hint="Exit recorded in this period" />
+            <StatTile
+              label="On site now"
+              value={onSiteNow.length}
+              tone={onSiteNow.length ? 'warning' : 'good'}
+              hint="Live count — not affected by the date filter"
+            />
+            <StatTile label="Average stay" value={formatStay(averageStayMs)} hint="Vehicles that entered and left in this period" />
+          </KpiRow>
+
+          {pendingSync > 0 && (
+            <div style={{ marginBottom: 14 }}>
+              <StatusPill tone="info">
+                {`${pendingSync} record${pendingSync === 1 ? '' : 's'} on this device not uploaded yet — included below`}
+              </StatusPill>
+            </div>
           )}
 
-          {neverLeft.length > 0 && (
-            <>
-              <h2 style={{ fontSize: 15, color: '#f87171', marginTop: 24, marginBottom: 12 }}>Vehicles Still Inside ({neverLeft.length})</h2>
-              {neverLeft.map((vehicle, index) => (
-                <div key={index} style={{ background: '#150a0a', border: '1px solid #7f1d1d', borderRadius: 8, padding: '12px 16px', marginBottom: 8 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <span style={{ color: '#fff', fontWeight: 700, fontSize: 15 }}>{vehicle.license_plate || 'Unknown'}</span>
-                    <span style={{ color: '#f87171', fontSize: 12 }}>{new Date(vehicle.entered_at).toLocaleString()}</span>
+          <Panel
+            title="Busiest hours"
+            subtitle="Vehicles entering per hour, newest first. Bar length is the number of entries."
+          >
+            <BarList
+              rows={hourly.slice(0, 24).map((row) => ({
+                key: row.hour,
+                label: formatHour(row.hour),
+                value: row.entered,
+              }))}
+              emptyText={vehicles.length ? 'No vehicles entered in the selected period' : 'No vehicles logged yet'}
+            />
+          </Panel>
+
+          <Panel
+            title={`On site now (${onSiteNow.length})`}
+            subtitle="No exit has been recorded for these. Oldest first — anything near the top of this list is worth a check."
+            right={onSiteNow.length
+              ? <StatusPill tone="warning">Needs an exit</StatusPill>
+              : <StatusPill tone="good">Gate is clear</StatusPill>}
+          >
+            {onSiteNow.length === 0 ? (
+              <div style={{ color: REPORT_COLORS.textMuted, fontSize: 13 }}>
+                Every vehicle logged has been signed out.
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gap: 8 }}>
+                {onSiteNow.map((vehicle) => (
+                  <div
+                    key={vehicle.id}
+                    style={{
+                      background: REPORT_COLORS.surfaceRaised,
+                      border: `1px solid ${REPORT_COLORS.borderStrong}`,
+                      borderRadius: 10,
+                      padding: '10px 12px',
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 4 }}>
+                      <span style={{ color: REPORT_COLORS.textPrimary, fontWeight: 700, fontSize: 14 }}>
+                        {vehicle.license_plate || vehicle.driver_name || 'Unrecorded plate'}
+                      </span>
+                      <span style={{ color: REPORT_COLORS.warning, fontSize: 12, fontWeight: 600 }}>
+                        {formatStay(asOf - new Date(vehicle.entered_at).getTime())} on site
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, color: REPORT_COLORS.textMuted }}>
+                      <span>Driver: {vehicle.driver_name || '—'}</span>
+                      {(vehicle.vehicle_make || vehicle.vehicle_color) && (
+                        <span>{[vehicle.vehicle_make, vehicle.vehicle_color].filter(Boolean).join(' · ')}</span>
+                      )}
+                      <span>Unit: {vehicle.visiting_unit || '—'}</span>
+                      <span>In: {new Date(vehicle.entered_at).toLocaleString()}</span>
+                    </div>
                   </div>
-                  <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', fontSize: 13, color: '#ccc' }}>
-                    <span>Driver: {vehicle.driver_name || '-'}</span>
-                    <span>{vehicle.vehicle_make || ''} {vehicle.vehicle_color || ''}</span>
-                    <span>Unit: {vehicle.visiting_unit || '-'}</span>
-                  </div>
-                </div>
-              ))}
-            </>
+                ))}
+              </div>
+            )}
+          </Panel>
+
+          {vehicles.length === 0 && (
+            <EmptyState
+              title="No vehicles logged yet"
+              detail={servedFromCache
+                ? 'Nothing is saved on this device for this site. Reconnect and the report will fill in on its own.'
+                : 'Vehicles appear here as soon as one is logged at the gate.'}
+            />
           )}
         </>
       )}

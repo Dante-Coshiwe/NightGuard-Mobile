@@ -252,6 +252,10 @@ export default function VehicleTab() {
 
     const tempId = `veh_${Date.now()}`;
     const siteId = getCachedSiteSettings().id || null;
+    // Stamp the arrival now, not when the row reaches the server. createVehicle() falls back to
+    // now() when entered_at is absent, so a vehicle logged offline used to be recorded at the
+    // moment the queue happened to drain rather than when it actually drove in.
+    const enteredAt = new Date().toISOString();
     let pictureUrl = null;
     try {
       pictureUrl = navigator.onLine && photoFile
@@ -270,13 +274,13 @@ export default function VehicleTab() {
       site_id: siteId,
       shift_id: shiftSession?.id || getShiftSession()?.id || null,
       guard_id: user?.id || null,
-      license_plate: null,
       vehicle_make: '',
       vehicle_color: '',
       driver_name: driverName,
       driver_contact: null,
       visiting_unit: personVisiting,
       visitor_type: visitorType,
+      entered_at: enteredAt,
       picture_url: pictureUrl,
       ...(pendingPhoto ? { _pendingPhoto: pendingPhoto } : {}),
     };
@@ -285,7 +289,6 @@ export default function VehicleTab() {
     // This guarantees we always have something to show the guard
     const localEntry = {
       id: tempId,
-      licensePlate: payload.license_plate,
       makeModel: payload.vehicle_make,
       driverName: payload.driver_name,
       colour: payload.vehicle_color,
@@ -293,7 +296,7 @@ export default function VehicleTab() {
       personVisiting: payload.visiting_unit,
       photoUrl: pictureUrl || photo || '',
       visitorType: payload.visitor_type,
-      enteredAt: new Date().toISOString(),
+      enteredAt,
       exitedAt: null,
       hasLeft: false,
       _offline: true,       // assume offline until server confirms
@@ -326,6 +329,11 @@ export default function VehicleTab() {
     try {
       const response = await post('/vehicles/entry', payload, {
         clientTempId: tempId,
+        // A photo still waiting to upload only ever uploads on a queue drain. Posting straight to
+        // the server instead saves the entry and drops _pendingPhoto on the floor — createVehicle
+        // strips it as a non-column — so the picture is lost with no error anywhere. That happens
+        // whenever the storage write above failed while the database itself was reachable.
+        forceQueue: Boolean(pendingPhoto),
       });
 
       if (response && !response._offline && response.id) {
@@ -352,7 +360,6 @@ export default function VehicleTab() {
     return vehicles.filter((v) => {
       const normalisedSearch = search.toLowerCase();
       const matchesSearch =
-        v.licensePlate?.toLowerCase().includes(normalisedSearch) ||
         v.driverName?.toLowerCase().includes(normalisedSearch) ||
         v.personVisiting?.toLowerCase().includes(normalisedSearch);
       const matchesView = activeView === 'all' || v.visitorType === activeView;
@@ -470,7 +477,7 @@ export default function VehicleTab() {
         <>
           <input
             type="text"
-            placeholder="Search by plate, driver or unit..."
+            placeholder="Search by driver or unit..."
             value={searchInput}
             onFocus={onFocus}
             onChange={(e) => setSearchInput(e.target.value)}

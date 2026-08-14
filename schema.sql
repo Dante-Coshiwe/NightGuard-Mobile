@@ -538,3 +538,17 @@ CREATE TABLE public.profile_sites (
   CONSTRAINT profile_sites_profile_id_fkey FOREIGN KEY (profile_id) REFERENCES public.profiles(id),
   CONSTRAINT profile_sites_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id)
 );
+CREATE TABLE public.device_locations (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  device_id text NOT NULL,
+  site_id uuid,
+  recorded_at timestamp with time zone NOT NULL,
+  latitude double precision NOT NULL CHECK (latitude >= '-90'::integer::double precision AND latitude <= 90::double precision),
+  longitude double precision NOT NULL CHECK (longitude >= '-180'::integer::double precision AND longitude <= 180::double precision),
+  accuracy real,
+  battery_level smallint CHECK (battery_level IS NULL OR battery_level >= 0 AND battery_level <= 100),
+  source text NOT NULL DEFAULT 'background'::text,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT device_locations_pkey PRIMARY KEY (id),
+  CONSTRAINT device_locations_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id)
+);

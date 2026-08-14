@@ -31,7 +31,6 @@ export default function PedestrianTab() {
   const onFocus = useScrollIntoView();
   const suppressCacheEvent = React.useRef(false);
   const [name, setName] = useState('');
-  const [idNumber, setIdNumber] = useState('');
   const [visitorType, setVisitorType] = useState(lookupData.pedestrianTypes[0] || 'Visitor');
   const [unitVisiting, setUnitVisiting] = useState('');
   const [photo, setPhoto] = useState(null);
@@ -247,6 +246,10 @@ export default function PedestrianTab() {
 
     const tempId = `ped_${Date.now()}`;
     const siteId = getCachedSiteSettings().id || null;
+    // Stamp the arrival now, not when the row reaches the server. createPedestrian() falls back to
+    // now() when entry_time is absent, so an entry registered offline used to be recorded at the
+    // moment the queue happened to drain -- minutes or hours after the person actually arrived.
+    const entryTime = new Date().toISOString();
     let pictureUrl = null;
     try {
       pictureUrl = navigator.onLine && photoFile
@@ -266,12 +269,12 @@ export default function PedestrianTab() {
       shift_id: shiftSession?.id || getShiftSession()?.id || null,
       guard_id: user?.id || null,
       full_name: name,
-      id_number: idNumber,
       contact_number: null,
       visiting_unit: unitVisiting,
       host_name: '',
       purpose_of_visit: visitorType,
       is_precleared: false,
+      entry_time: entryTime,
       picture_url: pictureUrl,
       ...(pendingPhoto ? { _pendingPhoto: pendingPhoto } : {}),
     };
@@ -285,7 +288,7 @@ export default function PedestrianTab() {
       unitVisiting: payload.visiting_unit,
       hostName: payload.host_name,
       photoUrl: pictureUrl || photo || '',
-      entryTime: new Date().toISOString(),
+      entryTime,
       exitTime: null,
       hasLeft: false,
       isPrecleared: false,
@@ -306,7 +309,6 @@ export default function PedestrianTab() {
 
     // Step 3: Reset form and close
     setName('');
-    setIdNumber('');
     setVisitorType(lookupData.pedestrianTypes[0] || 'Visitor');
     setUnitVisiting('');
     setPhoto(null);
@@ -319,6 +321,11 @@ export default function PedestrianTab() {
     try {
       const response = await post('/pedestrians/entry', payload, {
         clientTempId: tempId,
+        // A photo still waiting to upload only ever uploads on a queue drain. Posting straight to
+        // the server instead saves the entry and drops _pendingPhoto on the floor — createPedestrian
+        // strips it as a non-column — so the picture is lost with no error anywhere. That happens
+        // whenever the storage write above failed while the database itself was reachable.
+        forceQueue: Boolean(pendingPhoto),
       });
 
       if (response && !response._offline && response.id) {
@@ -371,10 +378,6 @@ export default function PedestrianTab() {
               {/* NightGuard fix: focused field scrolls itself into view without keyboard inset changes. */}
               <input className={`form-input ${formErrors.name ? 'error' : ''}`} value={name} onFocus={onFocus} onChange={(e) => setName(e.target.value)} disabled={submitting} />
               {formErrors.name && <div className="form-error">{formErrors.name}</div>}
-            </div>
-            <div className="form-group">
-              <label className="form-label">ID Number</label>
-              <input className="form-input" value={idNumber} onFocus={onFocus} onChange={(e) => setIdNumber(e.target.value)} inputMode="numeric" disabled={submitting} />
             </div>
             <div className="form-group">
               <label className="form-label required">Visitor Type</label>

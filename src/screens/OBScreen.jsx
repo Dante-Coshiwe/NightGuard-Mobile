@@ -1,14 +1,18 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { getRecentOBEntries } from '../services/api';
 import { buildDatedReportFileName, exportPdfDocument } from '../lib/reportUtils';
 import jsPDF from 'jspdf';
 import 'jspdf-autotable';
 import './OBScreen.css';
 import { useOfflineApi } from '../hooks/useOfflineApi';
-import { NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
+import { useLiveRefresh } from '../hooks/useLiveRefresh';
+import { isAppOnline } from '../lib/connectivity';
 import { getCachedSiteSettings, getShiftSession } from '../lib/deviceStore';
 import { useAuth } from '../contexts/AuthContext';
 import { getCachedObEntries, setCachedObEntries } from '../lib/reportCache';
+import { summariseDevices } from '../lib/deviceAttribution';
+import { getCurrentDeviceRecord } from '../services/schemaData';
+import DeviceBreakdown from '../components/DeviceBreakdown';
 
 export default function OBScreen() {
   const { user, shiftSession } = useAuth();
@@ -17,29 +21,56 @@ export default function OBScreen() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
+  // Kept apart from `error`, which belongs to the form. A background refresh failing must not
+  // wipe "Nature of Occurrence cannot be empty" out from under the guard, and vice versa.
+  const [listError, setListError] = useState('');
   const [success, setSuccess] = useState('');
+  // Bumped the moment a save starts. A refresh whose fetch was already in flight is answering a
+  // question from before that save, so applying it would drop the entry the guard just wrote off
+  // the list AND out of the cache — see loadEntries.
+  const submitSeq = useRef(0);
   const { post } = useOfflineApi();
 
   useEffect(() => {
     loadEntries();
   }, []);
 
-  const loadEntries = async () => {
-    setLoading(true);
+  // `silent` is the difference between opening the page and refreshing it. Only the first paint
+  // may show "Loading entries…" — see useLiveRefresh for why a refresh must never take the list
+  // away, and how often it would otherwise have done so.
+  const loadEntries = async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
+    const seq = submitSeq.current;
+
+    // The cache first, always and whatever the connection is doing. The occurrence book is
+    // readable the instant the page opens, with no signal and before any network work starts.
+    let cached = [];
+    try {
+      cached = await getCachedObEntries();
+    } catch (err) {
+      console.error('[OBScreen] Could not read the cached occurrence book:', err);
+    }
+
+    if (!silent && cached.length) {
+      setEntries(cached);
+      setLoading(false);
+    }
 
     try {
-      if (!navigator.onLine) {
-        // Load from cache if offline
-        const cached = await getCachedObEntries();
+      if (!isAppOnline()) {
         setEntries(cached);
         return;
       }
 
       const result = await getRecentOBEntries();
+
+      // A save started while this was in flight. Its optimistic write is newer than anything this
+      // answer can contain, so this one is thrown away rather than written over it.
+      if (submitSeq.current !== seq) return;
+
       const data = result || [];
 
-      // When coming online, keep queued/offline items visible until they are replaced.
-      const cached = await getCachedObEntries();
+      // Keep queued/offline items visible until the server's own copy replaces them.
       const offlineItems = (cached || []).filter((i) => i?._offline);
       const remoteIds = new Set(data.map((i) => String(i?.id)));
       const merged = [
@@ -48,38 +79,35 @@ export default function OBScreen() {
       ];
 
       setEntries(merged);
+      setListError('');
       await setCachedObEntries(merged);
 
     } catch (err) {
-      setError('Error loading entries');
-      console.error(err);
+      console.error('[OBScreen] Failed to load entries:', err);
 
-      // Fallback to cache on error
-      const cached = await getCachedObEntries();
-      setEntries(cached);
+      // Never blank the list because a refresh failed — what is on screen is still true, and
+      // offline is the expected condition on a guard's handset, not a fault worth shouting about.
+      if (cached.length) {
+        setEntries(cached);
+      } else if (!silent) {
+        setListError('Could not load entries — nothing is saved on this device yet.');
+      }
 
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => {
-    const onSyncComplete = () => {
-      loadEntries();
-    };
-    const handleOnline = () => {
-      console.log('[OBScreen] Coming online - reloading OB entries from server');
-      loadEntries();
-    };
-    window.addEventListener('nightguard_sync_complete', onSyncComplete);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
-    return () => {
-      window.removeEventListener('nightguard_sync_complete', onSyncComplete);
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
-    };
-  }, []);
+  useLiveRefresh(() => loadEntries({ silent: true }));
+
+  // Whose entries are these? On a one-handset site this is a no-op — `mine` is every row and the
+  // breakdown renders nothing. It only bites when a second device starts writing here.
+  const deviceSummary = useMemo(() => summariseDevices(entries, {
+    deviceRowId: getCurrentDeviceRecord()?.id || null,
+    devices: getCachedSiteSettings()?.devices || [],
+    timestampKey: 'captured_timestamp',
+  }), [entries]);
+  const visibleEntries = deviceSummary.mine;
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -90,21 +118,28 @@ export default function OBScreen() {
     setError('');
     setSuccess('');
     setSubmitting(true);
+    submitSeq.current += 1;
     try {
       const clientTempId = `ob_${Date.now()}`;
+      // Stamp when the guard actually wrote the entry. This used to live only in offlineResponse
+      // (the optimistic on-screen copy), so the payload carried no timestamp and createObEntry
+      // fell back to now() — an entry written offline was filed at whatever time the queue
+      // happened to drain, which for an occurrence book is the one field that has to be right.
+      const capturedAt = new Date().toISOString();
       const result = await post('/obentries/create', {
         site_id: getCachedSiteSettings().id || null,
         shift_id: shiftSession?.id || getShiftSession()?.id || null,
         captured_by: user?.id || null,
         guard_id: user?.id || null,
         nature_of_occurrence: newEntry.trim(),
+        captured_timestamp: capturedAt,
       }, {
         clientTempId,
         offlineResponse: {
           id: clientTempId,
           serial_number: `OFF-${Date.now().toString().slice(-6)}`,
           nature_of_occurrence: newEntry.trim(),
-          captured_timestamp: new Date().toISOString(),
+          captured_timestamp: capturedAt,
           _offline: true,
         },
       });
@@ -140,15 +175,19 @@ export default function OBScreen() {
 
     doc.setFontSize(9);
     doc.setTextColor(100);
+    // Export what is on screen, not everything held. When a second handset is writing here the
+    // list is filtered to this device, and a PDF that quietly included the other one would not
+    // match the book the guard just read.
     doc.text(
-      `Exported: ${new Date().toLocaleString()} | Total entries: ${entries.length}`,
+      `Exported: ${new Date().toLocaleString()} | Total entries: ${visibleEntries.length}`
+        + (deviceSummary.multiDevice ? ' | This device only' : ''),
       14,
       23
     );
 
     doc.autoTable({
       head: [['Serial No.', 'Date / Time', 'Nature of Occurrence', 'Guard', 'Location']],
-      body: entries.map((entry) => [
+      body: visibleEntries.map((entry) => [
         entry.serial_number || '-',
         formatDateTime(entry.captured_timestamp),
         entry.nature_of_occurrence || '-',
@@ -203,13 +242,14 @@ export default function OBScreen() {
 
       <div className="ob-list-section">
         <h2>Entries</h2>
-        {loading ? (
+        {listError && <div className="error-message">{listError}</div>}
+        {loading && visibleEntries.length === 0 ? (
           <div className="loading-message">Loading entries...</div>
-        ) : entries.length === 0 ? (
+        ) : visibleEntries.length === 0 ? (
           <div className="empty-message">No entries yet</div>
         ) : (
           <div className="entries-list">
-            {entries.map((entry) => (
+            {visibleEntries.map((entry) => (
               <div key={entry.id} className="entry-card">
                 <div className="entry-header">
                   <div className="entry-serial">{entry.serial_number}</div>
@@ -220,10 +260,12 @@ export default function OBScreen() {
             ))}
           </div>
         )}
+
+        <DeviceBreakdown summary={deviceSummary} noun="entries" />
       </div>
 
       <div className="ob-footer">
-        <button className="button-export" onClick={handleExportPDF} disabled={entries.length === 0}>
+        <button className="button-export" onClick={handleExportPDF} disabled={visibleEntries.length === 0}>
           Export PDF
         </button>
       </div>

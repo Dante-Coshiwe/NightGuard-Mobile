@@ -5,28 +5,7 @@ import './index.css';
 import { installConnectivityMonitor } from './lib/connectivity';
 import { installMobileKeyboardWorkarounds } from './lib/mobileKeyboard';
 import { installNativeStoragePersistence } from './lib/nativeStorage';
-import { notifyLiveUpdateReady, runOtaUpdate } from './services/liveUpdate';
-
-// Check our self-hosted Supabase OTA service for a newer web bundle. Staged
-// updates apply on the next background/restart, so this never interrupts a
-// running shift. Fire-and-forget; no-op on web.
-function scheduleOtaCheck() {
-  runOtaUpdate().then((result) => {
-    if (result?.status === 'staged') {
-      console.info('[LiveUpdate] update staged:', result.version);
-    }
-  }).catch(() => { /* handled inside runOtaUpdate */ });
-}
-
-async function installOtaForegroundCheck() {
-  if (!Capacitor.isNativePlatform()) return;
-  try {
-    const { App } = await import('@capacitor/app');
-    App.addListener('appStateChange', ({ isActive }) => {
-      if (isActive) scheduleOtaCheck();
-    });
-  } catch { /* @capacitor/app unavailable */ }
-}
+import { installLiveUpdateAutomation, notifyLiveUpdateReady } from './services/liveUpdate';
 
 // Kiosked devices can stay foregrounded for days and never fire a resume event,
 // so also re-check on a timer. 30 min keeps rollouts bounded without hammering.
@@ -55,13 +34,11 @@ async function bootstrap() {
   await initDeviceId();
   await seedGeneralGuard();
 
-  // Check for a newer bundle now that the device id exists (so every check-in is
-  // attributable), again whenever the app resumes, and on a timer for kiosks.
-  scheduleOtaCheck();
-  installOtaForegroundCheck();
-  if (Capacitor.isNativePlatform()) {
-    setInterval(scheduleOtaCheck, OTA_PERIODIC_CHECK_MS);
-  }
+  // Keep the bundle current on its own, now that the device id exists (so every
+  // check-in is attributable): check on launch, on resume and on a timer, and install
+  // what has downloaded as soon as the device is idle and off shift. Nobody has to
+  // press the Settings button — that is the manual override, not the mechanism.
+  installLiveUpdateAutomation({ periodicCheckMs: OTA_PERIODIC_CHECK_MS });
 
   ReactDOM.createRoot(document.getElementById('root')).render(
     <React.StrictMode>

@@ -4,8 +4,11 @@ import {
   getCachedGuards,
   getCachedCompletedShifts,
   getCachedPatrols,
+  getCachedPedestrians,
   getCachedSiteSettings,
+  getCachedVehicles,
   saveCachedCompletedShifts,
+  saveCachedVehicles,
   getNfcScans,
   getPatrolConfig,
   getShiftSession,
@@ -17,8 +20,9 @@ import {
   isGeneralGuardId,
 } from '../lib/deviceStore';
 
+import { getCachedIncidents, getCachedObEntries } from '../lib/reportCache';
 import { getBoundSiteIdSync, getSiteBinding } from '../lib/siteResolver';
-import { ensureDeviceRecord } from './schemaData';
+import { ensureDeviceRecord, getCurrentDeviceRecord } from './schemaData';
 
 const CACHED_USER_KEY = 'nightguard_cached_user';
 
@@ -87,6 +91,15 @@ function isUuid(value) {
 
 function nullableUuid(value) {
   return isUuid(value) ? value : null;
+}
+
+// Which handset logged this. Read synchronously from the cached site settings so it works with no
+// network, and resolved at INSERT time rather than at capture time — an entry written offline on a
+// handset that had not yet self-registered still gets attributed once the queue drains and
+// ensureDeviceRecord() has run. Null is an acceptable outcome: the column is nullable and a device
+// that cannot resolve its row must still be able to work.
+function currentDeviceRowId() {
+  return getCurrentDeviceRecord()?.id || null;
 }
 
 async function getSession() {
@@ -486,19 +499,32 @@ async function startShiftRecord(payload) {
 
 async function endShiftRecord(payload = {}) {
   const shiftId = payload.shift_id;
-  let query = supabase
-    .from('shifts')
-    .update({
-      ended_at: new Date().toISOString(),
-      status: 'closed',
-    })
-    .select('*');
+
+  // Stamp the moment the guard actually signed off, not the moment this update runs.
+  // A shift ended offline sits in the queue until the handset next finds signal, which
+  // on a rural site can be the next morning — `new Date()` here stretched a 12h night
+  // into a 20h one, and that inflated number is what the client was shown.
+  const endedAt = payload.ended_at || new Date().toISOString();
+
+  // `end_reason` is what separates a shift the guard signed off from one the platform
+  // closed on their behalf. Dropping it (as this did) made the two indistinguishable in
+  // every report — see deriveShiftMetrics.
+  const updates = {
+    ended_at: endedAt,
+    status: 'closed',
+    ...(payload.end_reason ? { end_reason: payload.end_reason } : {}),
+  };
+
+  // Only ever close a shift that is still open. A late-draining end event must not
+  // re-stamp a row that `startShiftRecord` already superseded, or the superseded shift
+  // reappears with a fresh end time and the hours are counted twice.
+  let query = supabase.from('shifts').update(updates).eq('status', 'active').select('*');
 
   if (shiftId) {
     query = query.eq('id', shiftId);
   } else {
     const siteId = await getCurrentSiteId();
-    query = query.eq('site_id', siteId).eq('status', 'active');
+    query = query.eq('site_id', siteId);
   }
 
   const { data, error } = await query.limit(1);
@@ -543,6 +569,61 @@ async function listCompletedShifts() {
   return mapped.length ? mapped : cached;
 }
 
+// One read for everything both shift reports need.
+//
+// They used to fetch `/shifts/completed` and nothing else, so neither could say what
+// happened DURING a shift — the client got a list of clock-in times and no evidence of
+// work. Each source below already knows how to answer offline; `safeList` makes sure one
+// dead source cannot take the whole report down with it.
+async function safeList(label, loader, fallback) {
+  try {
+    const rows = await loader();
+    return Array.isArray(rows) ? rows : [];
+  } catch (err) {
+    console.warn(`[api] shift report: ${label} unavailable (${err?.message || err}), using cache`);
+    try {
+      const rows = await fallback();
+      return Array.isArray(rows) ? rows : [];
+    } catch {
+      return [];
+    }
+  }
+}
+
+async function getShiftReportData() {
+  const [shifts, patrols, scans, incidents, vehicles, pedestrians, obEntries, checkpoints] = await Promise.all([
+    safeList('shifts', listCompletedShifts, () => getCachedCompletedShifts()),
+    safeList('patrols', listPatrols, () => getCachedPatrols()),
+    safeList('scans', listNfcScans, () => getNfcScans()),
+    safeList('incidents', listIncidents, () => getCachedIncidents()),
+    safeList('vehicles', listVehicles, () => cachedVehiclesAsRows()),
+    safeList('pedestrians', listPedestrians, () => getCachedPedestrians().map((entry) => ({
+      id: entry.id,
+      full_name: entry.name,
+      visiting_unit: entry.unitVisiting,
+      entry_time: entry.entryTime,
+      exit_time: entry.exitTime,
+    }))),
+    safeList('ob entries', listObEntries, () => getCachedObEntries()),
+    safeList('checkpoints', listNfcCheckpoints, () => getPatrolConfig().checkpoints || []),
+  ]);
+
+  return {
+    shifts,
+    patrols,
+    scans,
+    incidents,
+    vehicles,
+    pedestrians,
+    obEntries,
+    // Named points only. A blank row in the patrol config is not a place a guard can be
+    // expected to reach, and counting it would push every coverage figure down.
+    checkpointsConfigured: checkpoints.filter((point) => String(point?.name || point?.checkpoint_name || '').trim()).length,
+    generatedAt: new Date().toISOString(),
+    online: Boolean(navigator.onLine),
+  };
+}
+
 async function listPedestrians({ currentGuardOnly = false } = {}) {
   const siteId = await getCurrentSiteId();
   // An unbound device (binding not yet resolved, fresh install, wiped storage) must never
@@ -580,6 +661,7 @@ async function createPedestrian(payload) {
     ...columns,
     site_id: payload.site_id || await getCurrentSiteId(),
     shift_id: nullableUuid(payload.shift_id),
+    device_id: currentDeviceRowId(),
     guard_id: guardRefs.guard_id,
     local_guard_id: guardRefs.local_guard_id,
     entry_time: payload.entry_time || new Date().toISOString(),
@@ -608,11 +690,59 @@ async function markPedestrianExited(id) {
   return data;
 }
 
+// The vehicle cache is written by VehicleTab in the camelCase shape that tab renders.
+// Reports speak the server's snake_case, so translate rather than teaching every screen
+// both dialects.
+function cachedVehiclesAsRows() {
+  return getCachedVehicles().map((vehicle) => ({
+    id: vehicle.id,
+    license_plate: vehicle.licensePlate || null,
+    driver_name: vehicle.driverName || null,
+    vehicle_make: vehicle.makeModel || null,
+    vehicle_color: vehicle.colour || null,
+    driver_contact: vehicle.contact || null,
+    visiting_unit: vehicle.personVisiting || null,
+    visitor_type: vehicle.visitorType || null,
+    picture_url: vehicle.photoUrl || null,
+    entered_at: vehicle.enteredAt || null,
+    exited_at: vehicle.exitedAt || null,
+    _offline: Boolean(vehicle._offline),
+    _pendingExit: Boolean(vehicle._pendingExit),
+  }));
+}
+
+function rowsToVehicleCache(rows) {
+  return rows.map((vehicle) => ({
+    id: vehicle.id,
+    licensePlate: vehicle.license_plate,
+    makeModel: vehicle.vehicle_make || vehicle.vehicle_type,
+    driverName: vehicle.driver_name,
+    colour: vehicle.vehicle_color,
+    contact: vehicle.driver_contact || vehicle.contact_number,
+    personVisiting: vehicle.visiting_unit,
+    photoUrl: vehicle.picture_url,
+    visitorType: vehicle.visitor_type,
+    enteredAt: vehicle.entered_at,
+    exitedAt: vehicle.exited_at,
+    hasLeft: Boolean(vehicle.exited_at),
+    _offline: false,
+    _pendingExit: false,
+  }));
+}
+
 async function listVehicles({ currentGuardOnly = false } = {}) {
   const siteId = await getCurrentSiteId();
+  const cached = cachedVehiclesAsRows();
+
   // An unbound device (binding not yet resolved, fresh install, wiped storage) must never
   // read across sites — without a site filter this returns every site's records.
   if (!siteId) return [];
+
+  // Offline this used to run the query anyway, throw, and leave the Vehicle Report to
+  // catch the failure — which it did, but only ever showed rows THIS handset had typed.
+  // Answer from the cache like every other read does.
+  if (!navigator.onLine) return cached;
+
   let query = supabase
     .from('vehicles')
     .select('*')
@@ -630,8 +760,27 @@ async function listVehicles({ currentGuardOnly = false } = {}) {
   }
 
   const { data, error } = await query;
-  if (error) throwSupabaseError(error, 400);
-  return data || [];
+  // A failed refresh must not empty a report the device can already answer.
+  if (error) {
+    if (cached.length) return cached;
+    throwSupabaseError(error, 400);
+  }
+
+  const rows = data || [];
+
+  // Warm the cache so the report still works on the next shift with no signal. Only on
+  // the unfiltered read: a guard-scoped list is a subset and would evict everyone else's
+  // rows. Anything the server has not seen yet (queued entry, pending exit) is kept —
+  // a blind overwrite is what made just-logged entries vanish on refresh.
+  if (!currentGuardOnly) {
+    const serverIds = new Set(rows.map((vehicle) => String(vehicle.id)));
+    const pendingLocal = getCachedVehicles().filter((vehicle) => (
+      !serverIds.has(String(vehicle.id)) || vehicle._offline || vehicle._pendingExit
+    ));
+    saveCachedVehicles([...pendingLocal, ...rowsToVehicleCache(rows)]);
+  }
+
+  return rows;
 }
 
 async function createVehicle(payload) {
@@ -650,6 +799,7 @@ async function createVehicle(payload) {
     ...columns,
     site_id: payload.site_id || await getCurrentSiteId(),
     shift_id: nullableUuid(payload.shift_id),
+    device_id: currentDeviceRowId(),
     guard_id: guardRefs.guard_id,
     local_guard_id: guardRefs.local_guard_id,
     entered_at: payload.entered_at || new Date().toISOString(),
@@ -695,23 +845,56 @@ async function listIncidents() {
   return data || [];
 }
 
+// Photo storage on incidents needs two columns that older databases do not have (see
+// supabase/migrations — `picture_url` and `photo_urls`). PostgREST answers an insert naming an
+// unknown column with 42703 / PGRST204 and a 400, which the offline queue counts as a rejection and
+// eventually dead-letters — so shipping this without the migration applied would have cost the
+// incident itself, not just its pictures. Detected and retried without them instead: the incident
+// always lands, and the photos start being stored the moment the columns exist.
+const INCIDENT_PHOTO_COLUMNS = ['photo_urls', 'picture_url'];
+
+function isUnknownColumnError(error, columns) {
+  if (!error) return false;
+  if (error.code === '42703' || error.code === 'PGRST204') return true;
+  const message = String(error.message || '').toLowerCase();
+  return columns.some((column) => message.includes(`'${column}'`) || message.includes(`"${column}"`))
+    && (message.includes('column') || message.includes('schema cache'));
+}
+
 async function createIncident(payload) {
   const guardRefs = resolveGuardRefs(payload);
+  // Client-only keys. `_pendingPhotos` is the offline queue's carrier for photos captured without
+  // signal and is consumed there; it is not a column and must never reach the insert.
+  const { _pendingPhotos, _offline, ...columns } = payload;
+  const photoUrls = Array.isArray(payload.photo_urls) ? payload.photo_urls.filter(Boolean) : [];
   const insertPayload = {
-    ...payload,
+    ...columns,
     site_id: payload.site_id || await getCurrentSiteId(),
     shift_id: nullableUuid(payload.shift_id),
     reported_by: resolveProfileActorId(payload.reported_by),
+    device_id: currentDeviceRowId(),
     guard_id: guardRefs.guard_id,
     local_guard_id: guardRefs.local_guard_id,
     reported_at: payload.reported_at || new Date().toISOString(),
+    photo_urls: photoUrls,
+    picture_url: payload.picture_url || photoUrls[0] || null,
   };
 
-  const { data, error } = await supabase
+  let { data, error } = await supabase
     .from('incidents')
     .insert(insertPayload)
     .select('*')
     .single();
+
+  if (error && isUnknownColumnError(error, INCIDENT_PHOTO_COLUMNS)) {
+    console.warn('[api] incidents.photo_urls/picture_url not present — saving the incident without its photos. Apply the incident-photos migration.');
+    const { photo_urls, picture_url, ...withoutPhotos } = insertPayload;
+    ({ data, error } = await supabase
+      .from('incidents')
+      .insert(withoutPhotos)
+      .select('*')
+      .single());
+  }
 
   if (error) throwSupabaseError(error, 400);
   return data;
@@ -762,6 +945,7 @@ async function createObEntry(payload) {
     site_id: payload.site_id || await getCurrentSiteId(),
     shift_id: nullableUuid(payload.shift_id),
     captured_by: resolveProfileActorId(payload.captured_by),
+    device_id: currentDeviceRowId(),
     guard_id: guardRefs.guard_id,
     local_guard_id: guardRefs.local_guard_id,
     captured_timestamp: payload.captured_timestamp || new Date().toISOString(),
@@ -816,6 +1000,7 @@ async function createPatrolRecord(payload = {}) {
     ...(isUuid(payload.id) ? { id: payload.id } : {}),
     site_id: siteId,
     shift_id: nullableUuid(payload.shift_id),
+    device_id: currentDeviceRowId(),
     guard_id: guardRefs.guard_id,
     local_guard_id: guardRefs.local_guard_id,
     patrol_name: payload.patrol_name || payload.patrolName || 'Scheduled Patrol',
@@ -858,6 +1043,7 @@ async function completePatrolRecord(payload = {}) {
     ...(patrolId ? { id: patrolId } : {}),
     site_id: siteId,
     shift_id: nullableUuid(payload.shift_id),
+    device_id: currentDeviceRowId(),
     guard_id: guardRefs.guard_id,
     local_guard_id: guardRefs.local_guard_id,
     patrol_name: payload.patrol_name || 'Patrol',
@@ -896,6 +1082,7 @@ async function completePatrolRecord(payload = {}) {
     if (remaining.length) {
       const rows = remaining.map((point, offset) => ({
         site_id: siteId,
+        device_id: currentDeviceRowId(),
         guard_id: guardRefs.guard_id,
         local_guard_id: guardRefs.local_guard_id,
         shift_id: nullableUuid(payload.shift_id),
@@ -996,6 +1183,7 @@ async function createNfcScan(payload) {
   const insertPayload = {
     ...(clientScanId ? { id: clientScanId } : {}),
     site_id: payload.site_id || await getCurrentSiteId(),
+    device_id: currentDeviceRowId(),
     guard_id: guardRefs.guard_id,
     local_guard_id: guardRefs.local_guard_id,
     shift_id: nullableUuid(payload.shift_id),
@@ -1211,6 +1399,9 @@ async function handleGet(url) {
   if (url === '/shifts/completed') {
     return listCompletedShifts();
   }
+  if (url === '/shifts/report') {
+    return getShiftReportData();
+  }
   if (url === '/guards/stats') {
     return getGuardsWithStatsData();
   }
@@ -1374,6 +1565,9 @@ export const startShift = (data) => api.post('/shifts/start', data).then((res) =
 export const endShift = (data) => api.post('/shifts/end', data).then((res) => res.data);
 export const addGuard = (data) => api.post('/shifts/guards/add', data).then((res) => res.data);
 export const getCompletedShifts = () => api.get('/shifts/completed').then((res) => res.data);
+// Completed shifts PLUS the patrols, scans, incidents and gate traffic that happened
+// during them — the single source both shift reports render from.
+export const getShiftReport = () => api.get('/shifts/report').then((res) => res.data);
 
 export const getGuardPatrols = () => api.get('/patrols/my-patrols').then((res) => res.data);
 export const getPatrolsByGuard = (guardId) => api.get(`/patrols/guard/${guardId}`).then((res) => res.data);

@@ -1,15 +1,42 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { getRecentIncidents } from '../services/api';
 import './IncidentScreen.css';
 import { useOfflineApi } from '../hooks/useOfflineApi';
-import { NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
+import { useLiveRefresh } from '../hooks/useLiveRefresh';
+import { isAppOnline } from '../lib/connectivity';
 import { getCachedSiteSettings, getLookupData, getShiftSession } from '../lib/deviceStore';
 import { getCachedIncidents, setCachedIncidents } from '../lib/reportCache';
 import { useAuth } from '../contexts/AuthContext';
+import {
+  buildPendingPhotos,
+  normaliseSelectedPhoto,
+  normaliseSelectedPhotos,
+  uploadEntryPhoto,
+  uploadEntryPhotos,
+} from '../lib/photoCapture';
+import { incidentPhotoUrls, pendingPhotoCount, stripPendingPhotosFromList } from '../lib/incidentPhotos';
+import { summariseDevices } from '../lib/deviceAttribution';
+import { getCurrentDeviceRecord } from '../services/schemaData';
+import DeviceBreakdown from '../components/DeviceBreakdown';
 
-const EMPTY_FORM = {
-  dateTime: new Date().toISOString().slice(0, 16),
+// An incident is evidence, not an album. The cap keeps a queued incident's base64 photos inside the
+// storage the offline queue shares with everything else — see stripPendingPhotos.
+const MAX_INCIDENT_PHOTOS = 6;
+
+// `datetime-local` inputs are LOCAL time with no zone. toISOString() is UTC, so prefilling with it
+// showed a time shifted by the UTC offset (13:26 displayed while the wall clock read 15:26). That
+// was invisible for as long as the field was validated and then thrown away; now that the guard's
+// stated time is what gets stored, it would have back-dated every incident by the offset.
+function localDateTimeInput(date = new Date()) {
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+}
+
+// A function, not a constant: as a module-level object the timestamp was frozen at app load, so
+// every incident reported in a session after the first was prefilled with a stale time.
+const emptyForm = () => ({
+  dateTime: localDateTimeInput(),
   category: '',
+  severity: 'low',
   address: '',
   complainantName: '',
   complainantContact: '',
@@ -24,7 +51,7 @@ const EMPTY_FORM = {
   colour: '',
   vehiclePhoto: null,
   incidentPhotos: [],
-};
+});
 
 export default function IncidentScreen() {
   const { user, shiftSession } = useAuth();
@@ -36,8 +63,13 @@ export default function IncidentScreen() {
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [errors, setErrors] = useState({});
-  const [formData, setFormData] = useState(EMPTY_FORM);
+  const [formData, setFormData] = useState(emptyForm);
   const [lookupData, setLookupData] = useState(getLookupData());
+  const [viewerPhotos, setViewerPhotos] = useState(null);
+  // Bumped the moment a submit starts. A refresh whose fetch was already in flight is answering a
+  // question from before that submit, so applying it would drop the incident the guard just filed
+  // off the list AND out of the cache — see loadIncidents.
+  const submitSeq = useRef(0);
   const { post } = useOfflineApi();
 
   useEffect(() => {
@@ -50,22 +82,42 @@ export default function IncidentScreen() {
     return () => window.removeEventListener('nightguard_lookup_updated', handleLookupUpdate);
   }, []);
 
-  const loadIncidents = async () => {
-    setLoading(true);
+  // `silent` is the difference between opening the page and refreshing it. Only the first paint
+  // may show "Loading incidents…" — see useLiveRefresh for why a refresh must never take the list
+  // away, and how often it would otherwise have done so.
+  const loadIncidents = async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
+    const seq = submitSeq.current;
+
+    // The cache first, always and whatever the connection is doing, so the list is readable the
+    // instant the page opens and with no signal at all.
+    let cached = [];
+    try {
+      cached = await getCachedIncidents();
+    } catch (err) {
+      console.error('[IncidentScreen] Could not read cached incidents:', err);
+    }
+
+    if (!silent && cached.length) {
+      setIncidents(cached);
+      setLoading(false);
+    }
 
     try {
-      if (!navigator.onLine) {
-        // Load from cache if offline
-        const cached = await getCachedIncidents();
+      if (!isAppOnline()) {
         setIncidents(cached);
         return;
       }
 
       const result = await getRecentIncidents();
+
+      // A submit started while this was in flight. Its optimistic write is newer than anything this
+      // answer can contain, so this one is thrown away rather than written over it.
+      if (submitSeq.current !== seq) return;
+
       const data = result || [];
 
-      // When coming online, keep any queued/offline items visible until they are replaced.
-      const cached = await getCachedIncidents();
+      // Keep queued/offline items visible until the server's own copy replaces them.
       const offlineItems = (cached || []).filter((i) => i?._offline);
       const remoteIds = new Set(data.map((i) => String(i?.id)));
       const merged = [
@@ -74,55 +126,64 @@ export default function IncidentScreen() {
       ];
 
       setIncidents(merged);
-      await setCachedIncidents(merged);
+      await setCachedIncidents(stripPendingPhotosFromList(merged));
 
     } catch (err) {
-      console.error('Failed to load incidents:', err);
+      console.error('[IncidentScreen] Failed to load incidents:', err);
 
-      // Fallback to cache
-      const cached = await getCachedIncidents();
-      setIncidents(cached);
+      // Never blank the list because a refresh failed — what is on screen is still true.
+      if (cached.length) setIncidents(cached);
 
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => {
-    const onSyncComplete = () => {
-      loadIncidents();
-    };
-    const handleOnline = () => {
-      console.log('[IncidentScreen] Coming online - reloading incidents from server');
-      loadIncidents();
-    };
-    window.addEventListener('nightguard_sync_complete', onSyncComplete);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
-    return () => {
-      window.removeEventListener('nightguard_sync_complete', onSyncComplete);
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener(NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT, handleOnline);
-    };
-  }, []);
+  useLiveRefresh(() => loadIncidents({ silent: true }));
+
+  // Whose incidents are these? On a one-handset site this is a no-op — `mine` is every row and the
+  // breakdown renders nothing. It only bites when a second device starts filing here.
+  const deviceSummary = useMemo(() => summariseDevices(incidents, {
+    deviceRowId: getCurrentDeviceRecord()?.id || null,
+    devices: getCachedSiteSettings()?.devices || [],
+    timestampKey: 'reported_at',
+  }), [incidents]);
+  const visibleIncidents = deviceSummary.mine;
 
   const handleFormChange = (field, value) => {
     setFormData(prev => ({ ...prev, [field]: value }));
     if (errors[field]) setErrors(prev => ({ ...prev, [field]: '' }));
   };
 
-  const handlePhotoCapture = (type, e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (event) => {
+  // Photos are held as descriptors ({ dataUrl, blob, ... }), not bare data URLs. The blob is what
+  // gets uploaded; the data URL is both the on-screen preview and what survives into the offline
+  // queue, since a Blob JSON.stringifies to `{}` and the picture would be lost on the way there.
+  const handlePhotoCapture = async (type, e) => {
+    const input = e.target;
+    const files = input.files;
+    if (!files?.length) return;
+    setError('');
+    try {
       if (type === 'vehicle') {
-        handleFormChange('vehiclePhoto', event.target?.result);
+        const photo = await normaliseSelectedPhoto(files[0]);
+        handleFormChange('vehiclePhoto', photo);
       } else {
-        handleFormChange('incidentPhotos', [...(formData.incidentPhotos || []), event.target?.result]);
+        const photos = await normaliseSelectedPhotos(files);
+        setFormData((prev) => {
+          const combined = [...(prev.incidentPhotos || []), ...photos];
+          if (combined.length > MAX_INCIDENT_PHOTOS) {
+            setError(`Up to ${MAX_INCIDENT_PHOTOS} incident photos — the extra ones were not added.`);
+          }
+          return { ...prev, incidentPhotos: combined.slice(0, MAX_INCIDENT_PHOTOS) };
+        });
       }
-    };
-    reader.readAsDataURL(file);
+    } catch (err) {
+      console.error('[IncidentScreen] Could not read selected photo:', err);
+      setError('Could not read that photo. Try taking it again.');
+    } finally {
+      // Without this, picking the same file twice in a row fires no change event the second time.
+      input.value = '';
+    }
   };
 
   const validateStep = (step) => {
@@ -146,35 +207,130 @@ export default function IncidentScreen() {
   const handleSubmit = async () => {
     setError('');
     setSubmitting(true);
+    submitSeq.current += 1;
     try {
       const clientTempId = `incident_${Date.now()}`;
+      // When the incident happened, as the guard stated it. Two bugs met here: the guard-editable
+      // "Date & Time" field was validated as required and then never sent, and reported_at existed
+      // only on offlineResponse (the optimistic on-screen copy) rather than on the payload — so
+      // createIncident fell back to now() and filed the incident at whatever time the queue
+      // happened to drain. A datetime-local value is local time, which is what new Date() assumes.
+      const reportedAt = (() => {
+        const stated = formData.dateTime ? new Date(formData.dateTime) : null;
+        return stated && !Number.isNaN(stated.getTime())
+          ? stated.toISOString()
+          : new Date().toISOString();
+      })();
+      const siteId = getCachedSiteSettings().id || null;
+      const incidentPhotos = formData.incidentPhotos || [];
+      const vehiclePhoto = formData.vehiclePhoto || null;
+
+      // Upload now if there is signal; otherwise the photos ride the offline queue as _pendingPhotos
+      // and are uploaded on drain. A failed upload must never cost the incident itself — the guard's
+      // written account of what happened is worth more than the picture of it, so this only ever
+      // downgrades to the queued path.
+      let photoUrls = [];
+      let uploadFailed = false;
+      // isAppOnline(), not navigator.onLine — it is the same predicate useOfflineApi uses to decide
+      // whether to queue. If the two disagree, this uploads nothing while the post goes straight
+      // online, and createIncident drops _pendingPhotos as a non-column: the photos would vanish.
+      if (isAppOnline() && (incidentPhotos.length || vehiclePhoto)) {
+        try {
+          photoUrls = await uploadEntryPhotos({
+            photos: incidentPhotos,
+            type: 'incidents',
+            tempId: clientTempId,
+            siteId,
+          });
+          if (vehiclePhoto) {
+            const vehicleUrl = await uploadEntryPhoto({
+              photo: vehiclePhoto,
+              type: 'incidents',
+              tempId: `${clientTempId}-vehicle`,
+              siteId,
+            });
+            if (vehicleUrl) photoUrls.push(vehicleUrl);
+          }
+        } catch (err) {
+          console.warn('[IncidentScreen] Photo upload failed, queueing photos for sync:', err.message);
+          photoUrls = [];
+          uploadFailed = true;
+        }
+      }
+
+      const pendingPhotos = (photoUrls.length === 0 && (incidentPhotos.length || vehiclePhoto))
+        ? buildPendingPhotos([...incidentPhotos, ...(vehiclePhoto ? [vehiclePhoto] : [])])
+        : [];
+
+      // Everything the guard typed goes into the record. Steps 1, 3 and 4 collected the offender
+      // description and the vehicle's registration/make/colour, validated them, and then built a
+      // description that mentioned none of them — the incidents table has no columns for any of it,
+      // so it was simply discarded on submit. It is part of the narrative now.
+      const section = (label, value) => (value && String(value).trim() ? `${label}: ${String(value).trim()}` : null);
+      const vehicleLine = [formData.registration, formData.makeModel, formData.colour]
+        .map((part) => String(part || '').trim())
+        .filter(Boolean)
+        .join(' · ');
+      const description = [
+        formData.details,
+        section('Action Taken', formData.actionTaken),
+        [
+          section('Complainant', `${formData.complainantName} (${formData.complainantContact})`),
+          section('Incident With', formData.incidentWith),
+          section('Guard', formData.guardName),
+        ].filter(Boolean).join('\n'),
+        section('Offender', formData.offenderDetails),
+        section('Offender Address', formData.offenderAddress),
+        section('Vehicle', vehicleLine),
+      ].filter(Boolean).join('\n\n');
+
       const payload = {
-        site_id: getCachedSiteSettings().id || null,
+        site_id: siteId,
         shift_id: shiftSession?.id || getShiftSession()?.id || null,
         reported_by: user?.id || null,
         guard_id: user?.id || null,
+        reported_at: reportedAt,
         incident_type: formData.category,
-        description: `${formData.details}\n\nAction Taken: ${formData.actionTaken}\n\nComplainant: ${formData.complainantName} (${formData.complainantContact})\nIncident With: ${formData.incidentWith}\nGuard: ${formData.guardName}`,
-        severity: 'low',
+        description,
+        // Was hardcoded 'low'. The manager dashboard badges severity, sorts on it and headlines a
+        // "high severity" count — all of which read zero forever while the only value a guard could
+        // ever file was 'low'. The guard on the scene is the one who knows.
+        severity: formData.severity || 'low',
         location: formData.address,
+        photo_urls: photoUrls,
+        picture_url: photoUrls[0] || null,
+        ...(pendingPhotos.length ? { _pendingPhotos: pendingPhotos } : {}),
       };
       const result = await post('/incidents/report', payload, {
         clientTempId,
+        // Photos still to upload (offline, or the storage write failed while the database was
+        // reachable) must go through the queue — that is the only code path that uploads them and
+        // rewrites photo_urls before the insert. Posting directly would save the incident and throw
+        // the pictures away. The queue drains within the minute, so the delay costs nothing.
+        forceQueue: pendingPhotos.length > 0,
         offlineResponse: {
           ...payload,
           id: clientTempId,
-          reported_at: new Date().toISOString(),
           _offline: true,
         },
       });
       const updated = [result, ...incidents];
+      // State keeps the captured photos so the guard sees them on the card straight away; the cache
+      // gets the stripped copy, because those bytes already live in the offline queue.
       setIncidents(updated);
-      await setCachedIncidents(updated);
+      await setCachedIncidents(stripPendingPhotosFromList(updated));
       setView('list');
       setCurrentStep(1);
-      setFormData(EMPTY_FORM);
-      setSuccess(result._offline ? 'Incident saved offline and queued for sync' : 'Incident saved successfully');
-      setTimeout(() => setSuccess(''), 3000);
+      setFormData(emptyForm());
+      const photoNote = pendingPhotos.length
+        ? ` — ${pendingPhotos.length} photo${pendingPhotos.length === 1 ? '' : 's'} will upload when there is signal`
+        : (photoUrls.length ? ` with ${photoUrls.length} photo${photoUrls.length === 1 ? '' : 's'}` : '');
+      setSuccess(
+        (result._offline || uploadFailed)
+          ? `Incident saved offline and queued for sync${photoNote}`
+          : `Incident saved successfully${photoNote}`
+      );
+      setTimeout(() => setSuccess(''), 4000);
     } catch (err) {
       setError(err.response?.data?.error || 'Error saving incident');
     } finally {
@@ -216,6 +372,17 @@ export default function IncidentScreen() {
                 {lookupData.incidentTypes.map(cat => <option key={cat} value={cat}>{cat}</option>)}
               </select>
               {errors.category && <div className="form-error">{errors.category}</div>}
+            </div>
+            <div className="form-group">
+              <label className="form-label required">Severity</label>
+              <div className="radio-group">
+                {[['low', 'Low'], ['medium', 'Medium'], ['high', 'High']].map(([value, label]) => (
+                  <label key={value} className="radio-label">
+                    <input type="radio" name="severity" value={value} checked={formData.severity === value} onChange={e => handleFormChange('severity', e.target.value)} />
+                    {label}
+                  </label>
+                ))}
+              </div>
             </div>
             <div className="form-group">
               <label className="form-label required">Address</label>
@@ -291,7 +458,12 @@ export default function IncidentScreen() {
               <label className="form-label">Photo of Vehicle</label>
               <input type="file" className="photo-input" id="vehicle-photo" accept="image/*" capture="environment" onChange={e => handlePhotoCapture('vehicle', e)} />
               <button type="button" className="photo-button" onClick={() => document.getElementById('vehicle-photo').click()}>Capture Vehicle Photo</button>
-              {formData.vehiclePhoto && <img src={formData.vehiclePhoto} alt="Vehicle" className="photo-preview" style={{ marginTop: 8, width: '100%', borderRadius: 8 }} />}
+              {formData.vehiclePhoto && (
+                <div className="photo-grid-item" style={{ marginTop: 8 }}>
+                  <img src={formData.vehiclePhoto.dataUrl} alt="Vehicle" />
+                  <button type="button" className="photo-delete-btn" onClick={() => handleFormChange('vehiclePhoto', null)}>Remove</button>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -307,7 +479,7 @@ export default function IncidentScreen() {
               <div className="photos-grid">
                 {formData.incidentPhotos.map((photo, idx) => (
                   <div key={idx} className="photo-grid-item">
-                    <img src={photo} alt={`Incident ${idx + 1}`} />
+                    <img src={photo.dataUrl} alt={`Incident ${idx + 1}`} />
                     <button type="button" className="photo-delete-btn" onClick={() => handleFormChange('incidentPhotos', formData.incidentPhotos.filter((_, i) => i !== idx))}>Remove</button>
                   </div>
                 ))}
@@ -341,29 +513,86 @@ export default function IncidentScreen() {
 
       {success && <div className="success-message">{success}</div>}
 
-      {loading ? (
+      {loading && visibleIncidents.length === 0 ? (
         <div style={{ textAlign: 'center', padding: '40px', color: '#666' }}>Loading incidents...</div>
-      ) : incidents.length === 0 ? (
+      ) : visibleIncidents.length === 0 ? (
         <div style={{ textAlign: 'center', padding: '40px', color: '#666' }}>No incidents reported yet</div>
       ) : (
         <div className="incidents-list">
-          {incidents.map(incident => (
-            <div key={incident.id} className="incident-card">
-              <div className="incident-card-header">
-                <div>
-                  <div className="incident-category">{incident.incident_type}</div>
-                  <div className="incident-address">{incident.location}</div>
+          {visibleIncidents.map(incident => {
+            const photos = incidentPhotoUrls(incident);
+            // Photos waiting in the outbox with no preview to show — the card must still say they
+            // exist, or a guard who reopens the app sees an incident that looks like it lost them.
+            const queuedPhotos = photos.length ? 0 : pendingPhotoCount(incident);
+            return (
+              <div key={incident.id} className="incident-card">
+                <div className="incident-card-header">
+                  <div>
+                    <div className="incident-category">{incident.incident_type}</div>
+                    <div className="incident-address">{incident.location}</div>
+                  </div>
+                  <div className="incident-date">{formatDate(incident.reported_at)}</div>
                 </div>
-                <div className="incident-date">{formatDate(incident.reported_at)}</div>
+                <div className="incident-details">{incident.description?.slice(0, 80)}...</div>
+                {photos.length > 0 && (
+                  <div className="incident-photo-strip">
+                    {photos.map((url, idx) => (
+                      <button
+                        key={url}
+                        type="button"
+                        className="incident-photo-thumb"
+                        onClick={() => setViewerPhotos({ photos, index: idx })}
+                        aria-label={`View photo ${idx + 1} of ${photos.length}`}
+                      >
+                        {/* A photo still queued for upload, or one whose file was removed from the
+                            bucket, shows an empty frame rather than a broken-image glyph. */}
+                        <img src={url} alt="" loading="lazy" onError={(e) => { e.currentTarget.style.visibility = 'hidden'; }} />
+                      </button>
+                    ))}
+                  </div>
+                )}
+                <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '11px', padding: '2px 8px', borderRadius: 4, background: incident.severity === 'high' ? '#7f1d1d' : '#1a1a1a', color: incident.severity === 'high' ? '#fca5a5' : '#666' }}>
+                    {incident.severity}
+                  </span>
+                  {incident._offline && <span className="incident-pending-badge">Queued for sync</span>}
+                  {queuedPhotos > 0 && (
+                    <span className="incident-pending-badge">
+                      {queuedPhotos} photo{queuedPhotos === 1 ? '' : 's'} waiting to upload
+                    </span>
+                  )}
+                </div>
               </div>
-              <div className="incident-details">{incident.description?.slice(0, 80)}...</div>
-              <div style={{ marginTop: 6 }}>
-                <span style={{ fontSize: '11px', padding: '2px 8px', borderRadius: 4, background: incident.severity === 'high' ? '#7f1d1d' : '#1a1a1a', color: incident.severity === 'high' ? '#fca5a5' : '#666' }}>
-                  {incident.severity}
-                </span>
-              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <DeviceBreakdown summary={deviceSummary} noun="incidents" />
+
+      {viewerPhotos && (
+        <div className="incident-photo-viewer" role="dialog" aria-modal="true" onClick={() => setViewerPhotos(null)}>
+          <div className="incident-photo-viewer-inner" onClick={(e) => e.stopPropagation()}>
+            <img src={viewerPhotos.photos[viewerPhotos.index]} alt={`Incident photo ${viewerPhotos.index + 1}`} />
+            <div className="incident-photo-viewer-bar">
+              <button
+                type="button"
+                disabled={viewerPhotos.index === 0}
+                onClick={() => setViewerPhotos((v) => ({ ...v, index: v.index - 1 }))}
+              >
+                ‹ Prev
+              </button>
+              <span>{viewerPhotos.index + 1} / {viewerPhotos.photos.length}</span>
+              <button
+                type="button"
+                disabled={viewerPhotos.index >= viewerPhotos.photos.length - 1}
+                onClick={() => setViewerPhotos((v) => ({ ...v, index: v.index + 1 }))}
+              >
+                Next ›
+              </button>
+              <button type="button" onClick={() => setViewerPhotos(null)}>✕ Close</button>
             </div>
-          ))}
+          </div>
         </div>
       )}
     </div>

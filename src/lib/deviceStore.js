@@ -1,4 +1,5 @@
 import { Preferences } from '@capacitor/preferences';
+import { isUuidString } from './uuid';
 
 const LOOKUP_KEY = 'nightguard_lookup_data';
 const PATROL_CONFIG_KEY = 'nightguard_patrol_config';
@@ -338,12 +339,34 @@ export function purgeSiteScopedPatrolCaches() {
   console.warn('[DeviceStore] site changed — cleared patrol config, patrol list and synced scans');
 }
 
+export const NIGHTGUARD_SHIFT_SESSION_EVENT = 'nightguard_shift_session_updated';
+
 export function getShiftSession() {
   return readJson(SHIFT_SESSION_KEY, null);
 }
 
 export function saveShiftSession(session) {
-  return writeJson(SHIFT_SESSION_KEY, session);
+  const saved = writeJson(SHIFT_SESSION_KEY, session);
+  // AuthContext mirrors the session in React state, and callers read
+  // `shiftSession?.id || getShiftSession()?.id` — state first. Without this the offline queue
+  // can reconcile the id in localStorage and every screen would still send the stale one.
+  dispatchStoreEvent(NIGHTGUARD_SHIFT_SESSION_EVENT);
+  return saved;
+}
+
+// The device session is created locally with a `shift_<ts>` id, because it must work with no
+// network. The server drops any non-UUID id (see startShiftRecord) and mints its own, so once
+// /shifts/start syncs we have to adopt the real UUID here — otherwise every record written
+// afterwards carries a `shift_…` string, `nullableUuid()` turns it into null on insert, and
+// nothing is ever attributable to the session. That is exactly why shift_id was null everywhere.
+export function reconcileShiftSessionId(localId, serverId) {
+  if (!isUuidString(serverId)) return false;
+  const session = getShiftSession();
+  if (!session || session.id === serverId) return false;
+  if (localId && session.id !== localId) return false;
+  saveShiftSession({ ...session, id: serverId, localId: session.id });
+  console.info(`[DeviceStore] adopted server shift id ${serverId} (was ${session.id})`);
+  return true;
 }
 
 export function clearShiftSession() {
@@ -534,31 +557,15 @@ export function updateCachedVehicle(id, updates) {
   );
 }
 
-export function getReportEmailSettings() {
-  return readJson(REPORT_EMAIL_SETTINGS_KEY, {});
-}
-
-export function saveReportEmailSettings(settings) {
-  const saved = writeJson(REPORT_EMAIL_SETTINGS_KEY, settings);
-  dispatchStoreEvent('nightguard_report_schedules_updated');
-  return saved;
-}
-
-export function getReportEmailSetting(reportKey) {
-  const settings = getReportEmailSettings();
-  return settings[reportKey] || {
-    enabled: false,
-    time: '06:00',
-    subject: '',
-    recipients: '',
-  };
-}
-
-export function saveReportEmailSetting(reportKey, value) {
-  return saveReportEmailSettings({
-    ...getReportEmailSettings(),
-    [reportKey]: value,
-  });
+// Report email settings (recipients, subject, a nightly send time) lived here to feed
+// an "Email delivery" panel that never delivered any email — see ShareButton in
+// components/ReportKit.jsx. Reports are shared from the device now, so there is
+// nothing to store. Old devices keep a stale key in localStorage; it is harmless and
+// gets dropped whenever the app's storage is cleared.
+export function clearLegacyReportEmailSettings() {
+  try {
+    localStorage.removeItem(REPORT_EMAIL_SETTINGS_KEY);
+  } catch { /* ignore */ }
 }
 
 export function getLastSyncAt() {

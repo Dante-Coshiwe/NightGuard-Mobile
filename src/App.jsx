@@ -85,9 +85,10 @@ const AppRuntimeBridge = () => {
     const foreground = CapacitorApp.addListener('appStateChange', ({ isActive }) => {
       if (isActive) {
         window.dispatchEvent(new Event('nightguard_notifications_updated'));
-        // Re-assert kiosk lock whenever the app returns to the foreground — Android may have
-        // dropped screen-pinning while backgrounded.
-        KioskService.ensureActive().catch(() => null);
+        // Re-assert the kiosk lock whenever the app returns to the foreground — Android may have
+        // dropped screen-pinning while backgrounded. resumeFromExternalApp also ends any grace
+        // window opened for a deliberate trip to WhatsApp: the guard is back, so the lock is back.
+        KioskService.resumeFromExternalApp().catch(() => null);
         reconcileAppDeparture();
       } else {
         markAppBackgrounded({ user: userRef.current });
