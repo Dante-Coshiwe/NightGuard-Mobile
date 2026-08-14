@@ -626,3 +626,61 @@
 .incident-photo-viewer-bar button:disabled {
   opacity: 0.4;
 }
+
+/* Recovered report banner — see lib/incidentDraft.js. Deliberately calm rather than an
+   error: nothing has gone wrong from the guard's side, their work is simply still here. */
+.incident-draft-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border: 1px solid #3f3418;
+  border-radius: 8px;
+  background: #1a1608;
+}
+
+.incident-draft-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.incident-draft-text strong {
+  font-size: 13px;
+  color: #fbbf24;
+}
+
+.incident-draft-text span {
+  font-size: 12px;
+  color: #8a8172;
+}
+
+.incident-draft-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.incident-draft-resume,
+.incident-draft-discard {
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.incident-draft-resume {
+  border: none;
+  background: #b45309;
+  color: #fff;
+  font-weight: 600;
+}
+
+.incident-draft-discard {
+  border: 1px solid #3a3a3a;
+  background: transparent;
+  color: #999;
+}

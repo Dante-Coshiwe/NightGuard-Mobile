@@ -514,6 +514,61 @@ the guard sidebar has no Settings entry, so on a kiosk handset there is no manua
 Verify a rollout by watching `ota_update_logs` go `check` → `download_started` → `downloaded` →
 (background event) → the device reporting the new version as its `from_version`.
 
+### `--mandatory` reloads the app WHEREVER the guard is standing
+
+**Symptom (2026-08-14):** a guard adding a photo to an incident report had the app "do a weird
+refresh". The report and the photo were gone. Nothing was logged as an error.
+
+`ota_update_logs` told the whole story: `downloaded` 07:48:49.183, `applied` 07:48:49.678 — half a
+second apart, the same `runOtaUpdate` call. Not a background swap. An inline reload, from
+[liveUpdate.js:291](src/services/liveUpdate.js#L291):
+
+```js
+const applyNow = immediate || (check.mandatory === true && !shiftRunning);
+if (applyNow) { await updater.set({ id: bundle.id }); }   // destroys the JS context
+```
+
+Three things made it land exactly on the photo:
+
+1. `check()` runs on **every resume**, and returning from the camera or the photo picker *is* a
+   resume. So coming back from a photo was precisely when this fired.
+2. The 90-second idle rule — whose comment already said *"a reload while somebody is typing a
+   visitor's name throws the form away"* — lives on `applyStagedUpdateIfSafe()`, which **never
+   runs**: it returns `deferred: shift_running` first, and under the device-session model that
+   session never clears. The careful gate was on the dead path; the live path had none.
+3. `shiftRunning` was false, so nothing else stopped it.
+
+Fixed by gating the inline apply the same way (`deviceIsIdle()`), and by adding
+`holdLiveUpdates(reason)` — an explicit hold any screen with unsaved work can take. Idle time alone
+is not enough: a guard standing in the camera for two minutes looks perfectly idle from inside the
+updater. `IncidentScreen` holds it for as long as the wizard is open. The resume handler also calls
+`touch()` **before** `check()`, so returning from the camera is never mistaken for an idle device.
+
+**Immediate mitigation with no new bundle:** `UPDATE ota_bundles SET is_mandatory = false` for the
+version. `applyNow` goes false, the bundle stages instead, and it applies on the next
+background/restart. That is what was done to 1.1.24 on the day.
+
+### React state is not storage — an unfinished incident report must be on disk
+
+The wizard held everything in React state, so anything that destroyed the JS context threw away the
+guard's written account AND the photos, silently. OTA was only the newest cause; the common one has
+nothing to do with OTA at all — **taking a photo launches an external activity, and a low-RAM
+handset routinely reclaims the app behind it.**
+
+[src/lib/incidentDraft.js](src/lib/incidentDraft.js) persists the draft, restores it behind a
+"Unfinished report — Resume / Discard" banner, and clears it on submit or explicit Back (a reload is
+not a decision to abandon; pressing Back is).
+
+Two things it must keep doing:
+
+- **The draft goes to the FILESYSTEM on native, never localStorage.** Photos are base64 megabytes,
+  and the offline queue shares that quota — `saveQueue()`'s only failure handling is a
+  `console.error`, so a quota exception there silently discards the entire outbox. Saving one unsent
+  form must never cost every queued write. On web it keeps text only, for the same reason.
+- **Rehydrate `blob` from the data URL on restore.** `uploadEntryPhotos()` filters on `p?.blob`, so
+  a restored photo without one is dropped on submit with no error — the exact class of bug the
+  draft exists to prevent.
+
 ### Bundles now install themselves — the Settings button is the override
 
 Staging was never a rollout. `next()` applies on the next app **start**, and a gatehouse tablet is

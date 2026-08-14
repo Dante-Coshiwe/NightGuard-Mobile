@@ -18,6 +18,15 @@ import { incidentPhotoUrls, pendingPhotoCount, stripPendingPhotosFromList } from
 import { summariseDevices } from '../lib/deviceAttribution';
 import { getCurrentDeviceRecord } from '../services/schemaData';
 import DeviceBreakdown from '../components/DeviceBreakdown';
+import {
+  clearIncidentDraft,
+  draftHasContent,
+  flushIncidentDraft,
+  installIncidentDraftFlush,
+  loadIncidentDraft,
+  saveIncidentDraft,
+} from '../lib/incidentDraft';
+import { holdLiveUpdates } from '../services/liveUpdate';
 
 // An incident is evidence, not an album. The cap keeps a queued incident's base64 photos inside the
 // storage the offline queue shares with everything else — see stripPendingPhotos.
@@ -70,7 +79,33 @@ export default function IncidentScreen() {
   // question from before that submit, so applying it would drop the incident the guard just filed
   // off the list AND out of the cache — see loadIncidents.
   const submitSeq = useRef(0);
+  // An unfinished report recovered from disk, offered back rather than silently reinstated —
+  // see lib/incidentDraft.js for everything that can destroy the form mid-write.
+  const [recoveredDraft, setRecoveredDraft] = useState(null);
   const { post } = useOfflineApi();
+
+  useEffect(() => {
+    let cancelled = false;
+    loadIncidentDraft().then((draft) => {
+      if (!cancelled && draftHasContent(draft)) setRecoveredDraft(draft);
+    }).catch(() => null);
+    return installIncidentDraftFlush();
+  }, []);
+
+  // Stop anything reloading the app while the wizard is open. This covers what idle time
+  // cannot: a guard standing in the camera for two minutes looks perfectly idle from inside
+  // the updater. Keyed on `view` alone so it is taken once, not churned on every keystroke.
+  useEffect(() => {
+    if (view !== 'form') return undefined;
+    return holdLiveUpdates('incident-form');
+  }, [view]);
+
+  // Persist as it is filled. Debounced inside, and forced out the moment the app loses the
+  // foreground — which is exactly when the camera opens.
+  useEffect(() => {
+    if (view !== 'form') return;
+    saveIncidentDraft({ formData, currentStep });
+  }, [view, formData, currentStep]);
 
   useEffect(() => {
     loadIncidents();
@@ -322,6 +357,9 @@ export default function IncidentScreen() {
       setView('list');
       setCurrentStep(1);
       setFormData(emptyForm());
+      // The report is in the outbox now; the draft has done its job.
+      await clearIncidentDraft();
+      setRecoveredDraft(null);
       const photoNote = pendingPhotos.length
         ? ` — ${pendingPhotos.length} photo${pendingPhotos.length === 1 ? '' : 's'} will upload when there is signal`
         : (photoUrls.length ? ` with ${photoUrls.length} photo${photoUrls.length === 1 ? '' : 's'}` : '');
@@ -345,7 +383,21 @@ export default function IncidentScreen() {
     return (
       <div className="incident-container">
         <div className="incident-header">
-          <button className="back-button" onClick={() => { setView('list'); setCurrentStep(1); }}>← Back</button>
+          {/* Backing out is a decision to abandon the report, so the draft goes with it —
+              otherwise every abandoned form leaves a resume banner nagging on the list. A
+              reload is NOT a decision, which is why that case keeps the draft. */}
+          <button
+            className="back-button"
+            onClick={async () => {
+              setView('list');
+              setCurrentStep(1);
+              setFormData(emptyForm());
+              await clearIncidentDraft();
+              setRecoveredDraft(null);
+            }}
+          >
+            ← Back
+          </button>
           <h1>Report Incident</h1>
         </div>
 
@@ -457,7 +509,11 @@ export default function IncidentScreen() {
             <div className="photo-section">
               <label className="form-label">Photo of Vehicle</label>
               <input type="file" className="photo-input" id="vehicle-photo" accept="image/*" capture="environment" onChange={e => handlePhotoCapture('vehicle', e)} />
-              <button type="button" className="photo-button" onClick={() => document.getElementById('vehicle-photo').click()}>Capture Vehicle Photo</button>
+              {/* Force the draft to disk before handing control to the camera. The
+                  visibilitychange flush covers a full camera activity, but Android 13+ shows
+                  the photo picker as a bottom sheet that never hides the WebView — and the
+                  camera is exactly where a low-RAM handset reclaims the app. */}
+              <button type="button" className="photo-button" onClick={async () => { await flushIncidentDraft(); document.getElementById('vehicle-photo').click(); }}>Capture Vehicle Photo</button>
               {formData.vehiclePhoto && (
                 <div className="photo-grid-item" style={{ marginTop: 8 }}>
                   <img src={formData.vehiclePhoto.dataUrl} alt="Vehicle" />
@@ -473,7 +529,7 @@ export default function IncidentScreen() {
             <h2>Step 4: Incident Images</h2>
             <div className="photo-section">
               <input type="file" className="photo-input" id="incident-photos" accept="image/*" capture="environment" multiple onChange={e => handlePhotoCapture('incident', e)} />
-              <button type="button" className="photo-button" onClick={() => document.getElementById('incident-photos').click()}>Add Photos</button>
+              <button type="button" className="photo-button" onClick={async () => { await flushIncidentDraft(); document.getElementById('incident-photos').click(); }}>Add Photos</button>
             </div>
             {formData.incidentPhotos?.length > 0 ? (
               <div className="photos-grid">
@@ -512,6 +568,46 @@ export default function IncidentScreen() {
       </div>
 
       {success && <div className="success-message">{success}</div>}
+
+      {recoveredDraft && (
+        <div className="incident-draft-banner">
+          <div className="incident-draft-text">
+            <strong>Unfinished report</strong>
+            <span>
+              Saved {new Date(recoveredDraft.savedAt).toLocaleString(undefined, {
+                month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+              })}
+              {recoveredDraft.photosDropped > 0
+                ? ` — ${recoveredDraft.photosDropped} photo${recoveredDraft.photosDropped === 1 ? '' : 's'} could not be kept`
+                : ''}
+            </span>
+          </div>
+          <div className="incident-draft-actions">
+            <button
+              type="button"
+              className="incident-draft-resume"
+              onClick={() => {
+                setFormData({ ...emptyForm(), ...recoveredDraft.formData });
+                setCurrentStep(recoveredDraft.currentStep || 1);
+                setRecoveredDraft(null);
+                setView('form');
+              }}
+            >
+              Resume
+            </button>
+            <button
+              type="button"
+              className="incident-draft-discard"
+              onClick={async () => {
+                await clearIncidentDraft();
+                setRecoveredDraft(null);
+              }}
+            >
+              Discard
+            </button>
+          </div>
+        </div>
+      )}
 
       {loading && visibleIncidents.length === 0 ? (
         <div style={{ textAlign: 'center', padding: '40px', color: '#666' }}>Loading incidents...</div>

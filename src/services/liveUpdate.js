@@ -24,7 +24,7 @@ import { getSiteBinding } from '../lib/siteResolver';
 // Web bundle version currently shipped. Bump this on every release you publish
 // (it must match the `version` you pass to `ota:publish`). It is what the
 // server compares against to decide if a newer bundle exists.
-export const OTA_CURRENT_VERSION = '1.1.24';
+export const OTA_CURRENT_VERSION = '1.1.25';
 
 const OTA_CHECK_FN = 'ota-check';
 const OTA_REPORT_FN = 'ota-report';
@@ -245,15 +245,30 @@ async function doRunOtaUpdate({ immediate = false } = {}) {
     return { status: 'up_to_date' };
   }
 
-  // Already downloaded and staged on a previous check — don't re-download the
-  // same bundle on every launch while it waits for a background/restart to apply.
-  // (immediate skips this: the user asked to apply NOW, staging isn't enough.)
-  // A mandatory bundle normally re-checks so it can apply as soon as possible,
-  // but while a shift is running it cannot be applied anyway — so honour the
-  // staged marker rather than re-downloading it every 30 minutes on a kiosk.
   const shiftRunning = Boolean(getShiftSession());
+
+  // Can this bundle be swapped in RIGHT NOW, inline, destroying the JS context where the
+  // guard is standing? Only for a mandatory bundle, and only when nothing is going on.
+  //
+  // `deviceIsIdle()` is the fix for a real incident (2026-08-14): a guard adding a photo to
+  // an incident report had the app reload under them and lost the report and the picture.
+  // `check()` runs on every resume, and returning from the camera IS a resume — so the
+  // moment a photo comes back was exactly when this fired. The 90-second idle rule already
+  // existed and its comment already said "a reload while somebody is typing throws the form
+  // away", but it lived on applyStagedUpdateIfSafe(), which never runs: that function
+  // returns `deferred: shift_running` first, and under the device-session model the session
+  // never clears. The careful gate was on the dead path; this, the live one, had none.
+  //
+  // `immediate` is the Settings override — an admin who pressed the button asked for it.
+  const canApplyInline = immediate
+    || (check.mandatory === true && !shiftRunning && deviceIsIdle() && !updatesHeld());
+
+  // Already downloaded and staged on a previous check — don't re-download the same bundle
+  // on every launch while it waits for a background/restart. A mandatory bundle re-checks
+  // so it can apply as soon as possible, but only when it could actually apply: otherwise
+  // it re-downloads the same megabytes every 30 minutes on a kiosk and never applies.
   const stagedAlready = localStorage.getItem(OTA_STAGED_KEY) === check.version;
-  if (!immediate && stagedAlready && (check.mandatory !== true || shiftRunning)) {
+  if (!immediate && stagedAlready && !canApplyInline) {
     return { status: 'staged', version: check.version };
   }
 
@@ -282,13 +297,12 @@ async function doRunOtaUpdate({ immediate = false } = {}) {
     // the Edge Function does not round-trip; we log by version instead.
     await reportOta({ ...base, status: 'downloaded' });
 
-    // A mandatory bundle still must not be applied out from under a guard who is
-    // on duty: set() destroys the JS context and reloads. Nothing is lost — the
-    // shift session, the offline queue and the Supabase session all live in
-    // storage that survives the swap — but the screen going blank mid-patrol
-    // reads as a crash. Stage it instead; it applies the moment the app next
-    // goes to the background or restarts, which for a kiosk is the shift change.
-    const applyNow = immediate || (check.mandatory === true && !shiftRunning);
+    // Decided above, before the download, so the staged-marker check and this agree.
+    // NOTE: "nothing is lost" is true of the shift session, the offline queue and the
+    // Supabase session — all of which live in storage that survives the swap — but it was
+    // never true of anything held in React state, which is where a half-written incident
+    // report and its freshly captured photos live. See lib/incidentDraft.js.
+    const applyNow = canApplyInline;
 
     if (applyNow) {
       await reportOta({ ...base, status: 'applied' });
@@ -341,6 +355,32 @@ const AUTO_APPLY_POLL_MS = 60 * 1000;
 let lastInteractionAt = Date.now();
 let automationInstalled = false;
 
+// Screens holding work that a reload would destroy. Idle time alone is not enough: a guard
+// reading a form, or standing in the camera for two minutes, looks perfectly idle from in
+// here. Note the resume handler calls touch() BEFORE check(), so coming back from the camera
+// is never mistaken for idle either.
+const updateHolds = new Set();
+
+function deviceIsIdle() {
+  return Date.now() - lastInteractionAt >= IDLE_BEFORE_APPLY_MS;
+}
+
+function updatesHeld() {
+  return updateHolds.size > 0;
+}
+
+/**
+ * Block context-destroying updates while something unsaved is on screen. Returns the release
+ * function; call it when the work is finished or abandoned.
+ *
+ *   useEffect(() => holdLiveUpdates('incident-form'), []);
+ */
+export function holdLiveUpdates(reason = 'unsaved-work') {
+  const token = `${reason}:${Math.random().toString(36).slice(2)}`;
+  updateHolds.add(token);
+  return () => { updateHolds.delete(token); };
+}
+
 // The bundle downloaded and waiting, or null. Cheap enough to poll.
 async function getStagedBundle() {
   const { plugin: updater } = await loadUpdaterBox();
@@ -361,9 +401,15 @@ export async function applyStagedUpdateIfSafe({ requireIdle = true } = {}) {
   if (getShiftSession()) return { status: 'deferred', reason: 'shift_running' };
 
   // Rule 2.
-  if (requireIdle && Date.now() - lastInteractionAt < IDLE_BEFORE_APPLY_MS) {
+  if (requireIdle && !deviceIsIdle()) {
     return { status: 'deferred', reason: 'in_use' };
   }
+
+  // Rule 3. Something unsaved is on screen. This holds even on a resume (requireIdle:false):
+  // the comment below used to reason that "coming back from the background is the cleanest
+  // moment there is, nothing is half-typed" — which is wrong precisely when the thing that
+  // backgrounded the app was the camera, opened from a half-filled incident report.
+  if (updatesHeld()) return { status: 'deferred', reason: 'unsaved_work' };
 
   const staged = await getStagedBundle();
   if (!staged?.id) return { status: 'nothing_staged' };
@@ -405,10 +451,13 @@ export function installLiveUpdateAutomation({ periodicCheckMs = 30 * 60 * 1000 }
   import('@capacitor/app').then(({ App }) => {
     App.addListener('appStateChange', ({ isActive }) => {
       if (!isActive) return;
+      // BEFORE check(): returning from the camera or the photo picker is a resume, and
+      // without this the guard who just took a photo looks like an idle device to the
+      // apply gate — which is exactly how a reload landed on a half-filled report.
       touch();
       check();
-      // Coming back from the background is the cleanest moment there is: nothing is
-      // half-typed, so the idle requirement does not apply.
+      // Coming back from the background is usually a clean moment — but not when what
+      // backgrounded the app was the camera, so an active hold still wins (Rule 3).
       applyStagedUpdateIfSafe({ requireIdle: false }).catch(() => null);
     });
   }).catch(() => { /* @capacitor/app unavailable */ });
