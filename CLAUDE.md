@@ -1,19 +1,37 @@
 # Working notes for this repo
-## Release / OTA note - 2026-08-17 (APK 1.30 / bundle 1.1.32) — SHIPPED
+## Release / OTA note - 2026-08-17 (APK 1.31 / bundle 1.1.35) — SHIPPED, EMULATOR-VERIFIED
 
-Both halves are live.
-
-* **APK `1.30` / `versionCode 31`** — on the GitHub `Version1` release, replacing 1.29.
-  SHA-256 `B4AE5061CDB78F9C09C2C63AAEA32079915E0B7FD8D6FA437200889C082A753D`,
-  signed `CN=NightGuard Track` (not the debug fallback).
+* **APK `1.31` / `versionCode 32`** — on the GitHub `Version1` release.
+  SHA-256 `3841F16062D817D835C077DD2F2FF2FCD5A0019F9BB7481EE642EC43306655F5`,
+  signed `CN=NightGuard Track` (not the debug fallback). Carries built-in bundle 1.1.35.
   https://github.com/Dante-Coshiwe/nightguard-APPS/releases/download/Version1/app-release.apk
-* **Bundle `1.1.32`** — published to the `production` channel, **not** mandatory.
-  SHA-256 `e3217e76b634215be0486c01cce92e3b739b13f42ab3a8839af5da0257797c4f`.
+* **Bundle `1.1.35`** — `production`, **`is_mandatory: true`**.
+  SHA-256 `0f4735747badf90b2d1e60472af0c6adeb2d6a2293b31d7fe61cfc9553606dea`.
+  Mandatory was checked first, not assumed: all five devices run ≥ 1.1.25 and so carry the
+  `deviceIsIdle()` gate on the inline apply. See the 2026-08-14 note further down for why.
 
-The APK carries the Android 10 keyboard black-bar fix (native only — see below). The bundle carries
-the device re-registration and offline-queue fixes, so handsets still on APK 1.27/1.28 get those
-without a reinstall. **The two OUKITEL WP5s must be reinstalled by hand** — nothing else delivers a
-native change.
+**The two OUKITEL WP5s must be reinstalled by hand** — nothing else delivers a native change.
+
+### Verified on the emulator (Pixel_2_XL_API30, Android 11, WebView 83), not just reasoned about
+
+Driven over the Chrome DevTools Protocol against the running release APK — release builds here do
+expose `webview_devtools_remote_<pid>`, so `adb forward` + `Runtime.evaluate` gives a real handle on
+the live app. That is the cheapest way to test the outbox; do it again rather than guessing.
+
+1. **Rejected item does not block the queue.** Queue seeded with a doomed OB entry (bogus
+   `site_id`) FIRST and two valid ones behind it. The bad one stayed queued
+   (`attempts: 1`, RLS refusal); both good ones reached Supabase with a correct `device_id`.
+2. **Hanging upload does not block the queue** — the bug 1.1.35 fixes. `window.fetch` patched to
+   never settle for `/storage/v1/object/`, one entry with a `_pendingPhoto` queued FIRST.
+   Timeline: storage hung at +0.1s, the 45s photo timeout fired, the two entries behind it synced
+   at **+48.1s** with `lastError: "Sync timed out: pedestrians photo"` on the stuck item. Before
+   the fix that await was unbounded and nothing behind it would ever have moved.
+3. **No keyboard black bar on API 30.** Screenshot with the IME open: content runs to the keyboard's
+   top edge (the card under it is clipped mid-card), no gap, header still in place.
+   `window.innerHeight === visualViewport.height`.
+
+Test rows were written to the LIVE database and deleted afterwards — verify cleanup, do not leave
+`QUEUETEST-*` / `QUEUEHANG-*` rows behind.
 
 `SUPABASE_SERVICE_ROLE_KEY` is not in this repo's `.env`; the service key in
 `Desktop/NightGuardTrackApp/backend/.env` (`SUPABASE_SERVICE_KEY`) is the same secret and is what
