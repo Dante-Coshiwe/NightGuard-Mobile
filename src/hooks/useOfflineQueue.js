@@ -71,10 +71,28 @@ const MAX_PHOTO_ATTEMPTS = 3;
 // restarted — the queue silently stops draining while the guard keeps patrolling.
 const SYNC_ITEM_TIMEOUT_MS = 20000;
 
-function withSyncTimeout(promise, label) {
+// EVERY await inside syncInFlight must be bounded, not just the write itself.
+//
+// A photo upload is a raw supabase.storage.upload() (photoCapture.js uploadEntryPhoto) and
+// supabase-js sets no fetch timeout, so a half-open connection — a gate phone showing bars with no
+// data, which is the normal way mobile signal dies — never settles. That await sat between the
+// queue loop and everything after it, so the loop never advanced, syncInFlight never resolved, and
+// because syncOfflineQueueNow() hands the SAME promise back to every later caller
+// (`if (syncInFlight) return syncInFlight`), the entire outbox stopped draining until the app
+// process was restarted. One stalled photo froze every queued patrol, gate entry and incident
+// behind it — silently, with the banner still saying "uploading automatically".
+//
+// Photos get a longer budget than a write: they are up to ~1600px of JPEG on a gate's connection,
+// and killing a slow-but-progressing upload just to retry it from zero is worse than waiting.
+const PHOTO_UPLOAD_TIMEOUT_MS = 45000;
+// The post-drain cache refresh and sync-log write are AFTER saveQueue(), so a hang there cannot
+// lose queued work — but it still wedges syncInFlight permanently, which stops every future drain.
+const POST_SYNC_TIMEOUT_MS = 15000;
+
+function withSyncTimeout(promise, label, ms = SYNC_ITEM_TIMEOUT_MS) {
   let timer;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`Sync timed out: ${label}`)), SYNC_ITEM_TIMEOUT_MS);
+    timer = setTimeout(() => reject(new Error(`Sync timed out: ${label}`)), ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
@@ -654,12 +672,16 @@ export async function syncOfflineQueueNow() {
           let photoFailure = null;
 
           try {
-            uploadedUrls = await uploadPendingPhotos({
-              pendingPhotos: remappedData._pendingPhotos,
-              type: 'incidents',
-              tempId: item.clientTempId || String(item.id),
-              siteId: remappedData.site_id,
-            });
+            uploadedUrls = await withSyncTimeout(
+              uploadPendingPhotos({
+                pendingPhotos: remappedData._pendingPhotos,
+                type: 'incidents',
+                tempId: item.clientTempId || String(item.id),
+                siteId: remappedData.site_id,
+              }),
+              'incident photos',
+              PHOTO_UPLOAD_TIMEOUT_MS,
+            );
           } catch (photoErr) {
             photoFailure = photoErr;
           }
@@ -691,12 +713,16 @@ export async function syncOfflineQueueNow() {
           let photoFailure = null;
 
           try {
-            uploadedUrl = await uploadPendingPhoto({
-              pendingPhoto: remappedData._pendingPhoto,
-              type: photoType,
-              tempId: item.clientTempId || String(item.id),
-              siteId: remappedData.site_id,
-            });
+            uploadedUrl = await withSyncTimeout(
+              uploadPendingPhoto({
+                pendingPhoto: remappedData._pendingPhoto,
+                type: photoType,
+                tempId: item.clientTempId || String(item.id),
+                siteId: remappedData.site_id,
+              }),
+              `${photoType} photo`,
+              PHOTO_UPLOAD_TIMEOUT_MS,
+            );
           } catch (photoErr) {
             photoFailure = photoErr;
           }
@@ -778,16 +804,27 @@ export async function syncOfflineQueueNow() {
     console.log(`[OfflineQueue] SYNC - Queue updated: ${syncedCount} synced, ${failed.length} failed/pending`);
 
     if (syncedCount > 0) {
-      await refreshOperationalCachesFromDatabase(getCachedSiteSettings()).catch(() => null);
+      // Both are timeboxed for the same reason as the uploads above: .catch() does not rescue a
+      // promise that never settles, and a hang here leaves syncInFlight pinned forever, which
+      // stops every future drain even though the queue itself is already safely saved.
+      await withSyncTimeout(
+        refreshOperationalCachesFromDatabase(getCachedSiteSettings()),
+        'post-sync cache refresh',
+        POST_SYNC_TIMEOUT_MS,
+      ).catch(() => null);
       saveLastSyncAt();
-      await recordDeviceSyncLog({
-        syncType: 'offline_queue',
-        syncStatus: failed.length ? 'partial' : 'completed',
-        recordsSynced: syncedCount,
-        startedAt,
-        completedAt: new Date().toISOString(),
-        errorMessage: failed.length ? `${failed.length} items still pending` : '',
-      }, getCachedSiteSettings()).catch(() => null);
+      await withSyncTimeout(
+        recordDeviceSyncLog({
+          syncType: 'offline_queue',
+          syncStatus: failed.length ? 'partial' : 'completed',
+          recordsSynced: syncedCount,
+          startedAt,
+          completedAt: new Date().toISOString(),
+          errorMessage: failed.length ? `${failed.length} items still pending` : '',
+        }, getCachedSiteSettings()),
+        'device sync log',
+        POST_SYNC_TIMEOUT_MS,
+      ).catch(() => null);
       window.dispatchEvent(new Event('nightguard_sync_complete'));
       console.log(`[OfflineQueue] SYNC COMPLETED - final status: ${failed.length ? 'PARTIAL' : 'FULL'}`);
     }
