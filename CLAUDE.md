@@ -15,6 +15,12 @@ So: **before changing anything on the capture or upload path, read the risk regi
 places work can currently go missing, ranked, with the current state of each. The seams between the
 durability layers are where the bugs live — the layers themselves are sound.
 
+**Then read [AUDIT-2026-08-17.md](AUDIT-2026-08-17.md).** It is the measured state of the system as
+of the 1.26 / 1.1.28 release: what is still open (`exit_time` stamped at sync time, the at-most-once
+patrol drain, the kiosk wedge), which columns do **not** exist, and — the one that cost three days
+of shift records — why **a missing SELECT policy silently destroys WRITES**. Every write path here
+ends in `.insert().select().single()`, and `RETURNING` is a read.
+
 Four rules that have each already been learned the hard way here:
 
 1. **A record must be durable before the guard is told it is saved.**
