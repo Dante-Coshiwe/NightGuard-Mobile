@@ -120,18 +120,30 @@ export async function drainBackgroundPatrol({ post, context = {} } = {}) {
   // ⚠ CRUCIAL DATA PATH — this is how a walk done with the screen off reaches the server, and it
   // is the ONLY copy while it is in flight.
   //
-  // PatrolBuffer.drain() returns the route and captures AND CLEARS THEM in the same locked step,
-  // so from here until persistPatrolScan() has written them, the walk exists only in the local
-  // `drained` variable. A process kill in that window loses it: it is already gone natively and
-  // was never handed to the outbox. This is at-most-once delivery on the one path built for a
-  // phone in a pocket, where a kill is expected rather than exceptional.
+  // TWO-PHASE HANDOVER. The native buffer is read with peek(), which consumes nothing; only once
+  // the route is on the session and the captures are through persistPatrolScan() do we
+  // acknowledge() exactly what was stored, and only then does the native side drop it.
   //
-  // The fix is a two-phase drain (hand over → JS persists → acknowledge → clear), NOT removing the
-  // clear: without one, every drain re-delivers the whole walk and the trail duplicates.
+  // The single-step drain() this replaces returned the walk and cleared it together, so from that
+  // return until persistPatrolScan() had written, the walk existed only in a local variable — a
+  // kill there lost it outright, on the one path built for a phone in a pocket where a kill is
+  // expected rather than exceptional.
+  //
+  // The trade is deliberate: at-least-once instead of at-most-once. A kill before the
+  // acknowledgement re-delivers the same points next time, which the dedupe below (and
+  // appendRoutePoint's own distance/time thinning) absorbs. A duplicated point is a cosmetic
+  // problem; a lost patrol is a hole in a security record.
+  //
+  // peek/acknowledge exist only on APK 1.24 and newer. An older shell has drain() alone, so it is
+  // feature-detected rather than assumed — this bundle must keep working on every handset in the
+  // field, not just the freshly flashed ones.
   // See README.md, "Data capture and upload", risk 2.
+  const twoPhase = typeof PatrolTracker.peek === 'function'
+    && typeof PatrolTracker.acknowledge === 'function';
+
   let drained;
   try {
-    drained = await PatrolTracker.drain();
+    drained = twoPhase ? await PatrolTracker.peek() : await PatrolTracker.drain();
   } catch (err) {
     console.warn('[BackgroundPatrol] drain failed:', err?.message || err);
     return result;
@@ -140,15 +152,24 @@ export async function drainBackgroundPatrol({ post, context = {} } = {}) {
   const route = Array.isArray(drained?.route) ? drained.route : [];
   const captures = Array.isArray(drained?.captures) ? drained.captures : [];
 
-  route.forEach((point) => {
-    appendRoutePoint({
-      latitude: point.latitude,
-      longitude: point.longitude,
-      accuracy: point.accuracy,
-      timestamp: point.at,
+  // appendRoutePoint writes into the ACTIVE session and returns null when there is none, so
+  // without a session these points land nowhere. That has always been true — this function is
+  // documented as having to run before the session ends — but under the two-phase handover it
+  // matters more: acknowledging what was never stored would delete it for real.
+  const hasSession = Boolean(getActivePatrolSession());
+  if (hasSession) {
+    route.forEach((point) => {
+      appendRoutePoint({
+        latitude: point.latitude,
+        longitude: point.longitude,
+        accuracy: point.accuracy,
+        timestamp: point.at,
+      });
     });
-  });
-  result.routePoints = route.length;
+    result.routePoints = route.length;
+  } else if (route.length) {
+    console.warn(`[BackgroundPatrol] no active session — discarding ${route.length} orphaned route point(s)`);
+  }
 
   const configured = getPatrolConfig().checkpoints;
   // The session is the single source of truth for what this patrol has already credited. Belt and
@@ -158,9 +179,16 @@ export async function drainBackgroundPatrol({ post, context = {} } = {}) {
     (getActivePatrolSession()?.reachedCheckpointIds || []).map(String)
   );
 
+  // Counts the LEADING captures that are safely dealt with, because acknowledge() drops from the
+  // head. The first genuine failure stops the count and the loop: everything from there stays in
+  // the native buffer and comes back on the next drain, which is the whole point of two-phase.
+  let handledCaptures = 0;
+
   for (const capture of captures) {
-    if (alreadyReached.has(String(capture.checkpointId))) continue;
-    alreadyReached.add(String(capture.checkpointId));
+    if (alreadyReached.has(String(capture.checkpointId))) {
+      handledCaptures += 1;
+      continue;
+    }
 
     const matched = configured.find((cp) => String(cp.id) === String(capture.checkpointId)) || {
       id: capture.checkpointId,
@@ -181,13 +209,29 @@ export async function drainBackgroundPatrol({ post, context = {} } = {}) {
       ...context,
     });
 
-    markCheckpointReached(capture.checkpointId);
     try {
       await persistPatrolScan(entry, post);
+      // Credited only AFTER it is stored. Marking first (as this used to) meant a failed persist
+      // was skipped as "already reached" on the retry, so the two-phase handover would have
+      // acknowledged and deleted a scan that was never saved anywhere.
+      markCheckpointReached(capture.checkpointId);
+      alreadyReached.add(String(capture.checkpointId));
       result.captures += 1;
+      handledCaptures += 1;
     } catch (err) {
-      // persistPatrolScan already wrote it to the device; the queue owns delivery from here.
-      console.warn('[BackgroundPatrol] capture handover warning:', err?.message || err);
+      console.warn('[BackgroundPatrol] capture not persisted, leaving it buffered:', err?.message || err);
+      break;
+    }
+  }
+
+  // Phase two. Only now — with the route on the session and the captures through the outbox — does
+  // the native side let go. A failure here is safe by construction: nothing is deleted, so the
+  // same items are handed over again next time.
+  if (twoPhase) {
+    try {
+      await PatrolTracker.acknowledge({ routeCount: route.length, captureCount: handledCaptures });
+    } catch (err) {
+      console.warn('[BackgroundPatrol] acknowledge failed; buffer will be re-drained:', err?.message || err);
     }
   }
 

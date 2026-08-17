@@ -13,9 +13,11 @@ const WRITE_DEBOUNCE_MS = 120;
 //  * A critical write calls flushPersistNow() -> serialiseState(), which serialises the ENTIRE
 //    storage state to one file. Adding a large key makes EVERY critical write more expensive, for
 //    every other key. The outbox already carries base64 photos and has no size cap.
-//  * flushPersistNow() is fire-and-forget. Nothing awaits it, including the appStateChange/pagehide
-//    handlers below — which are the last moment before Android may kill the app, so the write can
-//    still be in flight when the process dies.
+//  * flushPersistNow() returns the in-flight write, and the appStateChange/pause handlers below
+//    await it — those are the last moment before Android may kill the app. Capacitor does not hold
+//    the native side open for a listener's promise, so the write can still in principle be in
+//    flight when the process dies; awaiting narrows the window rather than closing it. Anything
+//    that must be durable before a guard is told so should await flushNativeStorageNow().
 //
 // See README.md, "Data capture and upload", risks 4 and 6.
 //
@@ -83,8 +85,18 @@ function serialiseState() {
   }
 }
 
+let lastPersisted = null;
+
 async function persistState() {
-  await writeJsonFileAtomic(STORAGE_FILE, serialiseState());
+  const payload = serialiseState();
+  // Every critical write serialises the ENTIRE storage state (risk 4), and the outbox — the
+  // biggest key by far — is in CRITICAL_KEYS, so a device with a long backlog pays that cost on
+  // every capture. A repeat flush with byte-identical content buys nothing, and lifecycle events
+  // arrive in clusters (visibilitychange then pagehide then appStateChange, all within a few ms).
+  // Skipping those costs one string compare and saves a whole-state file write.
+  if (payload === lastPersisted) return;
+  await writeJsonFileAtomic(STORAGE_FILE, payload);
+  lastPersisted = payload;
 }
 
 function flushPersistSoon() {
@@ -96,12 +108,28 @@ function flushPersistSoon() {
     });
 }
 
+// Returns the in-flight write so a caller can actually wait for the bytes to land. It used to
+// return nothing, which is what made the last-moment flush fire-and-forget: the handlers below run
+// at the point Android may kill the process, and nothing held the promise. Awaiting is not a
+// guarantee — the platform can still pull the rug — but an unawaited promise had no chance at all.
+// See README.md, "Data capture and upload", risk 6.
 function flushPersistNow() {
   if (flushTimer) {
     clearTimeout(flushTimer);
     flushTimer = null;
   }
   flushPersistSoon();
+  return pendingFlush;
+}
+
+/**
+ * Wait until everything written so far is on disk. Resolves immediately off native, where
+ * localStorage is already the real thing. Use before anything that is about to tell a guard their
+ * work is safe, or before deliberately handing control to another app.
+ */
+export function flushNativeStorageNow() {
+  if (!initialised) return Promise.resolve();
+  return flushPersistNow().catch(() => null);
 }
 
 function schedulePersist() {
@@ -286,12 +314,16 @@ export async function installNativeStoragePersistence() {
 
   // beforeunload does not fire when Android kills a backgrounded app, so the last reliable moment
   // to get everything on disk is the pause event from the native shell.
+  //
+  // These handlers await the flush. Capacitor does not hold the native side open for a listener's
+  // promise, so this is not a guarantee — but it keeps the write at the head of the microtask
+  // queue and stops a second lifecycle event racing the first one's serialisation.
   try {
     const { App } = await import('@capacitor/app');
-    App.addListener('appStateChange', ({ isActive }) => {
-      if (!isActive) flushPersistNow();
+    App.addListener('appStateChange', async ({ isActive }) => {
+      if (!isActive) await flushPersistNow().catch(() => null);
     });
-    App.addListener('pause', flushPersistNow);
+    App.addListener('pause', async () => { await flushPersistNow().catch(() => null); });
   } catch (err) {
     console.warn('[NativeStorage] Could not attach app lifecycle flush:', err?.message || err);
   }

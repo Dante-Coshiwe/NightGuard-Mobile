@@ -16,6 +16,16 @@ import {
 } from '../../lib/deviceStore';
 import { useAuth } from '../../contexts/AuthContext';
 import { buildPendingPhoto, normaliseSelectedPhoto, uploadEntryPhoto } from '../../lib/photoCapture';
+import {
+  clearEntryDraft,
+  entryDraftHasContent,
+  flushEntryDraft,
+  installEntryDraftFlush,
+  loadEntryDraft,
+  saveEntryDraft,
+} from '../../lib/entryDraft';
+import { holdLiveUpdates } from '../../services/liveUpdate';
+import { getBoundSiteIdSync } from '../../lib/siteResolver';
 
 export default function VehicleTab() {
   const { user, shiftSession } = useAuth();
@@ -35,6 +45,9 @@ export default function VehicleTab() {
   const [searchInput, setSearchInput] = useState('');
   const [search, setSearch] = useState('');
   const [activeView, setActiveView] = useState('all');
+  // An unfinished registration recovered from disk, offered back rather than silently
+  // reinstated — see lib/entryDraft.js for everything that can destroy this form mid-write.
+  const [recoveredDraft, setRecoveredDraft] = useState(null);
   const { post, patch, isOnline } = useOfflineApi();
   const onFocus = useScrollIntoView();
   // Prevents nightguard_vehicles_updated event from overwriting a state update
@@ -96,6 +109,34 @@ export default function VehicleTab() {
     window.addEventListener('nightguard_lookup_updated', handleLookupUpdate);
     return () => window.removeEventListener('nightguard_lookup_updated', handleLookupUpdate);
   }, []);
+
+  // A reclaimed app comes back with showForm false — every bit of React state is gone — so the
+  // recovered draft is offered on the LIST, which is where the guard actually lands.
+  useEffect(() => {
+    let cancelled = false;
+    loadEntryDraft('vehicle').then((draft) => {
+      if (!cancelled && entryDraftHasContent(draft)) setRecoveredDraft(draft);
+    }).catch(() => null);
+    const uninstall = installEntryDraftFlush('vehicle');
+    return () => { cancelled = true; uninstall(); };
+  }, []);
+
+  // Stop anything reloading the app while the form is open. This covers what idle time cannot:
+  // a guard standing in the camera for two minutes looks perfectly idle from inside the updater.
+  useEffect(() => {
+    if (!showForm) return undefined;
+    return holdLiveUpdates('vehicle-entry-form');
+  }, [showForm]);
+
+  // Persist as it is filled. Debounced inside, and forced out the moment the app loses the
+  // foreground — which is exactly when the camera opens.
+  useEffect(() => {
+    if (!showForm) return;
+    saveEntryDraft('vehicle', {
+      fields: { driverName, personVisiting, visitorType },
+      photo: photoFile,
+    });
+  }, [showForm, driverName, personVisiting, visitorType, photoFile]);
 
   useEffect(() => {
     const loadVehicles = async () => {
@@ -240,20 +281,24 @@ export default function VehicleTab() {
     }).catch(() => setError('Could not load the selected photo'));
   };
 
-  // ⚠ CRUCIAL / KNOWN RISK — opening the picker launches an external activity, which backgrounds
-  // this app. On a low-RAM handset Android routinely reclaims it there, and everything the guard
-  // typed (driverName, personVisiting, visitorType) plus any photo already taken lives ONLY in
-  // React state: it is gone, silently, and the entry is never made.
+  // ⚠ CRUCIAL — opening the picker launches an external activity, which backgrounds this app. On a
+  // low-RAM handset Android routinely reclaims it there, and everything the guard typed plus any
+  // photo already taken would be gone, silently, with the entry never made.
   //
-  // The exposure here is worse than the incident wizard's, not better. A photo is REQUIRED to
-  // submit (see validateForm), so every single gate entry passes through this moment — and the
-  // text fields sit ABOVE the photo button, so the guard has typed everything before reaching it.
+  // The exposure here is worse than the incident wizard's: a photo is REQUIRED to submit (see
+  // validateForm), so every single gate entry passes through this moment, and the text fields sit
+  // ABOVE the photo button, so the guard has typed everything before reaching it.
   //
-  // IncidentScreen was fixed with two mechanisms that both apply directly here:
-  //   1. holdLiveUpdates('...') while the form is open, so no bundle reloads the app under it.
-  //   2. A draft persisted to the filesystem (see src/lib/incidentDraft.js) and offered back.
-  // Neither is wired up in this tab yet. See README.md, "Data capture and upload", risk 1.
+  // Both mechanisms that make this survivable are wired up above — holdLiveUpdates() while the
+  // form is open, and a filesystem draft (lib/entryDraft.js) flushed on backgrounding. The flush
+  // is forced here as well rather than relying on the visibilitychange listener alone: this is the
+  // one call site that knows for certain the app is about to leave.
   const openPhotoPicker = (inputId) => {
+    saveEntryDraft('vehicle', {
+      fields: { driverName, personVisiting, visitorType },
+      photo: photoFile,
+    });
+    void flushEntryDraft('vehicle');
     document.getElementById(inputId)?.click();
   };
 
@@ -264,7 +309,14 @@ export default function VehicleTab() {
     setSubmitting(true);
 
     const tempId = `veh_${Date.now()}`;
-    const siteId = getCachedSiteSettings().id || null;
+    // The DEVICE's bound site, which is what every read filters on (getCurrentSiteId in
+    // services/api.js resolves the binding first). getCachedSiteSettings() is a different
+    // source with a different precedence, and the two disagree in exactly the window that
+    // matters on a multi-site estate: after a device is relocated on the dashboard the binding
+    // updates immediately while the cached settings hold the OLD site until an online refresh
+    // lands. An entry stamped with the old site is filed into another site's records and
+    // vanishes from this guard's list. See lib/siteResolver.js.
+    const siteId = getBoundSiteIdSync() || getCachedSiteSettings().id || null;
     // Stamp the arrival now, not when the row reaches the server. createVehicle() falls back to
     // now() when entered_at is absent, so a vehicle logged offline used to be recorded at the
     // moment the queue happened to drain rather than when it actually drove in.
@@ -328,7 +380,11 @@ export default function VehicleTab() {
     // Use setTimeout so the event fires and is suppressed, then we release
     setTimeout(() => { suppressCacheEvent.current = false; }, 50);
 
-    // Step 3: Reset form and close — guard can keep working immediately
+    // Step 3: Reset form and close — guard can keep working immediately.
+    // The draft goes only now, after the entry is in the cache above (step 1) and therefore
+    // durable. Clearing it any earlier would open a window where the work exists nowhere.
+    void clearEntryDraft('vehicle');
+    setRecoveredDraft(null);
     setDriverName('');
     setPersonVisiting('');
     setPhoto(null);
@@ -386,7 +442,25 @@ export default function VehicleTab() {
         <div className="form-container">
           <div className="form-header">
             <h2 className="form-title">Register Vehicle</h2>
-            <button className="close-button" onClick={() => { setShowForm(false); setError(''); setVehicleErrors({}); }}>x</button>
+            {/* Closing the form is a decision to abandon the registration, so the draft goes with
+                it — otherwise every abandoned form leaves a resume banner nagging on the list. An
+                Android reclaim is NOT a decision, which is why that case keeps the draft. */}
+            <button
+              className="close-button"
+              onClick={() => {
+                setShowForm(false);
+                setError('');
+                setVehicleErrors({});
+                setDriverName('');
+                setPersonVisiting('');
+                setPhoto(null);
+                setPhotoFile(null);
+                void clearEntryDraft('vehicle');
+                setRecoveredDraft(null);
+              }}
+            >
+              x
+            </button>
           </div>
           {error && <div className="inline-error">{error}</div>}
           <form onSubmit={handleSubmit}>
@@ -464,6 +538,46 @@ export default function VehicleTab() {
 
   return (
     <div className="tab-content">
+      {/* The app was taken away mid-registration — almost always by the camera intent. Offered
+          back rather than reinstated silently, so the guard is told what happened. */}
+      {recoveredDraft && !showForm && (
+        <div className="entry-draft-banner">
+          <div className="entry-draft-text">
+            <strong>Unfinished vehicle registration</strong>
+            <span>
+              {recoveredDraft.fields?.driverName
+                ? `${recoveredDraft.fields.driverName} — `
+                : ''}
+              saved {new Date(recoveredDraft.savedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              {recoveredDraft.photoDropped ? ' (photo not recovered)' : ''}
+            </span>
+          </div>
+          <div className="entry-draft-actions">
+            <button
+              className="entry-draft-resume"
+              onClick={() => {
+                const fields = recoveredDraft.fields || {};
+                setDriverName(fields.driverName || '');
+                setPersonVisiting(fields.personVisiting || '');
+                setVisitorType(fields.visitorType || lookupData.vehicleTypes[0] || 'Visitor');
+                setPhotoFile(recoveredDraft.photo || null);
+                setPhoto(recoveredDraft.photo?.dataUrl || null);
+                setRecoveredDraft(null);
+                setShowForm(true);
+              }}
+            >
+              Resume
+            </button>
+            <button
+              className="entry-draft-discard"
+              onClick={() => { void clearEntryDraft('vehicle'); setRecoveredDraft(null); }}
+            >
+              Discard
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="panel-card">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
           <h2 style={{ fontSize: '16px', fontWeight: 700, margin: 0 }}>

@@ -26,12 +26,22 @@ function getLocalFallback() {
   }
 }
 
+// This value is the site on the ADMIN'S PROFILE — their home site — and it is NOT this device's
+// site. For a manager who holds several sites they are simply different things, and conflating
+// them is how a handset ends up permanently filed against a site nobody chose:
+// resolveSiteBinding()'s legacy path adopts `site_id` off this record, and login() writes this
+// record three lines before calling it. Marking the provenance lets the resolver tell a binding
+// written here apart from one left by a pre-1.1.0 bundle, which genuinely does record the site
+// the device was operating as. Absence of the marker means "old bundle" — do not invert this.
+export const ADMIN_PROFILE_SITE_SOURCE = 'admin_profile';
+
 export async function saveAdminDeviceBinding(userData = {}, email = '') {
   const binding = {
     admin_email: String(userData.email || email || '').trim().toLowerCase(),
     admin_id: userData.id || '',
     org_id: userData.organization_id || userData.org_id || '',
     site_id: userData.site_id || '',
+    site_id_source: ADMIN_PROFILE_SITE_SOURCE,
     saved_at: new Date().toISOString(),
   };
 

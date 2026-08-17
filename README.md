@@ -132,50 +132,66 @@ These are good and were built deliberately. The risks below are the seams *betwe
 
 ### Known risk areas
 
-Ranked by what it costs when it goes wrong. Nothing here is theoretical — each is a real property of
-the current code.
+Ranked by what it costs when it goes wrong. Nothing here is theoretical — each was a real property of
+the code. All eight were closed for the multi-site rollout (APK **1.24** / bundle **1.1.26**); each
+entry records what the failure was and what now prevents it, because the shape of the bug is what
+stops it being reintroduced.
 
-**1. Unsaved entry forms live only in React state.** [VehicleTab](src/screens/home/VehicleTab.jsx)
-and [PedestrianTab](src/screens/home/PedestrianTab.jsx) hold the typed fields and the captured photo
+**1. Unsaved entry forms lived only in React state.** [VehicleTab](src/screens/home/VehicleTab.jsx)
+and [PedestrianTab](src/screens/home/PedestrianTab.jsx) held the typed fields and the captured photo
 in component state. Both **require** a photo, so every gate entry passes through a camera intent that
 backgrounds the app — and a low-RAM handset routinely gets reclaimed there. The typed fields come
-*before* the photo button, so the maximum amount of work is at risk at the moment of maximum danger.
-There is no draft and no `holdLiveUpdates` hold. `IncidentScreen` was fixed this way
-([src/lib/incidentDraft.js](src/lib/incidentDraft.js)); these two have not been. **Still open.**
+*before* the photo button, so the maximum amount of work was at risk at the moment of maximum danger.
+**Closed:** both tabs now take a `holdLiveUpdates()` hold while the form is open and persist a draft
+to the filesystem via [src/lib/entryDraft.js](src/lib/entryDraft.js), flushed on backgrounding and on
+the photo button itself, and offered back on the list behind a Resume / Discard banner. Same design
+as [src/lib/incidentDraft.js](src/lib/incidentDraft.js); the same storage rule applies — photos go to
+the filesystem on native and are dropped on web, never into the localStorage quota the outbox shares.
 
-**2. The native patrol drain is at-most-once.** `PatrolBuffer.drain()` returns the route and captures
-*and clears them in the same locked step*. `drainBackgroundPatrol()` then persists them JS-side. A
-process kill in that window, or a throw from `persistPatrolScan`, loses the walk — it is already gone
-from the native buffer and was never handed to the outbox. The catch at
-[backgroundPatrol.js:176](src/lib/backgroundPatrol.js#L176) only warns. Making this safe means
-acknowledging the drain after the JS side has persisted, not before.
+**2. The native patrol drain was at-most-once.** `PatrolBuffer.drain()` returned the route and
+captures *and cleared them in the same locked step*, so until `drainBackgroundPatrol()` had persisted
+them the walk existed only in a JS variable — a kill there lost it, on the one path built for a phone
+in a pocket. **Closed:** `PatrolBuffer.peek()` consumes nothing and `PatrolBuffer.acknowledge(n, m)`
+drops only the leading items JS confirms it has stored, so the handover is at-least-once. A failed
+`persistPatrolScan` now breaks the loop and leaves the rest buffered, and `markCheckpointReached` runs
+*after* a successful persist rather than before — marking first would have made a failed scan look
+"already reached" on the retry and acknowledged it away. The JS side feature-detects `peek`, so this
+bundle still runs correctly on older shells that only have `drain`.
 
-**3. A corrupt patrol buffer silently starts from empty.** `PatrolBuffer.read()` returns `empty()` on
-unparseable JSON, deliberately — a corrupt buffer would otherwise block every future write. But it
-has **no `.bak`**, unlike `atomicFile.js` on the JS side. The more fragile half (a service killed
-mid-write, in a pocket, for an hour) has the weaker recovery.
+**3. A corrupt patrol buffer silently started from empty.** `PatrolBuffer.read()` returns `empty()` on
+unparseable JSON, deliberately — a corrupt buffer would otherwise block every future write. But it had
+**no `.bak`**, unlike `atomicFile.js` on the JS side: the more fragile half had the weaker recovery.
+**Closed:** it now keeps a backup and reads primary → `.bak` → staged `.tmp`, the same ladder
+`atomicFile.js` uses. `empty()` remains the last resort, for the same reason as before.
 
-**4. The outbox has no size cap, and every write rewrites everything.** `enqueueOfflineItem` appends
-without limit, and queued incident photos are base64 megabytes. Because `nightguard_offline_queue` is
-in `CRITICAL_KEYS`, each mutation calls `flushPersistNow()` → `serialiseState()`, which serialises
-**the entire storage state** to one file. Cost per write therefore grows with queue size: a device
-offline for a long stretch with photos makes every subsequent capture slower.
+**4. Every outbox write rewrites the entire storage state.** `nightguard_offline_queue` is in
+`CRITICAL_KEYS`, so each mutation calls `flushPersistNow()` → `serialiseState()`, and queued incident
+photos are base64 megabytes — cost per capture grew with the backlog, on the device least able to
+afford it. **Reduced, not eliminated:** `persistState()` now skips a write whose serialised content is
+byte-identical to the last one, which removes the repeat flushes that lifecycle events arrive in
+clusters of. The queue is still uncapped by design — a cap means deleting a guard's work.
 
-**5. `saveQueue()` reports failure only to the console.** A failed write means the outbox delta is
-gone with no user-visible signal and no retry. This is why queued photo bytes must live in exactly
-one place — see the note in CLAUDE.md.
+**5. `saveQueue()` reported failure only to the console.** A failed write lost the outbox delta with
+no user-visible signal and no retry. **Closed:** it retries after pruning the dead-letter list (those
+items have already exhausted their retries; live work has not), returns whether the queue is durable,
+and on final failure raises a non-dismissible banner — the guard is otherwise told an entry is saved
+when it is not. This is still why queued photo bytes must live in exactly one storage key.
 
-**6. The final flush is fire-and-forget.** `flushPersistNow()` is not awaited, including on
-`appStateChange(false)` and `pagehide`. That is the last moment before Android may kill the app, and
-the write can still be in flight.
+**6. The final flush was fire-and-forget.** **Narrowed:** `flushPersistNow()` returns the in-flight
+write and the `appStateChange`/`pause` handlers await it. Capacitor does not hold the native side open
+for a listener's promise, so this shrinks the window rather than closing it; anything that must be
+durable before a guard is told so should await the exported `flushNativeStorageNow()`.
 
-**7. Some sync failures are dropped without a trace.** `classifySyncFailure` returns `drop` for
-404/409/410, and the drop path `continue`s without dead-lettering. A 409 conflict is discarded
-entirely — no record, nothing to inspect later.
+**7. Some sync failures were dropped without a trace.** `classifySyncFailure` returns `drop` for
+404/409/410 and the drop path `continue`d without dead-lettering, so a 409 conflict was discarded with
+nothing left to inspect. **Closed:** dropped items are dead-lettered with `terminal: true` and their
+revivals already spent — the evidence is kept without the item being retried forever.
 
-**8. A long patrol loses the start of its trail.** `appendRoutePoint` trims the oldest half at
-`MAX_ROUTE_POINTS = 5000`. With 6 m / 20 s minimum spacing that is a very long walk, but a patrol
-left running reaches it and the earliest points go silently.
+**8. A long patrol lost the start of its trail.** The native `appendRoutePoint` deleted the oldest
+half at `MAX_ROUTE_POINTS = 5000`, so a patrol left running lost its first hour outright and silently.
+**Closed:** it now halves the resolution of the older portion and keeps the last 500 points intact,
+preserving the shape of the whole walk — the same thinning the JS side in
+[src/lib/patrolSession.js](src/lib/patrolSession.js) already did.
 
 ### Rules for changing any of this
 

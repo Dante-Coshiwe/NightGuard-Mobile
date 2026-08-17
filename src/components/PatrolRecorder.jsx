@@ -4,6 +4,7 @@ import { useGeolocation } from '../hooks/useGeolocation';
 import { useOfflineApi } from '../hooks/useOfflineApi';
 import { isAppOnline } from '../lib/connectivity';
 import { getCachedSiteSettings, getPatrolConfig, getShiftSession } from '../lib/deviceStore';
+import { getBoundSiteIdSync } from '../lib/siteResolver';
 import { buildPatrolScanEntry, evaluateGpsProgress, matchNfcCheckpoint } from '../lib/patrolCheckin';
 import { listenForNfcTags } from '../lib/nfcReader';
 import { persistPatrolScan } from '../lib/patrolScanStore';
@@ -93,7 +94,7 @@ export default function PatrolRecorder() {
         method: 'gps',
         position: fix,
         matchedCheckpoint: checkpoint,
-        siteId: getCachedSiteSettings().id || null,
+        siteId: getBoundSiteIdSync() || getCachedSiteSettings().id || null,
         guardId: user?.id || null,
         guardName: user?.full_name || 'Unknown guard',
         shiftId: shiftSession?.id || getShiftSession()?.id || null,
@@ -141,7 +142,7 @@ export default function PatrolRecorder() {
         method: 'nfc',
         tagUid,
         matchedCheckpoint,
-        siteId: getCachedSiteSettings().id || null,
+        siteId: getBoundSiteIdSync() || getCachedSiteSettings().id || null,
         guardId: user?.id || null,
         guardName: user?.full_name || 'Unknown guard',
         shiftId: shiftSession?.id || getShiftSession()?.id || null,
@@ -185,7 +186,7 @@ export default function PatrolRecorder() {
     await drainBackgroundPatrol({
       post,
       context: {
-        siteId: getCachedSiteSettings().id || null,
+        siteId: getBoundSiteIdSync() || getCachedSiteSettings().id || null,
         guardId: user?.id || null,
         guardName: user?.full_name || 'Unknown guard',
         shiftId: shiftSession?.id || getShiftSession()?.id || null,

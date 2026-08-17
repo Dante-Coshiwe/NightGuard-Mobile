@@ -5,6 +5,7 @@ import { useOfflineApi } from '../hooks/useOfflineApi';
 import { useLiveRefresh } from '../hooks/useLiveRefresh';
 import { isAppOnline } from '../lib/connectivity';
 import { getCachedSiteSettings, getLookupData, getShiftSession } from '../lib/deviceStore';
+import { getBoundSiteIdSync } from '../lib/siteResolver';
 import { getCachedIncidents, setCachedIncidents } from '../lib/reportCache';
 import { useAuth } from '../contexts/AuthContext';
 import {
@@ -256,7 +257,7 @@ export default function IncidentScreen() {
           ? stated.toISOString()
           : new Date().toISOString();
       })();
-      const siteId = getCachedSiteSettings().id || null;
+      const siteId = getBoundSiteIdSync() || getCachedSiteSettings().id || null;
       const incidentPhotos = formData.incidentPhotos || [];
       const vehiclePhoto = formData.vehiclePhoto || null;
 

@@ -106,6 +106,50 @@ public class PatrolTrackerPlugin extends Plugin {
         call.resolve(result);
     }
 
+    /**
+     * Phase one of the safe handover: read the recorded walk WITHOUT consuming it.
+     *
+     * `drain` above clears in the same step it hands over, so a kill before the JS side has
+     * persisted loses the walk outright. The JS side calls peek(), persists, then acknowledge()s
+     * exactly what it stored — at-least-once instead of at-most-once. It feature-detects this
+     * method, so an older bundle on this shell keeps using drain() and still works.
+     * See README.md, "Data capture and upload", risk 2.
+     */
+    @PluginMethod
+    public void peek(PluginCall call) {
+        JSONObject state = PatrolBuffer.peek(getContext());
+        JSObject result = new JSObject();
+        try {
+            result.put("route", state.optJSONArray("route") == null
+                ? new JSONArray() : state.optJSONArray("route"));
+            result.put("captures", state.optJSONArray("captures") == null
+                ? new JSONArray() : state.optJSONArray("captures"));
+            result.put("active", state.optBoolean("active", false));
+            result.put("running", PatrolTrackingService.isRunning());
+        } catch (Exception e) {
+            call.reject("peek_failed: " + e.getMessage());
+            return;
+        }
+        call.resolve(result);
+    }
+
+    /**
+     * Phase two: drop the leading `routeCount` / `captureCount` items now that the JS side has them
+     * on disk. Counts, not a clear — the service keeps recording while JS works.
+     */
+    @PluginMethod
+    public void acknowledge(PluginCall call) {
+        int routeCount = call.getInt("routeCount", 0);
+        int captureCount = call.getInt("captureCount", 0);
+        try {
+            PatrolBuffer.acknowledge(getContext(), routeCount, captureCount);
+        } catch (Exception e) {
+            call.reject("acknowledge_failed: " + e.getMessage());
+            return;
+        }
+        call.resolve(new JSObject().put("acknowledged", true));
+    }
+
     /** Progress without consuming anything — for a status line while the app is open. */
     @PluginMethod
     public void status(PluginCall call) {

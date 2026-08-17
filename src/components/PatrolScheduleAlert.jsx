@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Preferences } from '@capacitor/preferences';
 import { useAuth } from '../contexts/AuthContext';
 import { getCachedSiteSettings, getPatrolConfig, getShiftSession } from '../lib/deviceStore';
+import { getBoundSiteIdSync } from '../lib/siteResolver';
 import { getPatrolDue, raisePatrolDue } from '../lib/patrolDueAlarm';
 import NotificationService from '../services/notificationService';
 
@@ -70,7 +71,7 @@ export default function PatrolScheduleAlert() {
       const activeShift = shiftSession || getShiftSession();
       if ((!user && !activeShift) || getPatrolDue()) return;
 
-      const siteId = getCachedSiteSettings().id || activeShift?.siteId || null;
+      const siteId = getBoundSiteIdSync() || getCachedSiteSettings().id || activeShift?.siteId || null;
       raisePatrolDue({
         time: patrolTime,
         notificationId: notificationId || NotificationService.getNotificationIdForPatrolTime(patrolTime),
@@ -97,7 +98,7 @@ export default function PatrolScheduleAlert() {
       const patrolTimes = Array.isArray(config.patrolTimes) ? config.patrolTimes : [];
       if (!patrolTimes.includes(currentTime)) return;
 
-      const siteId = getCachedSiteSettings().id || activeShift?.siteId || null;
+      const siteId = getBoundSiteIdSync() || getCachedSiteSettings().id || activeShift?.siteId || null;
       const triggerKey = `nightguard_patrol_triggered_${siteId || 'site'}_${formatDateKey(now)}_${currentTime}`;
       const { value } = await Preferences.get({ key: triggerKey }).catch(() => ({ value: localStorage.getItem(triggerKey) }));
       if (value === 'true') return;

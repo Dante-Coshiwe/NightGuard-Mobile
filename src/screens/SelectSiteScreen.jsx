@@ -33,8 +33,14 @@ export default function SelectSiteScreen() {
     listBindableSites()
       .then((rows) => {
         if (!mounted) return;
-        setSites(rows);
-        if (rows.length === 1) setSelected(rows[0].id);
+        // Alphabetical, always. my_sites() does not promise an order, and a manager holding a
+        // dozen sites is scanning this list for one name — an arbitrary order makes them hunt,
+        // and this is a choice they only get to make once per device.
+        const ordered = [...(rows || [])].sort((a, b) => (
+          String(a?.site_name || '').localeCompare(String(b?.site_name || ''), undefined, { sensitivity: 'base' })
+        ));
+        setSites(ordered);
+        if (ordered.length === 1) setSelected(ordered[0].id);
       })
       .catch((err) => {
         if (!mounted) return;

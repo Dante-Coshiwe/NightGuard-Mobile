@@ -8,6 +8,7 @@ import { useOfflineApi } from '../hooks/useOfflineApi';
 import { useLiveRefresh } from '../hooks/useLiveRefresh';
 import { isAppOnline } from '../lib/connectivity';
 import { getCachedSiteSettings, getShiftSession } from '../lib/deviceStore';
+import { getBoundSiteIdSync } from '../lib/siteResolver';
 import { useAuth } from '../contexts/AuthContext';
 import { getCachedObEntries, setCachedObEntries } from '../lib/reportCache';
 import { summariseDevices } from '../lib/deviceAttribution';
@@ -127,7 +128,7 @@ export default function OBScreen() {
       // happened to drain, which for an occurrence book is the one field that has to be right.
       const capturedAt = new Date().toISOString();
       const result = await post('/obentries/create', {
-        site_id: getCachedSiteSettings().id || null,
+        site_id: getBoundSiteIdSync() || getCachedSiteSettings().id || null,
         shift_id: shiftSession?.id || getShiftSession()?.id || null,
         captured_by: user?.id || null,
         guard_id: user?.id || null,

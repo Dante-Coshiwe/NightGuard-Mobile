@@ -661,3 +661,62 @@
   font-size: 13px;
   font-weight: 600;
 }
+
+/* Recovered gate-entry banner — see lib/entryDraft.js. Deliberately calm rather than an error:
+   nothing has gone wrong from the guard's side, their work is simply still here. Mirrors
+   .incident-draft-* in IncidentScreen.css so the two recoveries read as one behaviour. */
+.entry-draft-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border: 1px solid #3f3418;
+  border-radius: 10px;
+  background: #1a1608;
+}
+
+.entry-draft-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.entry-draft-text strong {
+  font-size: 13px;
+  color: #fbbf24;
+}
+
+.entry-draft-text span {
+  font-size: 12px;
+  color: #8a8172;
+}
+
+.entry-draft-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.entry-draft-resume,
+.entry-draft-discard {
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.entry-draft-resume {
+  border: none;
+  background: #b45309;
+  color: #fff;
+  font-weight: 600;
+}
+
+.entry-draft-discard {
+  border: 1px solid #3a3a3a;
+  background: transparent;
+  color: #999;
+}

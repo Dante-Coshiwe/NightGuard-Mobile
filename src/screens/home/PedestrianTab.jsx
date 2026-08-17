@@ -15,6 +15,16 @@ import {
 } from '../../lib/deviceStore';
 import { useAuth } from '../../contexts/AuthContext';
 import { buildPendingPhoto, normaliseSelectedPhoto, uploadEntryPhoto } from '../../lib/photoCapture';
+import {
+  clearEntryDraft,
+  entryDraftHasContent,
+  flushEntryDraft,
+  installEntryDraftFlush,
+  loadEntryDraft,
+  saveEntryDraft,
+} from '../../lib/entryDraft';
+import { holdLiveUpdates } from '../../services/liveUpdate';
+import { getBoundSiteIdSync } from '../../lib/siteResolver';
 
 export default function PedestrianTab() {
   const { user, shiftSession } = useAuth();
@@ -37,6 +47,9 @@ export default function PedestrianTab() {
   const [photoFile, setPhotoFile] = useState(null);
   const [formErrors, setFormErrors] = useState({});
   const [error, setError] = useState('');
+  // An unfinished registration recovered from disk, offered back rather than silently
+  // reinstated — see lib/entryDraft.js for everything that can destroy this form mid-write.
+  const [recoveredDraft, setRecoveredDraft] = useState(null);
 
   const PedestrianThumbnail = ({ photoUrl, label }) => (
     <div className="entry-thumbnail" aria-label={`${label || 'Pedestrian'} photo`}>
@@ -91,6 +104,34 @@ export default function PedestrianTab() {
     window.addEventListener('nightguard_lookup_updated', handleLookupUpdate);
     return () => window.removeEventListener('nightguard_lookup_updated', handleLookupUpdate);
   }, []);
+
+  // A reclaimed app comes back with showForm false — every bit of React state is gone — so the
+  // recovered draft is offered on the LIST, which is where the guard actually lands.
+  useEffect(() => {
+    let cancelled = false;
+    loadEntryDraft('pedestrian').then((draft) => {
+      if (!cancelled && entryDraftHasContent(draft)) setRecoveredDraft(draft);
+    }).catch(() => null);
+    const uninstall = installEntryDraftFlush('pedestrian');
+    return () => { cancelled = true; uninstall(); };
+  }, []);
+
+  // Stop anything reloading the app while the form is open. This covers what idle time cannot:
+  // a guard standing in the camera for two minutes looks perfectly idle from inside the updater.
+  useEffect(() => {
+    if (!showForm) return undefined;
+    return holdLiveUpdates('pedestrian-entry-form');
+  }, [showForm]);
+
+  // Persist as it is filled. Debounced inside, and forced out the moment the app loses the
+  // foreground — which is exactly when the camera opens.
+  useEffect(() => {
+    if (!showForm) return;
+    saveEntryDraft('pedestrian', {
+      fields: { name, visitorType, unitVisiting },
+      photo: photoFile,
+    });
+  }, [showForm, name, visitorType, unitVisiting, photoFile]);
 
   useEffect(() => {
     const loadPedestrians = async () => {
@@ -233,16 +274,20 @@ export default function PedestrianTab() {
     }).catch(() => setError('Could not load the selected photo'));
   };
 
-  // ⚠ CRUCIAL / KNOWN RISK — same exposure as VehicleTab, see the longer note there.
+  // ⚠ CRUCIAL — same exposure as VehicleTab, see the longer note there. Opening the picker
+  // backgrounds the app and a low-RAM handset routinely gets reclaimed behind it; a photo is
+  // REQUIRED to submit, so every pedestrian entry passes through this moment.
   //
-  // Opening the picker backgrounds the app; the typed fields (name, visitorType, unitVisiting) and
-  // any captured photo live ONLY in React state, so an Android reclaim loses the entry silently. A
-  // photo is REQUIRED to submit, so every pedestrian entry passes through this moment.
-  //
-  // Not yet carrying the two fixes IncidentScreen has: holdLiveUpdates() while the form is open,
-  // and a filesystem-persisted draft (src/lib/incidentDraft.js).
-  // See README.md, "Data capture and upload", risk 1.
+  // Both mechanisms are wired up above — holdLiveUpdates() while the form is open, and a
+  // filesystem draft (lib/entryDraft.js). The flush is forced here as well rather than relying on
+  // the visibilitychange listener alone: this is the one call site that knows for certain the app
+  // is about to leave.
   const openPhotoPicker = (inputId) => {
+    saveEntryDraft('pedestrian', {
+      fields: { name, visitorType, unitVisiting },
+      photo: photoFile,
+    });
+    void flushEntryDraft('pedestrian');
     document.getElementById(inputId)?.click();
   };
 
@@ -254,7 +299,10 @@ export default function PedestrianTab() {
     setSubmitting(true);
 
     const tempId = `ped_${Date.now()}`;
-    const siteId = getCachedSiteSettings().id || null;
+    // The DEVICE's bound site — the same authority every read filters on. See the longer note in
+    // VehicleTab.handleSubmit: cached site settings are a different source with a different
+    // precedence, and they lag the binding after a dashboard relocation.
+    const siteId = getBoundSiteIdSync() || getCachedSiteSettings().id || null;
     // Stamp the arrival now, not when the row reaches the server. createPedestrian() falls back to
     // now() when entry_time is absent, so an entry registered offline used to be recorded at the
     // moment the queue happened to drain -- minutes or hours after the person actually arrived.
@@ -316,7 +364,11 @@ export default function PedestrianTab() {
     setPedestrians((prev) => [localEntry, ...prev.filter(p => String(p.id) !== String(tempId))]);
     setTimeout(() => { suppressCacheEvent.current = false; }, 50);
 
-    // Step 3: Reset form and close
+    // Step 3: Reset form and close.
+    // The draft goes only now, after the entry is in the cache above (step 1) and therefore
+    // durable. Clearing it any earlier would open a window where the work exists nowhere.
+    void clearEntryDraft('pedestrian');
+    setRecoveredDraft(null);
     setName('');
     setVisitorType(lookupData.pedestrianTypes[0] || 'Visitor');
     setUnitVisiting('');
@@ -378,7 +430,24 @@ export default function PedestrianTab() {
         <div className="form-container">
           <div className="form-header">
             <h2 className="form-title">Register Pedestrian</h2>
-            <button className="close-button" onClick={() => { setShowForm(false); setFormErrors({}); setError(''); }}>x</button>
+            {/* Closing the form is a decision to abandon the registration, so the draft goes with
+                it. An Android reclaim is NOT a decision, which is why that case keeps the draft. */}
+            <button
+              className="close-button"
+              onClick={() => {
+                setShowForm(false);
+                setFormErrors({});
+                setError('');
+                setName('');
+                setUnitVisiting('');
+                setPhoto(null);
+                setPhotoFile(null);
+                void clearEntryDraft('pedestrian');
+                setRecoveredDraft(null);
+              }}
+            >
+              x
+            </button>
           </div>
           {error && <div className="inline-error">{error}</div>}
           <form onSubmit={handleSubmit}>
@@ -456,6 +525,44 @@ export default function PedestrianTab() {
 
   return (
     <div className="tab-content">
+      {/* The app was taken away mid-registration — almost always by the camera intent. Offered
+          back rather than reinstated silently, so the guard is told what happened. */}
+      {recoveredDraft && !showForm && (
+        <div className="entry-draft-banner">
+          <div className="entry-draft-text">
+            <strong>Unfinished pedestrian registration</strong>
+            <span>
+              {recoveredDraft.fields?.name ? `${recoveredDraft.fields.name} — ` : ''}
+              saved {new Date(recoveredDraft.savedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              {recoveredDraft.photoDropped ? ' (photo not recovered)' : ''}
+            </span>
+          </div>
+          <div className="entry-draft-actions">
+            <button
+              className="entry-draft-resume"
+              onClick={() => {
+                const fields = recoveredDraft.fields || {};
+                setName(fields.name || '');
+                setUnitVisiting(fields.unitVisiting || '');
+                setVisitorType(fields.visitorType || lookupData.pedestrianTypes[0] || 'Visitor');
+                setPhotoFile(recoveredDraft.photo || null);
+                setPhoto(recoveredDraft.photo?.dataUrl || null);
+                setRecoveredDraft(null);
+                setShowForm(true);
+              }}
+            >
+              Resume
+            </button>
+            <button
+              className="entry-draft-discard"
+              onClick={() => { void clearEntryDraft('pedestrian'); setRecoveredDraft(null); }}
+            >
+              Discard
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="panel-card">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 10, flexWrap: 'wrap' }}>
           <h2 style={{ fontSize: '16px', fontWeight: 700, margin: 0 }}>

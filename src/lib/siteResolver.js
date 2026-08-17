@@ -2,7 +2,7 @@ import { Preferences } from '@capacitor/preferences';
 import { supabase } from './supabase';
 import { isAppOnline } from './connectivity';
 import { getDeviceId, getCachedSiteSettings, purgeSiteScopedPatrolCaches } from './deviceStore';
-import { getAdminDeviceBinding } from './deviceBinding';
+import { ADMIN_PROFILE_SITE_SOURCE, getAdminDeviceBinding } from './deviceBinding';
 
 // ============================================================================
 //  Which site is this device at?
@@ -183,9 +183,20 @@ export async function resolveSiteBinding({ refresh = false } = {}) {
   // 3. Devices already in the field, bound under the old scheme. Adopting the
   //    value they are already running on is what keeps this update invisible to
   //    them — no picker, no re-login, no interruption.
+  //
+  //    ⚠ This step must adopt only a site this device was ACTUALLY OPERATING AS.
+  //    An admin binding written by the current bundle carries the signed-in
+  //    manager's PROFILE home site, which for a multi-site manager is not this
+  //    device's site at all — and login() writes that record immediately before
+  //    calling here. Adopting it bound every new handset to whichever site sat on
+  //    the manager's profile row and skipped the picker entirely, permanently and
+  //    silently. A binding with no marker predates that write and is trustworthy;
+  //    one carrying it is not. See lib/deviceBinding.js.
   const legacy = await getAdminDeviceBinding();
   const cached = getCachedSiteSettings();
-  const legacySiteId = legacy?.site_id || cached?.id || DEV_SITE_ID || null;
+  const legacyIsDeviceSite = legacy?.site_id
+    && legacy.site_id_source !== ADMIN_PROFILE_SITE_SOURCE;
+  const legacySiteId = (legacyIsDeviceSite ? legacy.site_id : null) || cached?.id || DEV_SITE_ID || null;
 
   if (legacySiteId) {
     const adopted = await writePersisted({

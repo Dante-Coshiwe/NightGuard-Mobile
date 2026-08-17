@@ -23,6 +23,7 @@
 
 import { enqueueOfflineItem, syncOfflineQueueNow } from '../hooks/useOfflineQueue';
 import { getCachedSiteSettings, getShiftSession } from './deviceStore';
+import { getBoundSiteIdSync } from './siteResolver';
 import KioskService from '../services/kioskService';
 
 const AWAY_MARKER_KEY = 'nightguard_app_left_at';
@@ -58,7 +59,7 @@ export function markAppBackgrounded({ user } = {}) {
   const marker = {
     at: Date.now(),
     shiftId: shift.id || null,
-    siteId: getCachedSiteSettings().id || shift.siteId || null,
+    siteId: getBoundSiteIdSync() || getCachedSiteSettings().id || shift.siteId || null,
     guardId: shift.activeGuardId || user?.id || null,
     capturedBy: user?.id || null,
     guardName: shift.activeGuardName || user?.full_name || 'Guard',

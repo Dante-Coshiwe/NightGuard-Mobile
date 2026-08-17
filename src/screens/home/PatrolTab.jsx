@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useOfflineApi } from '../../hooks/useOfflineApi';
 import { getCachedSiteSettings, getPatrolConfig, getShiftSession } from '../../lib/deviceStore';
+import { getBoundSiteIdSync } from '../../lib/siteResolver';
 import NotificationService from '../../services/notificationService';
 import {
   buildPatrolCompletionPayload,
@@ -92,7 +93,7 @@ export default function PatrolTab() {
   }, [patrolActive]);
 
   const scanContext = () => ({
-    siteId: getCachedSiteSettings().id || null,
+    siteId: getBoundSiteIdSync() || getCachedSiteSettings().id || null,
     guardId: user?.id || null,
     guardName: user?.full_name || 'Unknown guard',
     shiftId: shiftSession?.id || getShiftSession()?.id || null,

@@ -63,8 +63,14 @@ function isUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ''));
 }
 
+// The binding first, deliberately. Cached site settings are refreshed FROM the binding
+// (getMySite -> getCurrentSiteId -> getSiteBinding), so the two normally agree — but the cache
+// lags it, and the window where they disagree is exactly the one that matters on a multi-site
+// estate: a device relocated on the dashboard has the new binding immediately and the old cached
+// settings until an online refresh lands. Config written against the stale answer lands on the
+// wrong site. Every write path in the app now resolves site the same way.
 function getSiteId(siteSettings = getCachedSiteSettings()) {
-  return siteSettings?.id || getBoundSiteIdSync() || null;
+  return getBoundSiteIdSync() || siteSettings?.id || null;
 }
 
 export function getCurrentDeviceRecord(siteSettings = getCachedSiteSettings()) {

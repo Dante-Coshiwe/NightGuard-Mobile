@@ -29,6 +29,11 @@ import {
 
 const QUEUE_KEY = 'nightguard_offline_queue';
 const DEAD_LETTER_KEY = 'nightguard_offline_queue_dead';
+// Raised when the outbox itself could not be written — see saveQueue(). This is the one failure
+// in the capture chain that the guard has to be told about, because it means a record they were
+// shown as saved is not actually anywhere.
+const QUEUE_WRITE_FAILURE_KEY = 'nightguard_offline_queue_write_failed';
+export const QUEUE_WRITE_FAILED_EVENT = 'nightguard_queue_write_failed';
 const OfflineQueueContext = createContext(null);
 let syncInFlight = null;
 let lastOnlineSyncTriggerAt = 0;
@@ -108,14 +113,73 @@ function getQueue() {
 //    the ENTIRE storage state to disk. Cost grows with queue size; the outbox has no cap.
 //
 // See README.md, "Data capture and upload", risks 4 and 5.
+//
+// This used to be a bare try/catch whose only failure handling was a console.error, which meant a
+// failed write dropped the delta with no signal and no retry — on the ADD path that is a guard's
+// record gone. It now tries in earnest before giving up, and when it does give up it says so out
+// loud instead of pretending the save happened.
+//
+// Recovery order matters. The dead-letter list is the expendable thing here: those items already
+// exhausted their retries and are kept for inspection, whereas the live queue is work that has
+// never reached the server. Trading the former for the latter is the right way round.
+function writeQueue(queue) {
+  localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+  // The outbox is writable again — retract the warning rather than leaving a stale one on screen
+  // for the rest of the shift.
+  if (localStorage.getItem(QUEUE_WRITE_FAILURE_KEY)) clearQueueWriteFailure();
+}
+
+/** Returns true when the queue is durably stored. Callers on the capture path MUST check it. */
 function saveQueue(queue) {
   try {
-    localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
-    console.log(`[OfflineQueue] saveQueue(): saved ${queue.length} items`, queue);
+    writeQueue(queue);
     window.dispatchEvent(new Event('nightguard_queue_updated'));
+    return true;
   } catch (err) {
-    console.error(`[OfflineQueue] saveQueue() ERROR:`, err.message);
+    console.error('[OfflineQueue] saveQueue() failed, attempting recovery:', err?.message || err);
   }
+
+  // Second attempt with the dead letters cleared out. On Android this storage is a
+  // filesystem-backed proxy whose CRITICAL_KEYS path serialises the WHOLE state on every write,
+  // so dropping a couple of hundred exhausted items can be the difference on a full device.
+  try {
+    const sacrificed = getDeadLetterQueue().length;
+    if (sacrificed) {
+      localStorage.removeItem(DEAD_LETTER_KEY);
+      console.warn(`[OfflineQueue] Dropped ${sacrificed} dead-lettered item(s) to make room for live work`);
+    }
+    writeQueue(queue);
+    window.dispatchEvent(new Event('nightguard_queue_updated'));
+    return true;
+  } catch (err) {
+    console.error('[OfflineQueue] saveQueue() failed after pruning dead letters:', err?.message || err);
+  }
+
+  // Out of options. Do NOT fail silently: the caller is about to tell a guard their entry is
+  // saved, and it is not. The banner this raises is the only chance anyone has to notice before
+  // the shift ends and the device is handed on.
+  try {
+    localStorage.setItem(QUEUE_WRITE_FAILURE_KEY, JSON.stringify({
+      at: new Date().toISOString(),
+      queueLength: queue.length,
+    }));
+  } catch { /* if even this will not fit, the event below is all that is left */ }
+  window.dispatchEvent(new Event(QUEUE_WRITE_FAILED_EVENT));
+  return false;
+}
+
+/** Set when the outbox could not be written. Cleared by the next write that succeeds. */
+export function getQueueWriteFailure() {
+  try {
+    const raw = localStorage.getItem(QUEUE_WRITE_FAILURE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearQueueWriteFailure() {
+  try { localStorage.removeItem(QUEUE_WRITE_FAILURE_KEY); } catch { /* best effort */ }
 }
 
 function getDeadLetterQueue() {
@@ -124,6 +188,18 @@ function getDeadLetterQueue() {
   } catch {
     return [];
   }
+}
+
+// How many writes the server has refused outright. This is NOT a backlog: a queued item is on its
+// way, a dead-lettered one has stopped trying and needs a person.
+//
+// It existed only in storage until 2026-08-14, when an RLS misconfiguration refused a patrol, a
+// gate exit and a shift on a live handset. Each was retried 8 times and dead-lettered, and the
+// guard was shown "uploading automatically" the entire time, then a plain "Online". The records
+// were gone from every screen while the handset still displayed the visitor as signed out. Nothing
+// anywhere said a word. Counting them is what turns that into something a person can see.
+export function getDeadLetterCount() {
+  return getDeadLetterQueue().length;
 }
 
 function deadLetter(item, err) {
@@ -183,10 +259,10 @@ export function reviveDeadLetteredItems() {
 //             (410), or the route does not exist (404). Retrying cannot change the outcome.
 // ⚠ CRUCIAL: this decides whether a guard's record is kept or thrown away.
 //
-// 'drop' is terminal AND silent — the caller `continue`s without dead-lettering, so a dropped item
-// leaves no record anywhere and cannot be inspected or replayed later. 409 (conflict) currently
-// lands here, which is the one worth revisiting: a conflict may mean the record is genuinely a
-// duplicate, or that something else moved underneath it.
+// 'drop' is terminal but no longer silent: the caller dead-letters it with `terminal: true` and
+// its revivals already spent, so the evidence survives without the item being retried forever.
+// 409 (conflict) is the one worth inspecting when it shows up — a conflict may mean the record is
+// genuinely a duplicate, or that something else moved underneath it.
 //
 // 'retry' must stay the default for anything with no HTTP status: no status means the request never
 // reached the server, so the attempt says NOTHING about whether the payload is acceptable and must
@@ -606,7 +682,15 @@ export async function syncOfflineQueueNow() {
         const disposition = classifySyncFailure(err);
 
         if (disposition === 'drop') {
+          // Terminal, but NOT untraceable. This used to `continue` straight past, so an item that
+          // reached here left no record anywhere and could never be inspected or replayed — and a
+          // 409 in particular may mean the record is a genuine duplicate OR that something moved
+          // underneath it, and there was no way to tell which afterwards. Dead-lettering it costs
+          // one bounded-size entry and keeps the evidence. It is marked so a revival never puts a
+          // known-terminal item back on the queue to fail again.
+          // See README.md, "Data capture and upload", risk 7.
           console.log(`[OfflineQueue] SYNC - Item dropped (terminal ${err?.response?.status})`);
+          deadLetter({ ...item, terminal: true, revivals: DEAD_LETTER_REVIVALS }, err);
           continue;
         }
 
@@ -666,6 +750,7 @@ export async function syncOfflineQueueNow() {
 function useOfflineQueueController() {
   const [isOnline, setIsOnline] = useState(isAppOnline());
   const [queueCount, setQueueCount] = useState(getQueue().length);
+  const [deadCount, setDeadCount] = useState(getDeadLetterCount());
   const [syncing, setSyncing] = useState(false);
 
   const addToQueue = useCallback((method, url, data, clientTempId = null) => {
@@ -679,6 +764,8 @@ function useOfflineQueueController() {
     try {
       const result = await syncOfflineQueueNow();
       setQueueCount(getQueue().length);
+      // Read AFTER the drain: a sync is precisely when items give up and land here.
+      setDeadCount(getDeadLetterCount());
       return result;
     } finally {
       setSyncing(false);
@@ -686,7 +773,10 @@ function useOfflineQueueController() {
   }, []);
 
   useEffect(() => {
-    const updateCount = () => setQueueCount(getQueue().length);
+    const updateCount = () => {
+      setQueueCount(getQueue().length);
+      setDeadCount(getDeadLetterCount());
+    };
     const handleOnline = async () => {
       const online = isAppOnline();
       setIsOnline(online);
@@ -742,10 +832,11 @@ function useOfflineQueueController() {
   return useMemo(() => ({
     isOnline,
     queueCount,
+    deadCount,
     syncing,
     addToQueue,
     syncQueue,
-  }), [isOnline, queueCount, syncing, addToQueue, syncQueue]);
+  }), [isOnline, queueCount, deadCount, syncing, addToQueue, syncQueue]);
 }
 
 // Total writes still waiting to reach the server, including rejected ones parked in the

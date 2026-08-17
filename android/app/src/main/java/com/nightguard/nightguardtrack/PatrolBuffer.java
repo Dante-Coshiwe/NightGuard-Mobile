@@ -34,34 +34,66 @@ final class PatrolBuffer {
         return new File(context.getFilesDir(), FILE_NAME);
     }
 
+    private static File tmpFile(Context context) {
+        return new File(context.getFilesDir(), FILE_NAME + ".tmp");
+    }
+
+    private static File bakFile(Context context) {
+        return new File(context.getFilesDir(), FILE_NAME + ".bak");
+    }
+
+    /** Parse one candidate file, or null when it holds nothing usable. */
+    private static JSONObject readOne(File f) {
+        if (!f.exists() || f.length() == 0) return null;
+        try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
+            byte[] bytes = new byte[(int) raf.length()];
+            raf.readFully(bytes);
+            return new JSONObject(new String(bytes, StandardCharsets.UTF_8));
+        } catch (IOException | JSONException e) {
+            android.util.Log.w("PatrolBuffer", "unreadable " + f.getName() + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Primary, then backup, then a staged write — the same recovery ladder atomicFile.js uses on
+     * the JS side.
+     *
+     * This half of the system is the one most likely to be killed mid-write (a service recording
+     * from a pocket for an hour) and it used to be the half with no recovery at all: a single
+     * unparseable file discarded the entire walk. Falling back to the previous good copy turns
+     * "lost the whole patrol" into "lost the last few points".
+     *
+     * Returning empty() when everything fails is still deliberate — a corrupt buffer must not
+     * block every future write and leave the guard recording nothing for the rest of the shift.
+     * See README.md, "Data capture and upload", risk 3.
+     */
     static JSONObject read(Context context) {
         synchronized (LOCK) {
-            File f = file(context);
-            if (!f.exists()) return empty();
-            try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
-                byte[] bytes = new byte[(int) raf.length()];
-                raf.readFully(bytes);
-                return new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-            } catch (IOException | JSONException e) {
-                // ⚠ CRUCIAL: this discards the entire recorded walk.
-                //
-                // Returning empty() is deliberate — a corrupt buffer would otherwise block every
-                // future write and the guard would record nothing at all for the rest of the shift.
-                // But note the asymmetry with the JS side: atomicFile.js keeps a .bak AND a staged
-                // .tmp and recovers from either, while this has neither, even though the background
-                // service is the half most likely to be killed mid-write. A backup copy here would
-                // turn "lost the whole patrol" into "lost the last few points".
-                // See README.md, "Data capture and upload", risk 3.
-                android.util.Log.w("PatrolBuffer", "unreadable buffer, starting fresh: " + e.getMessage());
-                return empty();
+            JSONObject primary = readOne(file(context));
+            if (primary != null) return primary;
+
+            JSONObject backup = readOne(bakFile(context));
+            if (backup != null) {
+                android.util.Log.w("PatrolBuffer", "recovered patrol buffer from backup copy");
+                return backup;
             }
+
+            JSONObject staged = readOne(tmpFile(context));
+            if (staged != null) {
+                android.util.Log.w("PatrolBuffer", "recovered patrol buffer from staged write");
+                return staged;
+            }
+
+            return empty();
         }
     }
 
     static void write(Context context, JSONObject state) {
         synchronized (LOCK) {
             File target = file(context);
-            File tmp = new File(context.getFilesDir(), FILE_NAME + ".tmp");
+            File tmp = tmpFile(context);
+            File bak = bakFile(context);
             try (FileOutputStream out = new FileOutputStream(tmp)) {
                 out.write(state.toString().getBytes(StandardCharsets.UTF_8));
                 out.flush();
@@ -70,6 +102,17 @@ final class PatrolBuffer {
                 android.util.Log.e("PatrolBuffer", "write failed: " + e.getMessage());
                 return;
             }
+
+            // Demote the current file to the backup before the new one takes its place, so there is
+            // never a moment with no readable copy on disk.
+            if (target.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                bak.delete();
+                if (!target.renameTo(bak)) {
+                    android.util.Log.w("PatrolBuffer", "could not demote current buffer to backup");
+                }
+            }
+
             if (!tmp.renameTo(target)) {
                 // renameTo can fail if the target exists on some filesystems; replace explicitly.
                 //noinspection ResultOfMethodCallIgnored
@@ -82,8 +125,70 @@ final class PatrolBuffer {
     }
 
     /**
+     * Phase one of the two-phase handover: show the caller what is recorded WITHOUT consuming it.
+     *
+     * The single-step {@link #drain} below returns the walk and clears it in the same locked step,
+     * so from the moment it returns until the JS side has persisted, the walk exists only in a JS
+     * variable — a process kill there loses it outright, on the one path built specifically for a
+     * phone in a pocket where a kill is expected rather than exceptional.
+     *
+     * Pairing this with {@link #acknowledge} makes the handover at-least-once instead: a kill
+     * before the acknowledgement simply means the same points are handed over again next time, and
+     * the JS side already de-duplicates captures against the session's reached list.
+     * See README.md, "Data capture and upload", risk 2.
+     */
+    static JSONObject peek(Context context) {
+        synchronized (LOCK) {
+            JSONObject state = read(context);
+            JSONObject out = new JSONObject();
+            try {
+                out.put("route", state.optJSONArray("route") == null
+                    ? new JSONArray() : state.optJSONArray("route"));
+                out.put("captures", state.optJSONArray("captures") == null
+                    ? new JSONArray() : state.optJSONArray("captures"));
+                out.put("active", state.optBoolean("active", false));
+                out.put("patrolId", state.opt("patrolId") == null ? JSONObject.NULL : state.opt("patrolId"));
+            } catch (JSONException e) {
+                android.util.Log.e("PatrolBuffer", "peek failed: " + e.getMessage());
+            }
+            return out;
+        }
+    }
+
+    /**
+     * Phase two: drop exactly the leading items the caller confirmed it has persisted.
+     *
+     * Counts rather than a clear, because the recorder keeps appending while JS works. Both arrays
+     * are append-only at the tail, so removing from the head removes precisely what was handed
+     * over and leaves anything that arrived since.
+     */
+    static void acknowledge(Context context, int routeCount, int captureCount) {
+        if (routeCount <= 0 && captureCount <= 0) return;
+        synchronized (LOCK) {
+            JSONObject state = read(context);
+            try {
+                state.put("route", dropLeading(state.optJSONArray("route"), routeCount));
+                state.put("captures", dropLeading(state.optJSONArray("captures"), captureCount));
+                write(context, state);
+            } catch (JSONException e) {
+                android.util.Log.e("PatrolBuffer", "acknowledge failed: " + e.getMessage());
+            }
+        }
+    }
+
+    private static JSONArray dropLeading(JSONArray source, int count) throws JSONException {
+        JSONArray kept = new JSONArray();
+        if (source == null) return kept;
+        for (int i = Math.max(0, count); i < source.length(); i++) kept.put(source.get(i));
+        return kept;
+    }
+
+    /**
      * Hand the recorded route and captures to the caller and clear them, in one locked step so a
      * fix arriving mid-drain cannot be silently dropped between the read and the write.
+     *
+     * ⚠ At-most-once: see {@link #peek}. Kept because a web bundle newer than this shell is not
+     * the only combination in the field — an OLDER bundle running on this APK still calls it.
      *
      * `reached` is deliberately NOT cleared: it is what stops an already-credited checkpoint being
      * captured a second time when the guard walks back past it.
@@ -125,14 +230,29 @@ final class PatrolBuffer {
         return state;
     }
 
-    /** Append a route point, trimming the oldest half if the trail hits the cap. */
+    /**
+     * Append a route point, thinning the trail when it hits the cap.
+     *
+     * This used to delete the oldest half outright, so a patrol left running long enough lost the
+     * beginning of its walk entirely and silently — the guard's first hour simply was not on the
+     * map. Halving the resolution of the older portion instead keeps the whole route's SHAPE, at
+     * lower detail, which is what a patrol trail is actually evidence of. The most recent points
+     * are kept at full resolution because they are the ones still being written against.
+     *
+     * This matches what appendRoutePoint() does on the JS side (src/lib/patrolSession.js), so a
+     * walk recorded with the screen off thins the same way as one recorded with it on.
+     * See README.md, "Data capture and upload", risk 8.
+     */
     static void appendRoutePoint(JSONObject state, JSONObject point) throws JSONException {
         JSONArray route = state.optJSONArray("route");
         if (route == null) route = new JSONArray();
         if (route.length() >= MAX_ROUTE_POINTS) {
-            JSONArray trimmed = new JSONArray();
-            for (int i = route.length() / 2; i < route.length(); i++) trimmed.put(route.get(i));
-            route = trimmed;
+            final int tailSize = 500;
+            int head = Math.max(0, route.length() - tailSize);
+            JSONArray thinned = new JSONArray();
+            for (int i = 0; i < head; i += 2) thinned.put(route.get(i));
+            for (int i = head; i < route.length(); i++) thinned.put(route.get(i));
+            route = thinned;
         }
         route.put(point);
         state.put("route", route);

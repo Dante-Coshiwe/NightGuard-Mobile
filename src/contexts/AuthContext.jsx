@@ -34,7 +34,6 @@ import { clearAdminDeviceBinding, getAdminDeviceBinding, saveAdminDeviceBinding 
 import {
   claimDeviceForSite,
   getBoundSiteIdSync,
-  listBindableSites,
   resolveSiteBinding,
   __clearSiteBinding,
 } from '../lib/siteResolver';
@@ -241,7 +240,16 @@ export const AuthProvider = ({ children }) => {
       // fires its store event, and the screens all listen for those, so whatever
       // comes back lands on screen without anyone waiting for it. Failures are
       // expected offline and are not worth surfacing.
+      //
+      // NOT while the device is still waiting for a site to be picked. getMySite()
+      // resolves through getCurrentSiteId(), which on an unbound device falls all the
+      // way back to the signed-in manager's PROFILE site — so refreshing here would
+      // cache another site's settings, and resolveSiteBinding() would then adopt that
+      // cache as this device's site on the next boot, behind the picker's back. There
+      // is nothing to refresh for a device with no site anyway; completeSiteBinding()
+      // does this same work the moment the manager chooses.
       void (async () => {
+        if (!resolvedSite) return;
         try {
           await refreshSiteSettings();
           await Promise.allSettled([
@@ -337,10 +345,21 @@ export const AuthProvider = ({ children }) => {
 
   // Decide this device's site at admin login.
   //
-  //   already bound     -> keep it, silently. The binding is permanent, so a
-  //                        second manager signing in never moves the device.
-  //   exactly one site  -> bind to it; there is nothing to ask.
-  //   several sites     -> the picker.
+  //   already bound -> keep it, silently. The binding is permanent, so a second
+  //                    manager signing in never moves the device. This is what
+  //                    makes the picker a FIRST-LOGIN-ONLY screen.
+  //   otherwise     -> the picker, and the manager confirms.
+  //
+  // The picker is shown even when the account resolves to exactly one site, and
+  // that is deliberate. This used to auto-bind in that case, on the reasoning
+  // that there is nothing to ask — but the list comes from `profile_sites` via
+  // my_sites(), and a manager who holds several sites shows up as holding one
+  // whenever those rows have not all been inserted (the 1.1.0 migration
+  // backfills only the single site already on the profile — see
+  // SITE_BINDING_ROLLOUT.md step 2). So "exactly one site" is indistinguishable
+  // from "incompletely provisioned", and guessing wrong bound the handset to the
+  // wrong site permanently and without a word. SelectSiteScreen pre-selects a
+  // lone site, so the honest version costs one tap, once, per device.
   //
   // Returns true when the caller must send the manager to the picker.
   const resolveSiteForLogin = async () => {
@@ -348,23 +367,6 @@ export const AuthProvider = ({ children }) => {
     if (existing?.site_id) {
       setNeedsSiteBinding(false);
       return false;
-    }
-
-    let sites = [];
-    try {
-      sites = await listBindableSites();
-    } catch (err) {
-      console.warn('[Auth] Could not list bindable sites:', err?.message || err);
-    }
-
-    if (sites.length === 1) {
-      try {
-        await claimDeviceForSite(sites[0]);
-        setNeedsSiteBinding(false);
-        return false;
-      } catch (err) {
-        console.warn('[Auth] Auto-bind failed, falling back to picker:', err?.message || err);
-      }
     }
 
     setNeedsSiteBinding(true);
