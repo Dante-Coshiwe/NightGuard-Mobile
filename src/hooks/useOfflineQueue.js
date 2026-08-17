@@ -315,12 +315,18 @@ function replaceCachedEntity(cacheKey, clientTempId, nextEntity) {
         _offline: false,
         _pendingExit: false,
         // The card reads `photoUrl`; the server row carries `picture_url`. Adopt the uploaded
-        // URL here and retire the pending marker, or an entry whose photo has just gone up
-        // keeps rendering the "waiting to upload" thumbnail until a full reload rebuilds the
-        // cache from the server. The bytes were never cached (see PedestrianTab/VehicleTab),
-        // so this is the only moment the real URL arrives.
+        // URL here, because the bytes were never cached (see PedestrianTab/VehicleTab) and this
+        // is the only moment the real URL arrives.
+        //
+        // The marker is only retired once a URL actually exists. Clearing it unconditionally
+        // blanks the card: most callers below pass a partial patch (an id, or an exit time),
+        // so `picture_url` is usually undefined, and the entry's own photoUrl is '' precisely
+        // while a photo is pending. That combination rendered a synced visitor with no photo
+        // and no explanation — the picture was safely in storage and the guard could not see it.
         photoUrl: nextEntity?.picture_url || entry.photoUrl || '',
-        _pendingPhotoCount: 0,
+        _pendingPhotoCount: (nextEntity?.picture_url || entry.photoUrl)
+          ? 0
+          : (Number(entry._pendingPhotoCount) || 0),
       }
       : entry
   ));
@@ -372,12 +378,21 @@ async function applySuccessfulSync(item, response) {
   if (item.method === 'post' && (responseData.id || guardPayload?.id) && item.clientTempId) {
     if (item.url.includes('pedestrians')) {
       console.log(`[OfflineQueue] applySuccessfulSync(): Updating pedestrian cache with serverId=${responseData.id}`);
-      replaceCachedEntity('cached_pedestrians', item.clientTempId, { id: responseData.id });
+      // picture_url matters as much as the id: the photo was uploaded during THIS drain, and the
+      // card has been holding a placeholder since capture because the bytes deliberately live in
+      // the queue and not in the cache. This response is where the real URL first exists.
+      replaceCachedEntity('cached_pedestrians', item.clientTempId, {
+        id: responseData.id,
+        picture_url: responseData.picture_url,
+      });
     }
     // Update vehicles with synced IDs
     if (item.url.includes('vehicles')) {
       console.log(`[OfflineQueue] applySuccessfulSync(): Updating vehicle cache with serverId=${responseData.id}`);
-      replaceCachedEntity('cached_vehicles', item.clientTempId, { id: responseData.id });
+      replaceCachedEntity('cached_vehicles', item.clientTempId, {
+        id: responseData.id,
+        picture_url: responseData.picture_url,
+      });
     }
     // Update guards with synced data
     if (resolvedUrl.includes('/users/guards') || resolvedUrl.includes('/shifts/guards/add')) {
