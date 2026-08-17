@@ -5,10 +5,29 @@ import {
   Info, FileText, Settings, ChevronDown, ChevronRight, Bell,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
-import { getLocationName } from '../lib/deviceStore';
+import { getDeviceId, getLocationName } from '../lib/deviceStore';
 import { NIGHTGUARD_LOGO } from '../lib/nightguardLogo';
 import EndShiftModal from './EndShiftModal';
 import NotificationService from '../services/notificationService';
+
+// Handsets with a physically damaged screen area behind the floating menu button.
+//
+// This is a hardware fault on one specific device, not a layout bug: the wheatek WP20 at Sibaya
+// Sands (NG-5CB273608D76D247) has a dead patch in its top-right corner, exactly where the mobile
+// hamburger sits, and the guard was rotating the phone every time to reach it. Dropping the button
+// below the damaged strip is the whole fix.
+//
+// It is keyed by device id rather than shipped fleet-wide because nothing is wrong with the layout
+// anywhere else, and OTA cannot target one handset: `ota_device_assignments` exists in the schema
+// but the deployed `ota-check` never reads it (verified 2026-08-17 — a device pinned to 1.0.2 was
+// still served the newest production bundle). The resolver keys off orgId only. So the bundle goes
+// to everyone and the offset picks its own device out.
+//
+// If that handset is repaired or retired, delete its entry — a stale one only costs a slightly
+// lower button. Add to it the same way if another screen fails.
+const DAMAGED_SCREEN_MENU_OFFSET_PX = {
+  'NG-5CB273608D76D247': 34,
+};
 
 const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
   const { user, logout, shiftSession } = useAuth();
@@ -17,6 +36,10 @@ const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
   const [openReports, setOpenReports] = useState(false);
   const [openConfig,  setOpenConfig]  = useState(false);
   const location = useLocation();
+
+  // 10 everywhere except the handsets in DAMAGED_SCREEN_MENU_OFFSET_PX. getDeviceId() is a
+  // synchronous cache read, and an unresolved id simply yields the default.
+  const menuTopPx = DAMAGED_SCREEN_MENU_OFFSET_PX[getDeviceId()] ?? 10;
 
   // Picking a page closes the menu on its own — no reaching for the X. Tapping the page you are
   // already on leaves it open, because that was not an attempt to go anywhere.
@@ -97,7 +120,7 @@ const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
           onClick={toggleSidebar}
           style={{
             position:        'fixed',
-            top:             10,
+            top:             menuTopPx,
             right:           14,        // top-right — never overlaps left content
             left:            'auto',
             zIndex:          9999,      // above the banner (98) so it's always tappable
