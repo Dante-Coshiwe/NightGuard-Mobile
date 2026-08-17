@@ -42,8 +42,27 @@ function throwApiError(message, status = 400, data = null) {
   throw new ApiError(message, status, data);
 }
 
+// ⚠ CRUCIAL: this status decides whether a refused write is KEPT or THROWN AWAY.
+//
+// PostgREST reports a row-level-security refusal as code 42501 over HTTP 403. Flattening
+// that to 400 is not cosmetic: useOfflineApi.shouldQueueFallback() routes 403 into the
+// offline queue and lets 400 throw, so an RLS denial was being dropped at the call site
+// instead of being held. That is how a checkpoint scan could disappear with nothing but a
+// console.warn in PatrolRecorder — the write never reached the outbox, so the dead-letter
+// banner had nothing to report either.
+//
+// An RLS denial is ENVIRONMENTAL (a policy gap, a site binding not yet granted), not a bad
+// payload — it succeeds unchanged once the cause is fixed, which is exactly what happened on
+// 2026-08-17 when a shift refused since the 14th synced by itself after the policy was added.
+// Keep it queued; classifySyncFailure() still counts it so it dead-letters and the guard is
+// told, rather than retrying invisibly forever.
+function supabaseErrorStatus(error, fallback) {
+  if (error?.code === '42501') return 403;
+  return fallback;
+}
+
 function throwSupabaseError(error, status = 400) {
-  throwApiError(error?.message || 'Database request failed', status, {
+  throwApiError(error?.message || 'Database request failed', supabaseErrorStatus(error, status), {
     error: error?.message || 'Database request failed',
     details: error,
   });

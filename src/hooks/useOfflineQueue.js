@@ -272,7 +272,11 @@ function classifySyncFailure(err) {
   const status = err?.response?.status;
   if (!status) return 'retry';
   if ([404, 409, 410].includes(status)) return 'drop';
-  if ([400, 422].includes(status)) return 'count';
+  // 403 is an RLS refusal (api.js maps PostgREST 42501 onto it). It is counted, not retried
+  // forever, on purpose: the write is safely queued either way, but counting it means it
+  // eventually dead-letters and OfflineBanner tells somebody. An RLS gap is fixed by a
+  // person, and a device that retries it silently for a week is the 2026-08-14 failure again.
+  if ([400, 403, 422].includes(status)) return 'count';
   return 'retry';
 }
 
@@ -304,7 +308,21 @@ function replaceCachedEntity(cacheKey, clientTempId, nextEntity) {
   console.log(`[OfflineQueue] replaceCachedEntity(): key="${cacheKey}", tempId="${clientTempId}", updating with:`, nextEntity);
   const cached = cacheKey === 'cached_pedestrians' ? getCachedPedestrians() : getCachedVehicles();
   const updated = cached.map((entry) => (
-    entry.id === clientTempId ? { ...entry, ...nextEntity, _offline: false, _pendingExit: false } : entry
+    entry.id === clientTempId
+      ? {
+        ...entry,
+        ...nextEntity,
+        _offline: false,
+        _pendingExit: false,
+        // The card reads `photoUrl`; the server row carries `picture_url`. Adopt the uploaded
+        // URL here and retire the pending marker, or an entry whose photo has just gone up
+        // keeps rendering the "waiting to upload" thumbnail until a full reload rebuilds the
+        // cache from the server. The bytes were never cached (see PedestrianTab/VehicleTab),
+        // so this is the only moment the real URL arrives.
+        photoUrl: nextEntity?.picture_url || entry.photoUrl || '',
+        _pendingPhotoCount: 0,
+      }
+      : entry
   ));
   if (cacheKey === 'cached_pedestrians') {
     saveCachedPedestrians(updated);

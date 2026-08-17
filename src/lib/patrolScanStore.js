@@ -1,4 +1,5 @@
 import { appendNfcScan, getNfcScans, saveNfcScans } from './deviceStore';
+import { enqueueOfflineItem } from '../hooks/useOfflineQueue';
 
 // One place where a patrol check-in is written down, used by every surface that can produce one
 // (the Patrol tab, the tracking screen, the background recorder) so a scan is persisted locally
@@ -9,10 +10,27 @@ import { appendNfcScan, getNfcScans, saveNfcScans } from './deviceStore';
 export async function persistPatrolScan(entry, post) {
   appendNfcScan(entry);
 
-  const result = await post('/nfc/scan', entry, {
-    clientTempId: entry.id,
-    offlineResponse: { ...entry, offline: true, _offline: true },
-  });
+  let result;
+  try {
+    result = await post('/nfc/scan', entry, {
+      clientTempId: entry.id,
+      offlineResponse: { ...entry, offline: true, _offline: true },
+    });
+  } catch (err) {
+    // post() only diverts into the outbox for the errors shouldQueueFallback() recognises;
+    // anything else reaches here as a throw. Every caller of this function catches and warns
+    // (PatrolRecorder, the tracking screen, the background recorder), so without this the
+    // checkpoint would exist ONLY in the local scan list — not on the server, not in the
+    // queue, not in the dead-letter store, and the guard is still shown "points gathered"
+    // because markCheckpointReached() has already run. That is a silent hole in a patrol
+    // record, which is the one thing this app must never produce.
+    //
+    // enqueueOfflineItem() de-dupes on (method, url, data, clientTempId), so this cannot
+    // double-queue a scan post() had already accepted.
+    console.warn('[patrolScanStore] scan post failed; handing it to the offline queue:', err?.message || err);
+    enqueueOfflineItem('post', '/nfc/scan', entry, entry.id);
+    return { ...entry, offline: true, _offline: true };
+  }
 
   if (!result?._offline) {
     saveNfcScans(getNfcScans().map((scan) => (

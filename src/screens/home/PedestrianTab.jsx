@@ -51,10 +51,20 @@ export default function PedestrianTab() {
   // reinstated — see lib/entryDraft.js for everything that can destroy this form mid-write.
   const [recoveredDraft, setRecoveredDraft] = useState(null);
 
-  const PedestrianThumbnail = ({ photoUrl, label }) => (
+  // `pending` is a photo captured but not yet uploaded. Its bytes deliberately live in the
+  // offline queue and nowhere else, so there is nothing to render yet — say it is coming
+  // rather than showing the same blank avatar as an entry that has no photo at all.
+  const PedestrianThumbnail = ({ photoUrl, label, pending }) => (
     <div className="entry-thumbnail" aria-label={`${label || 'Pedestrian'} photo`}>
       {photoUrl ? (
         <img src={photoUrl} alt="" loading="lazy" />
+      ) : pending ? (
+        <svg viewBox="0 0 40 40" role="img" aria-label="Photo waiting to upload">
+          <circle cx="20" cy="14" r="7" fill="#4b5563" />
+          <path d="M9 34c1.4-8 7-12 11-12s9.6 4 11 12" fill="#4b5563" />
+          <circle cx="31" cy="31" r="7" fill="#f59e0b" />
+          <path d="M31 27.5v4l2.5 1.5" stroke="#1f2937" strokeWidth="1.6" fill="none" strokeLinecap="round" />
+        </svg>
       ) : (
         <svg viewBox="0 0 40 40" role="img" aria-hidden="true">
           <circle cx="20" cy="14" r="7" fill="#6b7280" />
@@ -344,7 +354,14 @@ export default function PedestrianTab() {
       visitorType: payload.purpose_of_visit,
       unitVisiting: payload.visiting_unit,
       hostName: payload.host_name,
-      photoUrl: pictureUrl || photo || '',
+      // The uploaded URL only. NEVER the local data URL: those bytes are already in the
+      // offline queue as _pendingPhoto, and `cached_pedestrians` is the same localStorage
+      // quota, so keeping them here stores every queued photo twice. saveQueue()'s only
+      // failure handling is a console.error, so a quota exception there silently discards
+      // the entire outbox — one unsent form must never cost every queued write.
+      // Same rule as incidentPhotos.js; the count is what tells the card a photo exists.
+      photoUrl: pictureUrl || '',
+      _pendingPhotoCount: pendingPhoto ? 1 : 0,
       entryTime,
       exitTime: null,
       hasLeft: false,
@@ -622,7 +639,7 @@ export default function PedestrianTab() {
               <div className="list-item-header">
                 {/* NightGuard fix: fixed thumbnail space prevents list-card layout shifts. */}
                 <div className="entry-title-row">
-                  <PedestrianThumbnail photoUrl={ped.photoUrl} label={ped.name} />
+                  <PedestrianThumbnail photoUrl={ped.photoUrl} label={ped.name} pending={Number(ped._pendingPhotoCount) > 0} />
                   <div className="list-item-title">
                     {ped.name}
                     {ped._offline && <span style={{ fontSize: 9, color: '#f59e0b', marginLeft: 6, fontWeight: 400, letterSpacing: 0.2 }}>offline</span>}

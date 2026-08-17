@@ -54,10 +54,20 @@ export default function VehicleTab() {
   // we just made directly (e.g. from handleSubmit or handleMarkExit).
   const suppressCacheEvent = React.useRef(false);
 
-  const VehicleThumbnail = ({ photoUrl, label }) => (
+  // `pending` is a photo captured but not yet uploaded. Its bytes deliberately live in the
+  // offline queue and nowhere else, so there is nothing to render yet — say it is coming
+  // rather than showing the same blank icon as an entry that has no photo at all.
+  const VehicleThumbnail = ({ photoUrl, label, pending }) => (
     <div className="entry-thumbnail" aria-label={`${label || 'Vehicle'} photo`}>
       {photoUrl ? (
         <img src={photoUrl} alt="" loading="lazy" />
+      ) : pending ? (
+        <svg viewBox="0 0 40 40" role="img" aria-label="Photo waiting to upload">
+          <rect x="8" y="16" width="24" height="10" rx="3" fill="#4b5563" />
+          <path d="M12 16l3-5h10l3 5" fill="none" stroke="#4b5563" strokeWidth="3" strokeLinejoin="round" />
+          <circle cx="31" cy="31" r="7" fill="#f59e0b" />
+          <path d="M31 27.5v4l2.5 1.5" stroke="#1f2937" strokeWidth="1.6" fill="none" strokeLinecap="round" />
+        </svg>
       ) : (
         <svg viewBox="0 0 40 40" role="img" aria-hidden="true">
           <rect x="8" y="16" width="24" height="10" rx="3" fill="#6b7280" />
@@ -359,7 +369,14 @@ export default function VehicleTab() {
       colour: payload.vehicle_color,
       contact: payload.driver_contact,
       personVisiting: payload.visiting_unit,
-      photoUrl: pictureUrl || photo || '',
+      // The uploaded URL only. NEVER the local data URL: those bytes are already in the
+      // offline queue as _pendingPhoto, and `cached_vehicles` is the same localStorage
+      // quota, so keeping them here stores every queued photo twice. saveQueue()'s only
+      // failure handling is a console.error, so a quota exception there silently discards
+      // the entire outbox — one unsent form must never cost every queued write.
+      // Same rule as incidentPhotos.js; the count is what tells the card a photo exists.
+      photoUrl: pictureUrl || '',
+      _pendingPhotoCount: pendingPhoto ? 1 : 0,
       visitorType: payload.visitor_type,
       enteredAt,
       exitedAt: null,
@@ -624,7 +641,7 @@ export default function VehicleTab() {
                     <div className="list-item-header">
                       {/* NightGuard fix: fixed thumbnail space prevents list-card layout shifts. */}
                       <div className="entry-title-row">
-                        <VehicleThumbnail photoUrl={vehicle.photoUrl} label={vehicle.driverName} />
+                        <VehicleThumbnail photoUrl={vehicle.photoUrl} label={vehicle.driverName} pending={Number(vehicle._pendingPhotoCount) > 0} />
                         <div className="list-item-title">
                           {vehicle.driverName || vehicle.visitorType || 'Vehicle'}
                           {vehicle._offline && <span style={{ fontSize: 9, color: '#f59e0b', marginLeft: 6, fontWeight: 400, letterSpacing: 0.2 }}>offline</span>}
