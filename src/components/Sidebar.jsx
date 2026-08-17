@@ -13,9 +13,13 @@ import NotificationService from '../services/notificationService';
 // Handsets with a physically damaged screen area behind the floating menu button.
 //
 // This is a hardware fault on one specific device, not a layout bug: the wheatek WP20 at Sibaya
-// Sands (NG-5CB273608D76D247) has a dead patch in its top-right corner, exactly where the mobile
-// hamburger sits, and the guard was rotating the phone every time to reach it. Dropping the button
-// below the damaged strip is the whole fix.
+// Sands (NG-5CB273608D76D247) has a dead patch down the right-hand side of its screen, and the
+// guard was rotating the phone every time to reach the menu. The damaged strip runs a long way
+// down — 34px was tried first and was still inside it — so on that handset the button sits at the
+// vertical middle of the screen instead.
+//
+// The value is whatever CSS `top` should be, so a percentage is fine; anything truthy here also
+// gets translateY(-50%) so a percentage centres the button rather than starting it there.
 //
 // It is keyed by device id rather than shipped fleet-wide because nothing is wrong with the layout
 // anywhere else, and OTA cannot target one handset: `ota_device_assignments` exists in the schema
@@ -23,10 +27,10 @@ import NotificationService from '../services/notificationService';
 // still served the newest production bundle). The resolver keys off orgId only. So the bundle goes
 // to everyone and the offset picks its own device out.
 //
-// If that handset is repaired or retired, delete its entry — a stale one only costs a slightly
-// lower button. Add to it the same way if another screen fails.
-const DAMAGED_SCREEN_MENU_OFFSET_PX = {
-  'NG-5CB273608D76D247': 34,
+// If that handset is repaired or retired, delete its entry. Add to it the same way if another
+// screen fails.
+const DAMAGED_SCREEN_MENU_TOP = {
+  'NG-5CB273608D76D247': '50%',
 };
 
 const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
@@ -37,9 +41,10 @@ const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
   const [openConfig,  setOpenConfig]  = useState(false);
   const location = useLocation();
 
-  // 10 everywhere except the handsets in DAMAGED_SCREEN_MENU_OFFSET_PX. getDeviceId() is a
-  // synchronous cache read, and an unresolved id simply yields the default.
-  const menuTopPx = DAMAGED_SCREEN_MENU_OFFSET_PX[getDeviceId()] ?? 10;
+  // 10 everywhere except the handsets in DAMAGED_SCREEN_MENU_TOP. getDeviceId() is a synchronous
+  // cache read, and an unresolved id simply yields the default.
+  const menuTopOverride = DAMAGED_SCREEN_MENU_TOP[getDeviceId()] || null;
+  const menuTop = menuTopOverride ?? 10;
 
   // Picking a page closes the menu on its own — no reaching for the X. Tapping the page you are
   // already on leaves it open, because that was not an attempt to go anywhere.
@@ -120,8 +125,10 @@ const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
           onClick={toggleSidebar}
           style={{
             position:        'fixed',
-            top:             menuTopPx,
-            right:           14,        // top-right — never overlaps left content
+            top:             menuTop,
+            // Centres the button on a percentage `top`; absent for the default 10px.
+            ...(menuTopOverride ? { transform: 'translateY(-50%)' } : null),
+            right:           14,        // right edge — never overlaps left content
             left:            'auto',
             zIndex:          9999,      // above the banner (98) so it's always tappable
             background:      'rgba(10,10,10,0.92)',
