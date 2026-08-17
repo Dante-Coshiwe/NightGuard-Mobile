@@ -24,7 +24,7 @@ import { getSiteBinding } from '../lib/siteResolver';
 // Web bundle version currently shipped. Bump this on every release you publish
 // (it must match the `version` you pass to `ota:publish`). It is what the
 // server compares against to decide if a newer bundle exists.
-export const OTA_CURRENT_VERSION = '1.1.29';
+export const OTA_CURRENT_VERSION = '1.1.32';
 
 const OTA_CHECK_FN = 'ota-check';
 const OTA_REPORT_FN = 'ota-report';

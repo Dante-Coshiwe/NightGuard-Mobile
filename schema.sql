@@ -140,12 +140,16 @@ CREATE TABLE public.incidents (
   local_guard_id uuid,
   updated_at timestamp with time zone DEFAULT now(),
   deleted_at timestamp with time zone,
+  device_id uuid,
+  picture_url text,
+  photo_urls jsonb NOT NULL DEFAULT '[]'::jsonb,
   CONSTRAINT incidents_pkey PRIMARY KEY (id),
   CONSTRAINT incidents_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT incidents_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
   CONSTRAINT incidents_reported_by_fkey FOREIGN KEY (reported_by) REFERENCES public.profiles(id),
   CONSTRAINT incidents_guard_id_fkey FOREIGN KEY (guard_id) REFERENCES auth.users(id),
-  CONSTRAINT incidents_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id)
+  CONSTRAINT incidents_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id),
+  CONSTRAINT incidents_device_id_fkey FOREIGN KEY (device_id) REFERENCES public.devices(id)
 );
 CREATE TABLE public.vehicles (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -166,11 +170,13 @@ CREATE TABLE public.vehicles (
   local_guard_id uuid,
   picture_url text,
   deleted_at timestamp with time zone,
+  device_id uuid,
   CONSTRAINT vehicles_pkey PRIMARY KEY (id),
   CONSTRAINT vehicles_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT vehicles_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
   CONSTRAINT vehicles_guard_id_fkey FOREIGN KEY (guard_id) REFERENCES auth.users(id),
-  CONSTRAINT vehicles_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id)
+  CONSTRAINT vehicles_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id),
+  CONSTRAINT vehicles_device_id_fkey FOREIGN KEY (device_id) REFERENCES public.devices(id)
 );
 CREATE TABLE public.pedestrians (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -192,11 +198,13 @@ CREATE TABLE public.pedestrians (
   updated_at timestamp with time zone DEFAULT now(),
   picture_url text,
   deleted_at timestamp with time zone,
+  device_id uuid,
   CONSTRAINT pedestrians_pkey PRIMARY KEY (id),
   CONSTRAINT pedestrians_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT pedestrians_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
   CONSTRAINT pedestrians_guard_id_fkey FOREIGN KEY (guard_id) REFERENCES auth.users(id),
-  CONSTRAINT pedestrians_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id)
+  CONSTRAINT pedestrians_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id),
+  CONSTRAINT pedestrians_device_id_fkey FOREIGN KEY (device_id) REFERENCES public.devices(id)
 );
 CREATE TABLE public.ob_entries (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -212,12 +220,14 @@ CREATE TABLE public.ob_entries (
   local_guard_id uuid,
   updated_at timestamp with time zone DEFAULT now(),
   deleted_at timestamp with time zone,
+  device_id uuid,
   CONSTRAINT ob_entries_pkey PRIMARY KEY (id),
   CONSTRAINT ob_entries_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT ob_entries_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
   CONSTRAINT ob_entries_captured_by_fkey FOREIGN KEY (captured_by) REFERENCES public.profiles(id),
   CONSTRAINT ob_entries_guard_id_fkey FOREIGN KEY (guard_id) REFERENCES auth.users(id),
-  CONSTRAINT ob_entries_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id)
+  CONSTRAINT ob_entries_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id),
+  CONSTRAINT ob_entries_device_id_fkey FOREIGN KEY (device_id) REFERENCES public.devices(id)
 );
 CREATE TABLE public.device_sync_logs (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -246,11 +256,13 @@ CREATE TABLE public.patrols (
   guard_id uuid,
   local_guard_id uuid,
   deleted_at timestamp with time zone,
+  device_id uuid,
   CONSTRAINT patrols_pkey PRIMARY KEY (id),
   CONSTRAINT patrols_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT patrols_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
   CONSTRAINT patrols_guard_id_fkey FOREIGN KEY (guard_id) REFERENCES auth.users(id),
-  CONSTRAINT patrols_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id)
+  CONSTRAINT patrols_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id),
+  CONSTRAINT patrols_device_id_fkey FOREIGN KEY (device_id) REFERENCES public.devices(id)
 );
 CREATE TABLE public.patrol_checkpoints (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -370,13 +382,15 @@ CREATE TABLE public.nfc_scans (
   longitude double precision,
   location_accuracy double precision,
   method text,
+  device_id uuid,
   CONSTRAINT nfc_scans_pkey PRIMARY KEY (id),
   CONSTRAINT nfc_scans_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id),
   CONSTRAINT nfc_scans_guard_id_fkey FOREIGN KEY (guard_id) REFERENCES auth.users(id),
   CONSTRAINT nfc_scans_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES public.shifts(id),
   CONSTRAINT nfc_scans_patrol_id_fkey FOREIGN KEY (patrol_id) REFERENCES public.patrols(id),
   CONSTRAINT nfc_scans_local_guard_id_fkey FOREIGN KEY (local_guard_id) REFERENCES public.guards(id),
-  CONSTRAINT nfc_scans_checkpoint_id_fkey FOREIGN KEY (checkpoint_id) REFERENCES public.patrol_checkpoints(id)
+  CONSTRAINT nfc_scans_checkpoint_id_fkey FOREIGN KEY (checkpoint_id) REFERENCES public.patrol_checkpoints(id),
+  CONSTRAINT nfc_scans_device_id_fkey FOREIGN KEY (device_id) REFERENCES public.devices(id)
 );
 CREATE TABLE public.site_lookup_data (
   id uuid NOT NULL DEFAULT gen_random_uuid(),

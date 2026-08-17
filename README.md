@@ -1,4 +1,16 @@
 # NightGuard Track
+## Release / OTA note - 2026-08-17
+
+Native APK `1.29` / `versionCode 30` and web bundle `1.1.31` have been rebuilt with the revised Android Capacitor keyboard/insets fix and server-tolerant device unbinding. `app-release.apk` was uploaded to the GitHub `Version1` release on 2026-08-17.
+
+Current GitHub APK: https://github.com/Dante-Coshiwe/nightguard-APPS/releases/download/Version1/app-release.apk
+APK SHA-256: `F6231A7467BF66304FDFDBD4AE5A3C145297427C74740C8D75836990106042F6`
+
+Supabase OTA has NOT been pushed because `SUPABASE_SERVICE_ROLE_KEY` is not set in this environment. If OTA access becomes available, push the rebuilt `dist/` bundle with:
+
+```bash
+node scripts/ota-publish.mjs --notes "Fix Android Capacitor keyboard black/white bar and server-tolerant device unbinding"
+```
 
 Android app for security guards — patrol tracking, pedestrian/vehicle registers, occurrence book,
 incident reports. React + Vite in a Capacitor 8 native shell, with self-hosted over-the-air updates

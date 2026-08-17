@@ -268,10 +268,32 @@ export function reviveDeadLetteredItems() {
 // reached the server, so the attempt says NOTHING about whether the payload is acceptable and must
 // not be counted against MAX_SYNC_ATTEMPTS.
 // See README.md, "Data capture and upload", risk 7.
+// Postgres codes that mean this exact payload can NEVER be accepted, however many times it is
+// offered. Retrying them is not caution, it is a device burning a 20s timeout per drain, every
+// 60s, on a write with no possible future — and with MAX_SYNC_ATTEMPTS x DEAD_LETTER_REVIVALS
+// that is 32 doomed attempts each, which is what makes a wedged handset feel like it has stopped
+// syncing altogether.
+//
+// They are dropped from the live queue but NOT destroyed: the caller dead-letters them, so the
+// record is still on the device and still inspectable. Nothing here deletes a guard's work.
+//
+// 23503 (foreign key) is deliberately ABSENT. It looks terminal and is not: it is what a write
+// referencing a shift or patrol that has not synced YET produces, and it succeeds unchanged once
+// the parent lands. It stays on the counted path so it retries a bounded number of times first.
+const TERMINAL_PG_CODES = new Set([
+  '23502', // not_null_violation   — a required column is null; the payload is malformed
+  '23505', // unique_violation     — the row is already on the server, so this one is a duplicate
+  '22P02', // invalid_text_representation — a malformed uuid, e.g. a local `shift_<ts>` id
+  '22007', // invalid_datetime_format
+  '23514', // check_violation
+]);
+
 function classifySyncFailure(err) {
   const status = err?.response?.status;
   if (!status) return 'retry';
   if ([404, 409, 410].includes(status)) return 'drop';
+  // api.js carries the original PostgREST error through as response.data.details.
+  if (TERMINAL_PG_CODES.has(err?.response?.data?.details?.code)) return 'drop';
   // 403 is an RLS refusal (api.js maps PostgREST 42501 onto it). It is counted, not retried
   // forever, on purpose: the write is safely queued either way, but counting it means it
   // eventually dead-letters and OfflineBanner tells somebody. An RLS gap is fixed by a

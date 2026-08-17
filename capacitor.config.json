@@ -7,6 +7,10 @@
       "resize": "body",
       "resizeOnFullScreen": false
     },
+    "SystemBars": {
+      "insetsHandling": "css",
+      "style": "DARK"
+    },
     "CapacitorUpdater": {
       "autoUpdate": false,
       "directUpdate": false,
@@ -18,7 +22,7 @@
     }
   },
   "android": {
-    "adjustMarginsForEdgeToEdge": "force"
+    "adjustMarginsForEdgeToEdge": "auto"
   },
   "server": {
     "androidScheme": "https"

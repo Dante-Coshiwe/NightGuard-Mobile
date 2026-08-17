@@ -1,4 +1,23 @@
 # Working notes for this repo
+## Release / OTA note - 2026-08-17 (APK 1.30 / bundle 1.1.32) — SHIPPED
+
+Both halves are live.
+
+* **APK `1.30` / `versionCode 31`** — on the GitHub `Version1` release, replacing 1.29.
+  SHA-256 `B4AE5061CDB78F9C09C2C63AAEA32079915E0B7FD8D6FA437200889C082A753D`,
+  signed `CN=NightGuard Track` (not the debug fallback).
+  https://github.com/Dante-Coshiwe/nightguard-APPS/releases/download/Version1/app-release.apk
+* **Bundle `1.1.32`** — published to the `production` channel, **not** mandatory.
+  SHA-256 `e3217e76b634215be0486c01cce92e3b739b13f42ab3a8839af5da0257797c4f`.
+
+The APK carries the Android 10 keyboard black-bar fix (native only — see below). The bundle carries
+the device re-registration and offline-queue fixes, so handsets still on APK 1.27/1.28 get those
+without a reinstall. **The two OUKITEL WP5s must be reinstalled by hand** — nothing else delivers a
+native change.
+
+`SUPABASE_SERVICE_ROLE_KEY` is not in this repo's `.env`; the service key in
+`Desktop/NightGuardTrackApp/backend/.env` (`SUPABASE_SERVICE_KEY`) is the same secret and is what
+`scripts/ota-publish.mjs` needs.
 
 Hard-won gotchas. Read before touching the Android shell or the keyboard/layout code.
 
@@ -62,33 +81,44 @@ takes **no comments at all** — document config decisions here or in the manife
 **Symptom:** with the soft keyboard open, a large black band appears between the bottom of the page
 content and the top of the keyboard. The header also scrolls off the top.
 
-**Cause:** the keyboard's height was subtracted from the layout *three ways at once*, and the gap
-that opened up exposed the decor background, which `MainActivity.applyImmersiveBlackBars()` paints
-`Color.BLACK` — hence a *black* bar.
+**Cause:** the keyboard's height is subtracted from the layout twice, and the gap that opens up
+exposes the decor background, which `MainActivity.applyImmersiveBlackBars()` paints `Color.BLACK` —
+hence a *black* bar.
 
-1. `android:adjustMarginsForEdgeToEdge: "force"` (capacitor.config.json) turns on Capacitor's
-   `SystemBars` inset listener. It pads the WebView's parent by `imeInsets.bottom` when the keyboard
-   is visible — see `initWindowInsetsListener()` in
-   `node_modules/@capacitor/android/.../plugin/SystemBars.java`. **This alone is correct and
-   sufficient.**
-2. `Keyboard.resizeOnFullScreen: true` made the Keyboard plugin *also* run the legacy Cordova-era
-   `possiblyResizeChildOfContent()`, shrinking `content.getChildAt(0)` a second time.
-3. `android:windowSoftInputMode="adjustPan"` made the window *also* pan upward.
+1. The platform. Below API 35 the window is not edge-to-edge, so
+   `android:windowSoftInputMode="adjustResize"` **already** shrinks it to the space above the IME.
+2. Capacitor. `SystemBars.initWindowInsetsListener()` pads the WebView's parent by
+   `imeInsets.bottom` whenever the IME is visible — see
+   `node_modules/@capacitor/android/.../plugin/SystemBars.java`. On Android 15+ this is correct and
+   necessary, because there the window is *not* resized. Below 35 it is the second subtraction.
 
-**Fix (both halves are required):**
+That asymmetry is the whole bug, and it is why this looks device-specific: **the same build is
+correct on Android 15+ and wrong on Android 10.** Reported on two OUKITEL WP5s (Android 10);
+Android 15 handsets on the identical APK never showed it. Don't go looking for something unique to
+the model — look at the API level.
 
-| File | Setting |
+**Fix:** `applyLegacyKeyboardInsetFix()` in
+[MainActivity.java](android/app/src/main/java/com/nightguard/nightguardtrack/MainActivity.java)
+re-installs the inset listener after `super.onCreate()` with the IME term dropped, on API < 35 only.
+Ships in the APK; **an OTA bundle cannot carry it.**
+
+### ⚠ Both config knobs that look like they control this are DEAD on Capacitor 8
+
+Two separate attempts at this bug were spent turning these. Verified against the installed 8.3.0
+source — do not spend a third:
+
+| Key | Why it does nothing |
 |---|---|
-| `capacitor.config.json` | `plugins.Keyboard.resizeOnFullScreen: false` |
-| `android/app/src/main/AndroidManifest.xml` | `android:windowSoftInputMode="adjustResize"` |
+| `android.adjustMarginsForEdgeToEdge` | **Removed after Capacitor 7.** Zero hits in `@capacitor/android` 8.x. `"auto"`, `"force"` and deleting it are the same no-op. Most advice online (and every LLM) still recommends it — it is Capacitor 7 advice. |
+| `plugins.Keyboard.resizeOnFullScreen` | Still parsed, but `Keyboard.possiblyResizeChildOfContent()` returns immediately when the `SystemBars` class is on the classpath — which in Capacitor 8 is always, it is part of core. |
+| `plugins.Keyboard.resize` | Never read on Android. `KeyboardPlugin.load()` reads only `resizeOnFullScreen`; `setResizeMode()` is `call.unimplemented()`. Kept as `"body"` only for a future iOS target. |
 
-Keep `adjustMarginsForEdgeToEdge: "force"` — it is the thing doing the correct single adjustment.
+`SystemBars.insetsHandling: "disable"` is **not** an escape hatch either: it only suppresses the
+`--safe-area-inset-*` CSS injection. `initWindowInsetsListener()` runs unconditionally from
+`initSystemBars()` and still sets the padding.
 
-### `plugins.Keyboard.resize` is a no-op on Android
-
-Don't try to fix keyboard layout by changing `resize`. In Capacitor 8 the Android plugin never reads
-it: `KeyboardPlugin.load()` only reads `resizeOnFullScreen`, and `setResizeMode()` is
-`call.unimplemented()`. The key is kept as `"body"` only because it is meaningful if iOS is added.
+The manifest half still matters: keep `android:windowSoftInputMode="adjustResize"`. `adjustPan`
+makes the window pan as well, which is a *third* subtraction.
 
 ### Don't add CSS padding for the keyboard
 
@@ -410,6 +440,33 @@ on the hardware-bound id (`NG-<ANDROID_ID>`, survives reinstall), called from `r
 so it happens after every offline-queue drain. Select-then-insert rather than upsert on purpose:
 with no DDL access a unique index on `device_id` cannot be assumed. It is best-effort — a handset
 that cannot register must still be able to work a shift.
+
+### Look the device up by hardware id ALONE — never scope it by site
+
+`devices.device_id` is globally `UNIQUE` (it is in `schema.sql`; the "cannot be assumed" caveat
+above is out of date). So adding `.eq('site_id', siteId)` to that lookup cannot find *more* rows —
+it can only fail to find the one that exists. That single clause wedged a handset permanently:
+
+```
+lookup misses (row's site_id is null, or still the previous site)
+  -> falls through to INSERT
+  -> INSERT violates the unique index on device_id
+  -> ensureDeviceRecord() returns null, FOREVER
+```
+
+and a null device record means `device_id` is null on every OB entry, incident, patrol and shift the
+handset writes, `recordDeviceSyncLog` bails before logging, `latest_sync_update` never moves, and the
+dashboard shows the device as unregistered and permanently offline.
+
+Every route into that state is **ordinary admin work**: unbinding a device, deleting or moving its
+location, or binding a brand-new site. Observed 2026-08-17 on `NG-8A15B196B6DE42CF` (an OUKITEL
+WP5) — its row was soft-deleted at 09:33 and it kept checking in for over an hour afterwards writing
+nothing attributable, while its site's OB entry and shift both landed with `device_id: null`.
+
+`ensureDeviceRecord()` now looks up on `device_id` only, re-homes a row whose `site_id` has moved,
+clears `deleted_at`/`is_active=false` (the handset is demonstrably here and working), and recovers
+from a `23505` on insert by claiming the existing row. A soft-deleted device row must never be a
+tombstone the handset cannot escape.
 
 **`guards` — empty, so nothing is attributable to a person.** With no guards provisioned every
 device signs in as the built-in General Guard, which is *deliberately* local-only and never synced

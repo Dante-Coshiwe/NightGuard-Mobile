@@ -39,8 +39,8 @@
          edge-to-edge, Capacitor's SystemBars inset listener already lifts the WebView above the
          IME by padding its parent. adjustPan made the window ALSO slide up, so the keyboard height
          was subtracted twice and the black decor background showed through as a bar above the
-         keyboard. Paired with Keyboard.resizeOnFullScreen=false in capacitor.config.json, which is
-         the other half of that double-resize (it shrank the content view a second time).
+         keyboard. Paired with Keyboard.resizeOnFullScreen=true in capacitor.config.json, which is
+         the native fullscreen WebView resize workaround for IME insets.
 
          android:excludeFromRecents must stay OFF (1.8-1.20 set it to "true"). It hid the whole
          NightGuard task from the overview screen, so a guard who stepped out to WhatsApp had no

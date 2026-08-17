@@ -432,6 +432,14 @@ export function getCachedSiteSettings() {
   };
 }
 
+export function clearCachedSiteSettings() {
+  try {
+    localStorage.removeItem(SITE_SETTINGS_KEY);
+  } catch { /* ignore */ }
+  dispatchStoreEvent('nightguard_site_settings_updated');
+  return getCachedSiteSettings();
+}
+
 export function saveCachedSiteSettings(settings) {
   const next = {
     ...getCachedSiteSettings(),

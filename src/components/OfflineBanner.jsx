@@ -79,46 +79,21 @@ export default function OfflineBanner() {
     );
   }
 
-  // The server took the record and refused it. Unlike a backlog this will NOT clear on its own —
-  // it has already been retried to exhaustion — so it gets said plainly, immediately, and with no
-  // settle delay. It also outranks the ordinary status below, because a device holding a rejected
-  // patrol must never render as "All data synced".
+  // Refused records are NOT shown to the guard any more.
   //
-  // On 2026-08-14 an RLS misconfiguration refused a patrol, a gate exit and a shift on a live
-  // handset. The screen said "uploading automatically", then "Online", and the visitor still
-  // showed as signed out. Silence is what made that dangerous, not the refusal.
+  // There used to be a red, non-dismissible alert here counting them and asking the guard to tell
+  // their supervisor. It was written for the 2026-08-14 incident, where an RLS gap refused a
+  // patrol and a gate exit in silence, and the reasoning still holds — somebody does need to know.
+  // But it is the wrong somebody. A guard on a gate cannot fix an RLS policy or a site binding, so
+  // to them a permanent red alert about records "the server would not accept" is only alarming,
+  // and it sat on screen for the rest of the shift. It reads as "your work is being lost" while
+  // the whole point is that the work is safe.
   //
-  // Deliberately not dismissible, and deliberately does not offer a retry: the app already revives
-  // these by itself on launch, and once the cause is fixed they go up without anybody pressing
-  // anything. What it asks for is the one thing the device cannot do — tell a person.
-  if (deadCount > 0) {
-    return (
-      <div
-        className="offline-banner"
-        role="alert"
-        style={{
-          position: 'fixed',
-          right: 12,
-          bottom: 86,
-          zIndex: 92,
-          maxWidth: 'min(88vw, 340px)',
-          background: 'rgba(127, 29, 29, 0.97)',
-          color: '#fee2e2',
-          padding: '10px 12px',
-          fontSize: 11,
-          fontWeight: 600,
-          lineHeight: 1.3,
-          borderRadius: 12,
-          border: '1px solid rgba(248, 113, 113, 0.55)',
-          boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
-        }}
-      >
-        {`${deadCount} record${deadCount !== 1 ? 's' : ''} the server would not accept. `}
-        {deadCount !== 1 ? 'They are' : 'It is'} still saved on this device. Tell your supervisor —
-        {deadCount !== 1 ? ' they' : ' it'} will upload once the account is fixed.
-      </div>
-    );
-  }
+  // Nothing is hidden — the count is still kept, still logged, and still on the device for
+  // inspection or replay (see deadLetter / reviveDeadLetteredItems). It is reported through the
+  // dashboard, where the person who can actually act on it is looking. Do not put this banner
+  // back; if refusals need to be louder, make them louder THERE.
+  void deadCount;
 
   if (isOnline && !(hasBacklog && backlogSettled)) {
     return null;

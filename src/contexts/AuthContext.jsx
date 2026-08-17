@@ -20,6 +20,7 @@ import {
   getQuickSwitchEnabled,
   getShiftSession,
   saveCachedGuards,
+  clearCachedSiteSettings,
   saveCachedSiteSettings,
   saveQuickSwitchEnabled,
   saveShiftSession,
@@ -35,6 +36,8 @@ import {
   claimDeviceForSite,
   getBoundSiteIdSync,
   resolveSiteBinding,
+  markCurrentDeviceUnbound,
+  unclaimCurrentDevice,
   __clearSiteBinding,
 } from '../lib/siteResolver';
 import NotificationService from '../services/notificationService';
@@ -543,19 +546,28 @@ export const AuthProvider = ({ children }) => {
     const { error } = await supabase.auth.signInWithPassword({ email: boundEmail, password });
     if (error) throw new Error('Password incorrect - device not unbound');
 
+    await markCurrentDeviceUnbound('admin_unbound_device');
+
     localStorage.removeItem(DEVICE_BOUND_KEY);
     localStorage.removeItem(CACHED_USER_KEY);
     localStorage.removeItem(BOUND_USER_KEY);
     localStorage.removeItem('nightguard_bound_email');
     await clearAdminDeviceBinding();
-    // Drop the local site bind too. The server record stands, so a device that
-    // has not physically moved re-adopts the same site on the next login;
-    // relocating it is a dashboard action, deliberately not one the device can
-    // perform on itself.
     await __clearSiteBinding();
     clearShiftSession();
     setShiftSession(null);
+    setSiteSettings(clearCachedSiteSettings());
+    setNeedsSiteBinding(false);
     setUser(null);
+
+    // Server cleanup should happen while the Supabase session still exists, but
+    // a verified local unbind must not hang on a weak connection or blocked RLS.
+    // If cleanup cannot finish quickly, the pending marker prevents this handset
+    // from re-adopting the stale server row on the next boot.
+    await Promise.race([
+      unclaimCurrentDevice({ throwOnFailure: false }),
+      new Promise((resolve) => setTimeout(resolve, 3500)),
+    ]).catch(() => null);
     await supabase.auth.signOut().catch(() => null);
   };
 

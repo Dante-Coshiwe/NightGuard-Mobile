@@ -4,10 +4,19 @@ import { Keyboard } from '@capacitor/keyboard';
 let installed = false;
 let keyboardVisible = false;
 
+function isNativeAndroid() {
+  return Capacitor?.isNativePlatform?.() && Capacitor.getPlatform() === 'android';
+}
+
 function setViewportHeight() {
   if (typeof window === 'undefined' || typeof document === 'undefined') return;
 
-  const height = window.visualViewport?.height || window.innerHeight || 0;
+  // On Android the native window is already resized by adjustResize / Capacitor's
+  // fullscreen workaround. visualViewport is unreliable on older Android WebViews
+  // while the IME is animating, and using it here can double-shrink the app.
+  const height = isNativeAndroid()
+    ? window.innerHeight || document.documentElement.clientHeight || 0
+    : window.visualViewport?.height || window.innerHeight || 0;
   document.documentElement.style.setProperty('--app-viewport-height', `${Math.round(height)}px`);
 }
 
@@ -25,12 +34,12 @@ function scrollActiveFieldIntoView() {
 
   window.setTimeout(() => {
     try {
-      active.scrollIntoView({ block: 'center', inline: 'nearest' });
+      active.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     } catch (e) {
-      // Fallback for older browsers
+      // Fallback for older browsers.
       active.focus();
     }
-  }, 100);
+  }, 120);
 }
 
 function ensureFormIsVisible() {
@@ -55,15 +64,13 @@ export async function installMobileKeyboardWorkarounds() {
     }
   };
 
-  // Monitor viewport changes
   window.addEventListener('resize', refreshViewport);
   window.visualViewport?.addEventListener('resize', refreshViewport);
 
-  if (!(Capacitor?.isNativePlatform?.() && Capacitor.getPlatform() === 'android')) {
+  if (!isNativeAndroid()) {
     return;
   }
 
-  // Android specific keyboard handling
   await Keyboard.addListener('keyboardDidShow', (info) => {
     setKeyboardState(true, info?.keyboardHeight || 0);
     setViewportHeight();
@@ -73,9 +80,7 @@ export async function installMobileKeyboardWorkarounds() {
   await Keyboard.addListener('keyboardDidHide', () => {
     setKeyboardState(false, 0);
     setViewportHeight();
-    window.scrollTo(0, 0);
   });
 
-  // Re-scroll when focus changes while keyboard is open
   document.addEventListener('focusin', ensureFormIsVisible, true);
 }

@@ -1000,10 +1000,27 @@ export async function ensureDeviceRecord(siteSettings = getCachedSiteSettings())
   try {
     // Someone may have registered it already — an admin by hand, or this handset before a
     // reinstall wiped the local cache. Adopt that row instead of creating a duplicate.
+    //
+    // ⚠ Look up on the HARDWARE ID ALONE. `devices.device_id` is globally UNIQUE, so there is at
+    // most one row and scoping the lookup by site cannot find more — it can only fail to find the
+    // one that exists. This used to filter `.eq('site_id', siteId)` as well, and that single
+    // clause is what wedged a handset permanently:
+    //
+    //   lookup misses (the row's site_id is null, or still the previous site)
+    //     -> falls through to INSERT
+    //     -> INSERT violates the unique index on device_id
+    //     -> ensureDeviceRecord returns null, FOREVER
+    //     -> device_id is null on every ob entry, incident, patrol and shift the device writes,
+    //        recordDeviceSyncLog bails before logging, and the dashboard shows the handset as
+    //        unregistered and permanently offline.
+    //
+    // Every route into that state is ordinary admin work: unbinding a device, deleting or moving
+    // its location, or binding a brand-new site (the row is created against the first site, then
+    // the site changes underneath it). Observed on NG-8A15B196B6DE42CF, whose row was soft-deleted
+    // on 2026-08-17 — it kept checking in for over an hour afterwards writing nothing attributable.
     const { data: existing, error: findError } = await supabase
       .from('devices')
       .select('*')
-      .eq('site_id', siteId)
       .eq('device_id', hardwareId)
       .limit(1)
       .maybeSingle();
@@ -1015,6 +1032,38 @@ export async function ensureDeviceRecord(siteSettings = getCachedSiteSettings())
     if (existing?.id) {
       // Adopted a row someone else created (an admin by hand, or this handset before a reinstall
       // wiped the local cache). It may hold nothing but a name, so fill in what we know.
+      //
+      // Re-home it if it is pointing somewhere else, and un-delete it if an admin removed it: the
+      // handset is demonstrably here and working this site, and a soft-deleted row otherwise keeps
+      // it invisible on the dashboard for the rest of its life. Best-effort — a refusal here must
+      // not stop the device working, so the row is still adopted either way.
+      const needsRehome = String(existing.site_id || '') !== String(siteId)
+        || existing.deleted_at
+        || existing.is_active === false;
+
+      if (needsRehome) {
+        const rehomedAt = new Date().toISOString();
+        const { data: rehomed, error: rehomeError } = await supabase
+          .from('devices')
+          .update({
+            site_id: siteId,
+            deleted_at: null,
+            is_active: true,
+            site_bound_at: existing.site_bound_at || rehomedAt,
+            updated_at: rehomedAt,
+          })
+          .eq('id', existing.id)
+          .select('*')
+          .maybeSingle();
+
+        if (rehomeError) {
+          console.warn('[NightGuard] device re-home refused:', getSupabaseErrorMessage(rehomeError));
+        } else if (rehomed?.id) {
+          await refreshDeviceTelemetry(rehomed.id);
+          return rememberDevice(rehomed);
+        }
+      }
+
       await refreshDeviceTelemetry(existing.id);
       return rememberDevice(existing);
     }
@@ -1037,6 +1086,25 @@ export async function ensureDeviceRecord(siteSettings = getCachedSiteSettings())
       .maybeSingle();
 
     if (createError) {
+      // A row for this hardware id already exists (unique index on devices.device_id) but the
+      // SELECT above could not see it — an RLS policy that scopes reads by site will do exactly
+      // that for a device whose row points at another site. Claim it by hardware id rather than
+      // giving up, or the handset stays unregistered forever and writes nothing attributable.
+      if (createError.code === '23505') {
+        const rescuedAt = new Date().toISOString();
+        const { data: rescued } = await supabase
+          .from('devices')
+          .update({ site_id: siteId, deleted_at: null, is_active: true, updated_at: rescuedAt })
+          .eq('device_id', hardwareId)
+          .select('*')
+          .maybeSingle();
+        if (rescued?.id) {
+          console.info(`[NightGuard] adopted the existing device row for ${hardwareId}`);
+          await refreshDeviceTelemetry(rescued.id);
+          return rememberDevice(rescued);
+        }
+      }
+
       // RLS may not grant guards insert on devices. Nothing is lost by failing here — this is
       // exactly today's behaviour — so log it and let the shift carry on.
       console.warn('[NightGuard] device self-registration refused:', getSupabaseErrorMessage(createError));

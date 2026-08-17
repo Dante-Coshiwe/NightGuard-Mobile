@@ -7,7 +7,7 @@
   height: 100%;
   background: #000;
   color: #fff;
-  padding-bottom: var(--bottom-nav-offset, 100px);
+  padding-bottom: calc(var(--bottom-nav-offset, 100px) + var(--safe-area-bottom, 0px));
   overflow: auto;
 }
 
