@@ -24,6 +24,7 @@ import {
   saveNfcScans,
   getCachedPatrols,
   saveCachedPatrols,
+  saveCachedReportRecipients,
   isGeneralGuardId,
 } from '../lib/deviceStore';
 
@@ -522,6 +523,17 @@ async function applySuccessfulSync(item, response) {
       ...responseData,
       _offline: false,
     });
+  }
+
+  // Update the cached report recipients once the edit actually lands.
+  //
+  // The response is re-read from the server by updateReportRecipientsRecord(), so it carries
+  // the authoritative site_id — which is what the cache is keyed on. Writing item.data here
+  // instead would cache a payload with no site_id and the screen would refuse to show it,
+  // which looks exactly like the save having been lost.
+  if (item.url === '/report-recipients/mine' && responseData?.site_id) {
+    console.log('[OfflineQueue] applySuccessfulSync(): Updated report recipients');
+    saveCachedReportRecipients({ ...responseData, _offline: false });
   }
 
   // Update cached incidents so the UI can reflect queued reports immediately.

@@ -1,22 +1,67 @@
 # Working notes for this repo
-## Release / OTA note - 2026-08-17 (APK 1.31 / bundle 1.1.35) — SHIPPED, EMULATOR-VERIFIED
+## Release / OTA note - 2026-08-18 (APK 1.32 / bundle 1.1.36) — SHIPPED, EMULATOR-VERIFIED
 
-* **APK `1.31` / `versionCode 32`** — on the GitHub `Version1` release.
-  SHA-256 `3841F16062D817D835C077DD2F2FF2FCD5A0019F9BB7481EE642EC43306655F5`,
-  signed `CN=NightGuard Track` (not the debug fallback). Carries built-in bundle 1.1.35.
+* **APK `1.32` / `versionCode 33`** — on the GitHub `Version1` release, replacing 1.31 at the
+  same fixed asset URL (the public download page links to that path, so the asset is clobbered
+  in place rather than renamed).
+  SHA-256 `fbcb8ac0b41aac4d39319253af771c624d89cac5640b99003289f54108608038`,
+  signed `CN=NightGuard Track` (not the debug fallback). Carries built-in bundle 1.1.36.
   https://github.com/Dante-Coshiwe/nightguard-APPS/releases/download/Version1/app-release.apk
-* **Bundle `1.1.35`** — `production`, **`is_mandatory: true`**.
-  SHA-256 `0f4735747badf90b2d1e60472af0c6adeb2d6a2293b31d7fe61cfc9553606dea`.
-  Mandatory was checked first, not assumed: all five devices run ≥ 1.1.25 and so carry the
-  `deviceIsIdle()` gate on the inline apply. See the 2026-08-14 note further down for why.
+* **Bundle `1.1.36`** — `production`, **`is_mandatory: false`**.
+  SHA-256 `929e12239fd3dd76b09f2340075487f6341034ceb36f32a71c8955a0f57841f6`.
+  Kiosk exit PIN `0000` alongside `773745`; per-site Report Emails screen for location admins.
+
+**Signing cert continuity was verified, not assumed** — the published 1.31 and the new 1.32
+both sign as `d816c241ffbfaeede388f3b8a13a9950af62e98c5e7265e50f521b8c7c480789`, so 1.32
+installs over 1.31 in place. A cert mismatch would force an uninstall on every handset, and an
+uninstall takes the outbox, the Supabase session and the shift session with it. Download the
+currently-published APK and diff the cert before every release; it is two minutes.
+
+⚠ **The GitHub release URL is CDN-cached and served the OLD APK for ~2 minutes after upload.**
+`gh release view` showed the new digest immediately while a plain `curl` of the download URL
+still returned 1.31. Do not conclude an upload failed, and do not re-upload — append a
+cache-busting query string (`?cb=$(date +%s)`) to check what was really stored.
+
+**Why 1.1.36 is NOT mandatory.** `--mandatory` triggers the inline apply that cost a guard an
+incident report and its photo on 2026-08-14. The `deviceIsIdle()` gate that makes it safe only
+exists in bundles **≥ 1.1.25**, and `ota_update_logs` still carries three ids on 1.1.5 / 1.1.6 /
+1.1.8 (last seen 3-4 August, probably retired but not confirmed). Non-mandatory costs nothing:
+Capgo swaps natively on the next background event, and screen-off is enough. To force it later,
+`update ota_bundles set is_mandatory = true where version = '1.1.36';` — no republish needed.
+
+**Fleet counting trap:** `NG-898D898E11E775F0` is the **Pixel_2_XL_API30 emulator**, not a field
+handset, and `NG-B4D60C7CB96F8727` is the dev phone. Ten ids look "real" by the `NG-<16 hex>`
+pattern; only **four are production**. Confirm the device id from the handset's own storage
+(`grep -ao 'NG-[0-9A-F]\{16\}' shared_prefs/CapacitorStorage.xml`) before counting anything.
 
 **The two OUKITEL WP5s must be reinstalled by hand** — nothing else delivers a native change.
 
 ### Verified on the emulator (Pixel_2_XL_API30, Android 11, WebView 83), not just reasoned about
 
-Driven over the Chrome DevTools Protocol against the running release APK — release builds here do
-expose `webview_devtools_remote_<pid>`, so `adb forward` + `Runtime.evaluate` gives a real handle on
+Driven over the Chrome DevTools Protocol: `adb forward` + `Runtime.evaluate` gives a real handle on
 the live app. That is the cheapest way to test the outbox; do it again rather than guessing.
+
+⚠ **Corrected 2026-08-18 — a release APK does NOT expose `webview_devtools_remote_<pid>`.**
+An earlier version of this note claimed it did. It does not: `CapConfig.java` reads
+`android.webContentsDebuggingEnabled` and defaults it to `isDebug`, which is false in release, and
+this repo has never set the key. Verified by grepping `/proc/net/unix` on a running release
+build — no socket. To drive a release build, add it to `capacitor.config.json` temporarily:
+
+```json
+"android": { "adjustMarginsForEdgeToEdge": "auto", "webContentsDebuggingEnabled": true }
+```
+
+then `npx cap sync android` and rebuild. **Revert it and rebuild before distributing anything** —
+it is baked into `android/app/src/main/assets/capacitor.config.json` at sync time and ships in the
+APK. A debug APK has it on already, but is signed with the debug key, so it cannot be installed
+over a release build without an uninstall — and an uninstall wipes the Supabase session, the shift
+session and the outbox.
+
+**Reinstalling over a pinned kiosk build wedges the emulator.** Killing the app mid-lock-task
+leaves `mLockTaskModeState=PINNED` with an EMPTY `mLockTaskModeTasks`, and every subsequent
+`am start` fails with `Error: Activity not started, unknown error code 101` and no other clue.
+Clear it with `adb shell am task lock stop`. This is the kiosk wedge from the README risk register,
+reproduced by accident — worth knowing it can strand a real handset the same way.
 
 1. **Rejected item does not block the queue.** Queue seeded with a doomed OB entry (bogus
    `site_id`) FIRST and two valid ones behind it. The bad one stayed queued

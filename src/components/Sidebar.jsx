@@ -100,6 +100,7 @@ const Sidebar = ({ isOpen, toggleSidebar, isMobile }) => {
         { to: '/config/guard-patrol', label: 'Guard Patrol' },
         { to: '/config/settings',     label: 'Settings' },
         { to: '/config/lookup-data',  label: 'Lookup Data' },
+        { to: '/config/report-email', label: 'Report Emails' },
       ],
     },
   ];

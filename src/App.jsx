@@ -18,6 +18,7 @@ import UsersConfig from './screens/UsersConfig';
 import GuardPatrolConfig from './screens/GuardPatrolConfig';
 import SettingsConfig from './screens/SettingsConfig';
 import LookupDataConfig from './screens/LookupDataConfig';
+import ReportEmailConfig from './screens/ReportEmailConfig';
 import ShiftManagementScreen from './screens/ShiftManagementScreen';
 import Layout from './components/Layout';
 import ShiftScreen from './screens/ShiftScreen';
@@ -224,6 +225,7 @@ function App() {
               <Route path="config/settings" element={<SettingsConfig />} />
               <Route path="config/kiosk-pin" element={<SetKioskPinScreen />} />
               <Route path="config/lookup-data" element={<LookupDataConfig />} />
+              <Route path="config/report-email" element={<ReportEmailConfig />} />
             </Route>
             {/* Anything unknown (an old deep link, a stale notification) belongs on the home
                 screen rather than on a blank page. */}

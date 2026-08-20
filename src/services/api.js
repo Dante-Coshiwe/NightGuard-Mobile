@@ -1355,9 +1355,88 @@ async function updateMySiteRecord(payload) {
   return getMySiteRecord();
 }
 
+// ---------------------------------------------------------------------------
+// Report email recipients
+// ---------------------------------------------------------------------------
+// The addresses this SITE's daily digests and live incident alerts are sent to.
+//
+// ⚠ THE SITE IS RESOLVED HERE AND IS NEVER TAKEN FROM THE CALLER. A location admin can sign
+// in to any site they hold, so a site_id arriving in a payload is the one route by which this
+// screen could point one client's records at another client's inbox. getCurrentSiteId() reads
+// the device's own binding, which is the same source every other write on this handset uses,
+// so the recipients a screen edits are always the recipients for the site the handset is
+// actually standing on.
+//
+// The server enforces it a second time regardless: report_recipients carries
+// has_site_access(site_id) on select, insert and update. Both checks are wanted -- this one
+// stops the wrong row being addressed, RLS stops it being written.
+
+const REPORT_RECIPIENTS_COLUMNS = 'site_id, recipient_emails, immediate_emails, daily_send_time, is_active';
+
+async function getReportRecipientsRecord() {
+  const siteId = await getCurrentSiteId();
+  if (!siteId) throwApiError('No site is associated with the current device', 404);
+
+  const { data: row, error } = await supabase
+    .from('report_recipients')
+    .select(REPORT_RECIPIENTS_COLUMNS)
+    .eq('site_id', siteId)
+    .maybeSingle();
+  if (error) throwSupabaseError(error);
+
+  // The house defaults live on the singleton settings row. Read them so the screen can say
+  // "follows the house time (06:00)" rather than showing an empty box that looks unset --
+  // and so it can tell the admin when the master switch is off, which is the difference
+  // between "configured" and "actually sending".
+  const { data: settings } = await supabase
+    .from('report_settings')
+    .select('daily_send_time, timezone, emails_enabled, immediate_incident_enabled')
+    .eq('id', 1)
+    .maybeSingle();
+
+  return {
+    site_id: siteId,
+    recipient_emails: row?.recipient_emails || [],
+    immediate_emails: row?.immediate_emails || [],
+    daily_send_time: row?.daily_send_time || null,
+    is_active: row ? row.is_active !== false : true,
+    configured: Boolean(row),
+    house_send_time: settings?.daily_send_time || null,
+    timezone: settings?.timezone || 'Africa/Johannesburg',
+    emails_enabled: settings?.emails_enabled === true,
+    immediate_incident_enabled: settings?.immediate_incident_enabled !== false,
+  };
+}
+
+async function updateReportRecipientsRecord(payload = {}) {
+  const siteId = await getCurrentSiteId();
+  if (!siteId) throwApiError('No site is associated with the current device', 404);
+
+  const list = (value) => (Array.isArray(value) ? value.map((v) => String(v).trim()).filter(Boolean) : []);
+
+  // Upsert on site_id, which is UNIQUE. Select-then-insert would race a dashboard admin
+  // editing the same site, and lose one of the two edits silently.
+  const { error } = await supabase
+    .from('report_recipients')
+    .upsert({
+      site_id: siteId,
+      recipient_emails: list(payload.recipient_emails),
+      immediate_emails: list(payload.immediate_emails),
+      daily_send_time: payload.daily_send_time || null,
+      is_active: payload.is_active !== false,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'site_id' });
+
+  if (error) throwSupabaseError(error);
+  return getReportRecipientsRecord();
+}
+
 async function handleGet(url) {
   if (url === '/auth/me') {
     return getCurrentProfile();
+  }
+  if (url === '/report-recipients/mine') {
+    return getReportRecipientsRecord();
   }
   if (url === '/patrols') {
     return listPatrols();
@@ -1528,6 +1607,9 @@ async function handlePut(url, payload = {}) {
   if (url === '/sites/mine') {
     return updateMySiteRecord(payload);
   }
+  if (url === '/report-recipients/mine') {
+    return updateReportRecipientsRecord(payload);
+  }
 
   throwApiError(`Unsupported PUT route: ${url}`, 404);
 }
@@ -1610,6 +1692,8 @@ export const toggleGuardActive = (id, is_active) => api.patch(`/users/guards/${i
 
 export const getMySite = () => api.get('/sites/mine').then((res) => res.data);
 export const updateMySite = (data) => api.put('/sites/mine', data).then((res) => res.data);
+
+export const getMyReportRecipients = () => api.get('/report-recipients/mine').then((res) => res.data);
 
 export const logNFCScan = (data) => api.post('/nfc/scan', data).then((res) => res.data);
 export const registerNFCTag = (data) => api.post('/nfc/register', data).then((res) => res.data);

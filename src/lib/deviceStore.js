@@ -9,7 +9,12 @@ const QUICK_SWITCH_KEY = 'nightguard_quick_switch_enabled';
 const CACHED_GUARDS_KEY = 'nightguard_cached_guards';
 const PRECLEARED_PEDESTRIANS_KEY = 'nightguard_precleared_pedestrians';
 const BLACKLISTED_VEHICLES_KEY = 'nightguard_blacklisted_vehicles';
+// The dead key from the old "Email delivery" panel that never delivered anything. Only
+// clearLegacyReportEmailSettings() touches it. REPORT_RECIPIENTS_KEY below is the live one
+// and is deliberately a different name — reusing this one would resurrect a stale blob of
+// the old shape on every handset that still carries it.
 const REPORT_EMAIL_SETTINGS_KEY = 'nightguard_report_email_settings';
+const REPORT_RECIPIENTS_KEY = 'nightguard_report_recipients';
 const LAST_SYNC_KEY = 'nightguard_last_sync_at';
 const DEVICE_ID_KEY = 'nightguard_device_id';
 const SITE_SETTINGS_KEY = 'nightguard_site_settings';
@@ -574,6 +579,34 @@ export function clearLegacyReportEmailSettings() {
   try {
     localStorage.removeItem(REPORT_EMAIL_SETTINGS_KEY);
   } catch { /* ignore */ }
+}
+
+// Who this SITE's automated reports are emailed to. Cached so the config screen is readable
+// with no signal, which on a guard's handset is the normal condition rather than the fault.
+//
+// ⚠ THE CACHE CARRIES ITS OWN site_id AND IS ONLY EVER RETURNED FOR A MATCHING SITE.
+// A location admin can sign in to any site they hold, and unbinding or re-homing a handset is
+// ordinary admin work — so this device does not stay on one site for its lifetime. A cached
+// blob returned after a re-bind would show the previous client's addresses on the new
+// client's screen, and the admin would have every reason to believe they were editing the
+// site named in the header. Treat a mismatch as no cache at all: an empty screen is honest,
+// a confidently wrong one is not.
+//
+// Deliberately NOT in nativeStorage's CRITICAL_KEYS. This is a few email addresses that can
+// always be re-read from the server; every write to a critical key re-serialises the entire
+// storage state to disk, and that cost belongs to the outbox, not to a settings screen.
+export function getCachedReportRecipients(siteId) {
+  if (!siteId) return null;
+  const stored = readJson(REPORT_RECIPIENTS_KEY, null);
+  if (!stored || String(stored.site_id) !== String(siteId)) return null;
+  return stored;
+}
+
+export function saveCachedReportRecipients(record) {
+  if (!record?.site_id) return null;
+  const saved = writeJson(REPORT_RECIPIENTS_KEY, record);
+  dispatchStoreEvent('nightguard_report_recipients_updated');
+  return saved;
 }
 
 export function getLastSyncAt() {

@@ -10,8 +10,18 @@ import { clearShiftSession, getShiftSession } from '../lib/deviceStore';
 import { endPatrolSession, flushPendingPatrolCompletions, getActivePatrolSession } from '../lib/patrolSession';
 import { getStoredAdminPinHashValue } from '../services/kioskPinService';
 
-// Universal fallback PIN so a manager who forgets the device PIN can always exit kiosk mode.
-const UNIVERSAL_EXIT_PIN = '773745';
+// Universal fallback PINs so a manager who forgets the device PIN can always exit kiosk mode.
+//
+// Any value here unlocks the device REGARDLESS of the site's configured admin PIN, and it
+// bypasses the 3-strike lockout and the failed-attempt security event below — a universal PIN
+// takes the success path, so nothing is recorded when one is used. Treat this array as the
+// list of people who can end any shift on any handset, because in practice that is what it is.
+//
+// '0000' was added deliberately on request (2026-08-18). It is trivially guessable, so on a
+// kiosk handset it effectively makes ending a shift and leaving the app unrestricted. That is
+// a business call, not a bug — but it is the reason this comment exists, so that nobody later
+// reads it as an oversight and nobody is surprised that the exit lockout stopped biting.
+const UNIVERSAL_EXIT_PINS = ['773745', '0000'];
 
 export default function EndShiftModal({ activeShift, onClose, onEnded }) {
   const navigate = useNavigate();
@@ -39,7 +49,10 @@ export default function EndShiftModal({ activeShift, onClose, onEnded }) {
     setSubmitting(true);
 
     try {
-      const isUniversal = pin === UNIVERSAL_EXIT_PIN;
+      // Trim before comparing: the PIN field is numeric, but a paste or an on-screen keyboard
+      // can leave whitespace, and a universal PIN that silently fails is worse than no
+      // universal PIN at all — the manager has no way to tell it apart from a wrong one.
+      const isUniversal = UNIVERSAL_EXIT_PINS.includes(pin.trim());
 
       // The universal PIN always works (managers' fallback) and bypasses the lockout.
       if (!isUniversal) {
