@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(adb root *)",
+      "Bash(python -c ' *)",
+      "Bash(python matrix.py)",
+      "Bash(python config_matrix.py)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\Control Room\\Desktop\\NightGuardTrackApp\\supabase\\migrations"
+    ]
+  }
+}
