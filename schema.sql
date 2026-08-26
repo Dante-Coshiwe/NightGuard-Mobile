@@ -566,3 +566,58 @@ CREATE TABLE public.device_locations (
   CONSTRAINT device_locations_pkey PRIMARY KEY (id),
   CONSTRAINT device_locations_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id)
 );
+CREATE TABLE public.report_recipients (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  site_id uuid NOT NULL UNIQUE,
+  recipient_emails ARRAY NOT NULL DEFAULT '{}'::text[],
+  immediate_emails ARRAY NOT NULL DEFAULT '{}'::text[],
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  updated_at timestamp with time zone NOT NULL DEFAULT now(),
+  daily_send_time time without time zone,
+  CONSTRAINT report_recipients_pkey PRIMARY KEY (id),
+  CONSTRAINT report_recipients_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id)
+);
+CREATE TABLE public.report_deliveries (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  site_id uuid,
+  report_type text NOT NULL,
+  trigger_kind text NOT NULL,
+  source_id uuid,
+  recipients ARRAY NOT NULL DEFAULT '{}'::text[],
+  status text NOT NULL,
+  skip_reason text,
+  provider_message_id text,
+  error text,
+  row_count integer,
+  period_start timestamp with time zone,
+  period_end timestamp with time zone,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT report_deliveries_pkey PRIMARY KEY (id),
+  CONSTRAINT report_deliveries_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id)
+);
+CREATE TABLE public.report_settings (
+  id integer NOT NULL DEFAULT 1 CHECK (id = 1),
+  company_name text NOT NULL DEFAULT 'NightGuard'::text,
+  psira_number text,
+  registration_number text,
+  vat_number text,
+  address_line text,
+  phone text,
+  contact_email text,
+  footer_note text,
+  logo_data_url text,
+  brand_color text NOT NULL DEFAULT '#c8000a'::text,
+  from_email text NOT NULL DEFAULT 'onboarding@resend.dev'::text,
+  from_name text NOT NULL DEFAULT 'NightGuard Reports'::text,
+  reply_to text,
+  timezone text NOT NULL DEFAULT 'Africa/Johannesburg'::text,
+  daily_send_time time without time zone NOT NULL DEFAULT '06:00:00'::time without time zone,
+  emails_enabled boolean NOT NULL DEFAULT false,
+  daily_incident_enabled boolean NOT NULL DEFAULT true,
+  daily_patrol_enabled boolean NOT NULL DEFAULT true,
+  daily_entry_exit_enabled boolean NOT NULL DEFAULT true,
+  immediate_incident_enabled boolean NOT NULL DEFAULT true,
+  updated_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT report_settings_pkey PRIMARY KEY (id)
+);
