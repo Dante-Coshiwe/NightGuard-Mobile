@@ -31,18 +31,24 @@ function getSupabaseErrorMessage(error) {
   return String(error?.message || error?.details || error?.hint || '').trim();
 }
 
-function shouldFallbackToLocal(error) {
+// ── Two failures that were treated as one, and cost a site its patrol points ──
+//
+// A device that cannot REACH the server and a server that REFUSES the write are
+// not the same event, and they were both answered with "saved locally, will sync
+// later". For a flat tunnel that is true and kind. For a refusal it is a lie: the
+// write will be refused again on every retry, for ever, and the operator walks
+// away believing the work is safe.
+//
+// On 2026-09-07 that cost a Fountainbrook supervisor nine patrol points. The
+// schedule row is written before the checkpoints in savePatrolConfiguration, so
+// the site was left with a correct schedule and NO checkpoints, and the screen
+// said "saved". Keep these two apart.
+
+// Cannot reach the server. The cache is genuinely the right answer, and the write
+// is genuinely worth retrying — includes the 12s client deadline in lib/supabase.js.
+function isOfflineError(error) {
   const message = getSupabaseErrorMessage(error).toLowerCase();
   return (
-    message.includes('row-level security') ||
-    message.includes('violates row-level security') ||
-    message.includes('schema cache') ||
-    message.includes('could not find the') ||
-    message.includes('permission denied') ||
-    message.includes('not found in the schema cache') ||
-    // Network reachability, including the 12s client deadline in lib/supabase.js.
-    // A device that cannot reach the server has cached data that is still good;
-    // throwing here would surface an error where the cache is the right answer.
     message.includes('failed to fetch') ||
     message.includes('fetch failed') ||
     message.includes('networkerror') ||
@@ -54,9 +60,46 @@ function shouldFallbackToLocal(error) {
   );
 }
 
+// Reached the server and was turned away: RLS, a missing grant, or a column this
+// build thinks exists and the database does not. Retrying changes nothing, so
+// this must reach the operator as a failure rather than a queued save.
+function isBlockedError(error) {
+  const message = getSupabaseErrorMessage(error).toLowerCase();
+  return (
+    message.includes('row-level security') ||
+    message.includes('violates row-level security') ||
+    message.includes('schema cache') ||
+    message.includes('could not find the') ||
+    message.includes('permission denied') ||
+    message.includes('not found in the schema cache')
+  );
+}
+
+// Reads only. A read that fails for either reason should fall back to the cached
+// copy rather than blowing up a screen — but the CALLER must still know it failed,
+// so it never mistakes "I could not read your points" for "you have no points".
+function shouldFallbackToLocal(error) {
+  return isOfflineError(error) || isBlockedError(error);
+}
+
 function markPendingAndReturn(key, value) {
   markPendingSchemaSync(key, true);
   return { ...value, _offline: true };
+}
+
+// Every patrol write goes through this, so no branch can quietly reintroduce the
+// "saved locally" lie. Offline queues and retries; refused throws with the reason
+// the operator needs, and the pending flag is NOT set -- a write that will never
+// be accepted must not sit in the queue pretending it will be.
+function patrolWriteFailure(error, what, normalisedConfig) {
+  if (isOfflineError(error)) return markPendingAndReturn('patrolConfig', normalisedConfig);
+  clearPendingSchemaSync('patrolConfig');
+  const detail = getSupabaseErrorMessage(error) || 'unknown error';
+  throw new Error(
+    isBlockedError(error)
+      ? `${what} was refused by the server and has NOT been saved: ${detail}. Nothing will retry this — the patrol points are still only on this device.`
+      : `${what} failed and has NOT been saved: ${detail}`,
+  );
 }
 
 function isUuid(value) {
@@ -110,6 +153,11 @@ function buildLookupRow(siteId, data) {
 }
 
 function mapPatrolConfig(scheduleRow, checkpoints) {
+  // NEVER substitutes DEFAULT_PATROL_CONFIG.checkpoints for an empty list. It used
+  // to, and that is what showed an operator the three seeded defaults after their
+  // own points failed to save — and then wrote those defaults back to the server.
+  // An empty list means "this site has no points"; deciding whether that is true
+  // or merely unreadable is the caller's job, and it needs the read error to do it.
   const savedCheckpoints = Array.isArray(checkpoints) && checkpoints.length
     ? checkpoints.map((checkpoint, index) => ({
       id: checkpoint.id,
@@ -122,7 +170,7 @@ function mapPatrolConfig(scheduleRow, checkpoints) {
       latitude: isValidCoordinate(checkpoint.latitude, checkpoint.longitude) ? Number(checkpoint.latitude) : null,
       longitude: isValidCoordinate(checkpoint.latitude, checkpoint.longitude) ? Number(checkpoint.longitude) : null,
     }))
-    : DEFAULT_PATROL_CONFIG.checkpoints;
+    : [];
 
   return {
     ...DEFAULT_PATROL_CONFIG,
@@ -357,6 +405,20 @@ export async function loadPatrolConfiguration(siteSettings = getCachedSiteSettin
   if (scheduleError && !shouldFallbackToLocal(scheduleError)) throw new Error(scheduleError.message);
   if (checkpointsError && !shouldFallbackToLocal(checkpointsError)) throw new Error(checkpointsError.message);
 
+  // A read that FAILED is not a site with no patrol points.
+  //
+  // Everything below decides what this site's layout is, and it used to reach that
+  // decision from `checkpoints` alone — which is null or [] whether the site is
+  // genuinely empty or the read was refused or timed out. So a failed read looked
+  // exactly like a fresh site, the seeded defaults were adopted, and then written
+  // to the server over the real layout. Bail out here instead: the cached config is
+  // the best copy anybody has, and it must not be touched or overwritten.
+  if (checkpointsError || scheduleError) {
+    console.warn("[PatrolConfig] could not read this site's patrol setup; keeping the copy on this device untouched:",
+      getSupabaseErrorMessage(checkpointsError || scheduleError));
+    return cachedPatrolConfig;
+  }
+
   // The stored config is stamped with the site it was loaded for. A device that moved between
   // sites — or whose binding resolved after the config was first cached — must not carry the
   // previous site's patrol points across. Without this, an empty new site got seeded with the OLD
@@ -368,18 +430,48 @@ export async function loadPatrolConfiguration(siteSettings = getCachedSiteSettin
     console.warn(`[PatrolConfig] cached config belongs to site ${configSiteId}, not ${siteId} — discarding it`);
   }
 
-  const hasRemoteSchedule = Boolean(scheduleRow);
   const hasRemoteCheckpoints = Array.isArray(checkpoints) && checkpoints.length > 0;
-  const localConfig = (hasRemoteSchedule || hasRemoteCheckpoints)
-    ? mapPatrolConfig(scheduleRow, checkpoints)
-    : localBaseline;
-  savePatrolConfig({ ...localConfig, site_id: siteId });
+  const localCheckpoints = Array.isArray(localBaseline.checkpoints) ? localBaseline.checkpoints : [];
+  // Points this device is holding that the server has never acknowledged. After a
+  // refused or dropped save this is the ONLY copy of the operator's work.
+  const hasUnsyncedLocalPoints = !hasRemoteCheckpoints
+    && localCheckpoints.some((c) => String(c?.name || '').trim());
 
-  if (!scheduleRow || !Array.isArray(checkpoints) || checkpoints.length === 0) {
+  let localConfig;
+  if (hasRemoteCheckpoints) {
+    // The server has the layout: it wins, and nothing needs pushing back.
+    localConfig = mapPatrolConfig(scheduleRow, checkpoints);
+    savePatrolConfig({ ...localConfig, site_id: siteId });
+  } else if (hasUnsyncedLocalPoints) {
+    // The server has none and this device has some. Keep the local points and try
+    // to push them up — do NOT let an empty server list wipe unsynced work. This is
+    // the case that lost a site its patrol points: the layout was replaced by the
+    // seeded defaults and those were then written to the server.
+    localConfig = {
+      ...mapPatrolConfig(scheduleRow, checkpoints),
+      checkpoints: localCheckpoints,
+    };
+    savePatrolConfig({ ...localConfig, site_id: siteId });
     try {
       await savePatrolConfiguration(localConfig, siteSettings);
-    } catch {
-      return localConfig;
+      console.info(`[PatrolConfig] pushed ${localCheckpoints.length} unsynced patrol point(s) up for site ${siteId}`);
+    } catch (err) {
+      // Left on the device and retried on the next load. Logged loudly rather than
+      // swallowed, because this is the moment somebody's setup is at risk.
+      console.error('[PatrolConfig] unsynced patrol points still could not be saved:', err?.message || err);
+    }
+  } else {
+    // Genuinely nothing anywhere: a new site. Seeding the defaults here is the one
+    // place it is correct, because there is no real layout to destroy.
+    localConfig = localBaseline;
+    savePatrolConfig({ ...localConfig, site_id: siteId });
+    if (!scheduleRow) {
+      try {
+        await savePatrolConfiguration(localConfig, siteSettings);
+      } catch (err) {
+        console.warn('[PatrolConfig] could not seed a new site:', err?.message || err);
+        return localConfig;
+      }
     }
   }
 
@@ -419,11 +511,7 @@ export async function savePatrolConfiguration(localConfig, siteSettings = getCac
     .limit(1);
 
   if (scheduleSelectError) {
-    if (shouldFallbackToLocal(scheduleSelectError)) {
-      return markPendingAndReturn('patrolConfig', normalisedConfig);
-    }
-    markPendingSchemaSync('patrolConfig');
-    throw new Error(scheduleSelectError.message);
+    return patrolWriteFailure(scheduleSelectError, 'Reading the patrol schedule', normalisedConfig);
   }
 
   const scheduleExists = Array.isArray(existingSchedules) && existingSchedules.length > 0;
@@ -432,11 +520,7 @@ export async function savePatrolConfiguration(localConfig, siteSettings = getCac
     : await supabase.from('site_patrol_schedules').insert(schedulePayload);
 
   if (scheduleError) {
-    if (shouldFallbackToLocal(scheduleError)) {
-      return markPendingAndReturn('patrolConfig', normalisedConfig);
-    }
-    markPendingSchemaSync('patrolConfig');
-    throw new Error(scheduleError.message);
+    return patrolWriteFailure(scheduleError, 'Saving the patrol schedule', normalisedConfig);
   }
 
   const currentCheckpoints = Array.isArray(normalisedConfig.checkpoints) ? normalisedConfig.checkpoints : [];
@@ -448,11 +532,7 @@ export async function savePatrolConfiguration(localConfig, siteSettings = getCac
     .eq('site_id', siteId);
 
   if (existingError) {
-    if (shouldFallbackToLocal(existingError)) {
-      return markPendingAndReturn('patrolConfig', normalisedConfig);
-    }
-    markPendingSchemaSync('patrolConfig');
-    throw new Error(existingError.message);
+    return patrolWriteFailure(existingError, "Reading this site's existing patrol points", normalisedConfig);
   }
 
   const removableIds = (existingRows || [])
@@ -466,16 +546,12 @@ export async function savePatrolConfiguration(localConfig, siteSettings = getCac
 
     const { error: deleteError } = await supabase.from('patrol_checkpoints').delete().in('id', removableIds);
     if (deleteError) {
-      if (shouldFallbackToLocal(deleteError)) {
-        return markPendingAndReturn('patrolConfig', normalisedConfig);
-      }
       // A still-referenced checkpoint (FK 23503 — e.g. the scan unlink was denied by RLS)
       // must not abort the whole save; leave the orphaned row behind and keep going.
       if (deleteError.code === '23503') {
         console.warn('[PatrolConfig] Could not delete referenced checkpoints; leaving them in place:', deleteError.message);
       } else {
-        markPendingSchemaSync('patrolConfig');
-        throw new Error(deleteError.message);
+        return patrolWriteFailure(deleteError, 'Removing deleted patrol points', normalisedConfig);
       }
     }
   }
@@ -526,11 +602,7 @@ export async function savePatrolConfiguration(localConfig, siteSettings = getCac
         .select('*');
 
       if (checkpointError) {
-        if (shouldFallbackToLocal(checkpointError)) {
-          return markPendingAndReturn('patrolConfig', normalisedConfig);
-        }
-        markPendingSchemaSync('patrolConfig');
-        throw new Error(checkpointError.message);
+        return patrolWriteFailure(checkpointError, 'Updating the existing patrol points', normalisedConfig);
       }
 
       savedRows = [...savedRows, ...(updatedRows || [])];
@@ -556,11 +628,7 @@ export async function savePatrolConfiguration(localConfig, siteSettings = getCac
       }
 
       if (insertError) {
-        if (shouldFallbackToLocal(insertError)) {
-          return markPendingAndReturn('patrolConfig', normalisedConfig);
-        }
-        markPendingSchemaSync('patrolConfig');
-        throw new Error(insertError.message);
+        return patrolWriteFailure(insertError, `Saving ${newCheckpointRows.length} new patrol point${newCheckpointRows.length === 1 ? '' : 's'}`, normalisedConfig);
       }
 
       savedRows = [...savedRows, ...(insertedRows || [])];
