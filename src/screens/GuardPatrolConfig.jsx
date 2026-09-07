@@ -6,6 +6,16 @@ import NotificationService from '../services/notificationService';
 import { useGeolocation } from '../hooks/useGeolocation';
 import { isValidCoordinate } from '../lib/geo';
 import { isNfcReaderAvailable, listenForNfcTags, nfcStatus } from '../lib/nfcReader';
+import {
+  buildPatrolTimes,
+  derivePatrolWindow,
+  describePatrolWindow,
+  formatPatrolInterval,
+  patrolWindowLastSlot,
+  patrolWindowLength,
+  MAX_PATROL_TIMES,
+  PATROL_INTERVAL_CHOICES,
+} from '../lib/patrolWindow';
 import CheckpointMap from '../components/CheckpointMap';
 
 const styles = {
@@ -202,7 +212,7 @@ export default function GuardPatrolConfig() {
           tag_uid: '',
           zone: '',
           checkpoint_order: prev.checkpoints.length + 1,
-          required: true,
+          required: true, // Always: see PatrolTab — every point counts.
           status: 'pending',
           latitude: null,
           longitude: null,
@@ -230,38 +240,91 @@ export default function GuardPatrolConfig() {
     }));
   };
 
-  const addPatrolTime = () => {
+  // ── The schedule is a window; the storage is still a list ─────────────────
+  //
+  // Supervisors were adding "19:00", then "19:30", then "20:00" … twenty-one taps
+  // for one night's cover, and one fat-fingered entry meant a patrol nobody was
+  // ever told about. It is entered as first patrol / last patrol / how often now
+  // and expanded into the same `patrolTimes` array everything downstream already
+  // reads — the alarms, the schedule watcher and the reports all keep working off
+  // the list, and a handset on an older bundle never has to know windows exist.
+  const patrolTimes = Array.isArray(config.patrolTimes) ? config.patrolTimes : [];
+  const patrolTimesKey = patrolTimes.join(',');
+
+  // The window as TYPED, held separately from the times it generates.
+  //
+  // Deriving it back out of the times on every keystroke looked equivalent and is
+  // not: an interval that does not divide the window stops short of the end, so
+  // re-deriving hands back that shorter end, and the next edit builds on it. Typing
+  // 19:00, then 05:00, then picking "every 30 min" walked the end down to 02:30 —
+  // the operator's own last patrol time, quietly rewritten between two clicks.
+  // The times are still the only thing stored; this is just the editor's memory of
+  // what was asked for.
+  const [patrolWindow, setPatrolWindow_] = useState(() => derivePatrolWindow(config.patrolTimes));
+  // Which times list the draft above was last reconciled against.
+  const [windowSource, setWindowSource] = useState(patrolTimesKey);
+
+  // Re-seed the editor when the times change underneath it — a first load, a
+  // config that arrived from the store, or a round dropped by its ✕ — but never
+  // when they changed because the editor itself generated them.
+  //
+  // Done during render rather than in an effect: this is React's "adjusting state
+  // when a prop changes", so it costs one re-render before anything is painted
+  // instead of a cascade after it.
+  if (windowSource !== patrolTimesKey) {
+    setWindowSource(patrolTimesKey);
+    if (buildPatrolTimes(patrolWindow).join(',') !== patrolTimesKey) {
+      setPatrolWindow_(derivePatrolWindow(patrolTimes));
+    }
+  }
+
+  // Both ends and the interval go through here, so the times listed on screen are
+  // always exactly the times that get saved and armed.
+  const setPatrolWindow = (patch) => {
+    const next = { ...patrolWindow, ...patch };
+    setPatrolWindow_(next);
     setConfig((prev) => ({
       ...prev,
-      patrolTimes: [...(prev.patrolTimes || []), '06:00'],
+      patrolTimes: buildPatrolTimes(next),
+      // Kept in step so site_patrol_schedules.patrol_interval_minutes describes the
+      // schedule sitting beside it instead of a number nothing reads.
+      patrolIntervalMinutes: next.intervalMinutes,
     }));
   };
 
-  const updatePatrolTime = (index, value) => {
+  // What the window really produces. Differs from the typed end whenever the
+  // interval does not divide the window.
+  const lastSlot = patrolWindowLastSlot(patrolWindow);
+
+  // Dropping one slot out of a generated round — a shift change, a gate that is
+  // locked at 01:00. The window then reads as the nearest even one and says so,
+  // rather than pretending the list is still regular.
+  const removePatrolTime = (value) => {
     setConfig((prev) => ({
       ...prev,
-      patrolTimes: (prev.patrolTimes || []).map((time, itemIndex) => (itemIndex === index ? value : time)),
+      patrolTimes: (prev.patrolTimes || []).filter((time) => time !== value),
     }));
   };
 
-  const removePatrolTime = (index) => {
-    setConfig((prev) => ({
-      ...prev,
-      patrolTimes: (prev.patrolTimes || []).filter((_, itemIndex) => itemIndex !== index),
-    }));
-  };
+  // Whatever the saved times actually work out to has to stay selectable, or
+  // opening a legacy schedule would silently snap it to a nearby listed interval.
+  const intervalChoices = [...new Set([...PATROL_INTERVAL_CHOICES, patrolWindow.intervalMinutes])]
+    .sort((a, b) => a - b);
 
   const validateConfig = () => {
     const errors = {};
     const times = Array.isArray(config.patrolTimes) ? config.patrolTimes : [];
     if (config.patrolScheduleEnabled !== false && times.length === 0) {
-      errors.patrolTimes = 'Add at least one patrol time.';
+      errors.patrolTimes = 'Set a first patrol, a last patrol and an interval.';
     }
-    times.forEach((time, index) => {
-      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(time || ''))) {
-        errors[`patrolTime_${index}`] = 'Use HH:mm format.';
-      }
-    });
+    // The window generator cannot emit a malformed time, but a config saved by an
+    // older build can still carry one, and it would be armed as an alarm that
+    // never fires. Reported against the schedule as a whole — there are no
+    // per-time inputs left to hang an error off.
+    const malformed = times.filter((time) => !/^([01]\d|2[0-3]):[0-5]\d$/.test(String(time || '')));
+    if (malformed.length) {
+      errors.patrolTimes = `Remove or replace ${malformed.length} unreadable patrol time${malformed.length === 1 ? '' : 's'}: ${malformed.join(', ')}`;
+    }
 
     (config.checkpoints || []).forEach((checkpoint, index) => {
       const latEntered = checkpoint.latitude !== null && checkpoint.latitude !== undefined && String(checkpoint.latitude).trim() !== '';
@@ -462,29 +525,92 @@ export default function GuardPatrolConfig() {
         </div>
 
         <div style={{ marginTop: 18 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
-            <h3 style={{ margin: 0, fontSize: 15 }}>Daily patrol times</h3>
-            <button type="button" onClick={addPatrolTime} style={styles.subtleBtn}>+ Add Time</button>
+          <h3 style={{ margin: '0 0 10px', fontSize: 15 }}>Daily patrol times</h3>
+          <div style={{ display: 'grid', gap: 12, gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))' }}>
+            <label>
+              <div style={{ color: '#a3a3a3', marginBottom: 6 }}>First patrol</div>
+              <input
+                style={styles.input}
+                type="time"
+                value={patrolWindow.start}
+                onChange={(e) => setPatrolWindow({ start: e.target.value })}
+              />
+            </label>
+            <label>
+              <div style={{ color: '#a3a3a3', marginBottom: 6 }}>Last patrol</div>
+              <input
+                style={styles.input}
+                type="time"
+                value={patrolWindow.end}
+                onChange={(e) => setPatrolWindow({ end: e.target.value })}
+              />
+            </label>
+            <label>
+              <div style={{ color: '#a3a3a3', marginBottom: 6 }}>One every</div>
+              <select
+                style={styles.input}
+                value={patrolWindow.intervalMinutes}
+                onChange={(e) => setPatrolWindow({ intervalMinutes: Number(e.target.value) })}
+              >
+                {intervalChoices.map((minutes) => (
+                  <option key={minutes} value={minutes}>{formatPatrolInterval(minutes)}</option>
+                ))}
+              </select>
+            </label>
           </div>
+
+          <div style={{ marginTop: 12, color: '#d4d4d4', fontSize: 13 }}>
+            {describePatrolWindow(patrolWindow, patrolTimes.length)}
+            {patrolWindowLength(patrolWindow) ? ` · ${patrolWindowLength(patrolWindow)} of cover` : ''}
+          </div>
+          {/* Said out loud rather than fixed silently: the interval does not divide
+              the window, so the round stops before the last patrol time asked for. */}
+          {lastSlot && lastSlot !== patrolWindow.end && (
+            <div style={{ marginTop: 4, color: '#fbbf24', fontSize: 12 }}>
+              This interval does not reach {patrolWindow.end} — the last patrol lands at {lastSlot}.
+            </div>
+          )}
+          {/* The end wraps past midnight in every night schedule, so say which day
+              the last one lands on rather than leaving it to be worked out. */}
+          {patrolWindow.end < patrolWindow.start && (
+            <div style={{ marginTop: 4, color: '#8b8b8b', fontSize: 12 }}>
+              The last patrol falls the following morning.
+            </div>
+          )}
+          {!patrolWindow.even && patrolTimes.length > 1 && (
+            <div style={{ marginTop: 4, color: '#8b8b8b', fontSize: 12 }}>
+              Times were removed by hand, so they are not evenly spaced. Changing any field
+              above rebuilds the full round.
+            </div>
+          )}
+          {patrolTimes.length >= MAX_PATROL_TIMES && (
+            <div style={{ marginTop: 4, color: '#fbbf24', fontSize: 12 }}>
+              Capped at {MAX_PATROL_TIMES} patrols a day — one alarm is set on the handset
+              for each. Use a longer interval for a shorter list.
+            </div>
+          )}
           {validationErrors.patrolTimes && <div style={styles.fieldError}>{validationErrors.patrolTimes}</div>}
-          <div style={{ display: 'grid', gap: 10 }}>
-            {(config.patrolTimes || []).map((time, index) => (
-              <div key={`${time}-${index}`} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <input
-                  style={{ ...styles.input, maxWidth: 180 }}
-                  type="time"
-                  value={time}
-                  onChange={(e) => updatePatrolTime(index, e.target.value)}
-                />
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 12 }}>
+            {patrolTimes.map((time) => (
+              <span
+                key={time}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6, padding: '5px 8px',
+                  background: '#111', border: '1px solid #2a2a2a', borderRadius: 8,
+                  color: '#e5e5e5', fontSize: 13, fontVariantNumeric: 'tabular-nums',
+                }}
+              >
+                {time}
                 <button
                   type="button"
-                  style={{ ...styles.subtleBtn, color: '#f87171', borderColor: '#7f1d1d' }}
-                  onClick={() => removePatrolTime(index)}
+                  aria-label={`Remove the ${time} patrol`}
+                  onClick={() => removePatrolTime(time)}
+                  style={{ background: 'none', border: 'none', color: '#8b8b8b', cursor: 'pointer', padding: 0, fontSize: 14, lineHeight: 1 }}
                 >
-                  Remove
+                  ×
                 </button>
-                {validationErrors[`patrolTime_${index}`] && <div style={styles.fieldError}>{validationErrors[`patrolTime_${index}`]}</div>}
-              </div>
+              </span>
             ))}
           </div>
         </div>

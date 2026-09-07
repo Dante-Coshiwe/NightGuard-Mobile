@@ -104,7 +104,12 @@ export default function PatrolTab() {
 
   // Reached checkpoints come from the persisted session, so progress survives leaving the app.
   const reachedCheckpointIds = new Set((session?.reachedCheckpointIds || []).map(String));
-  const requiredCheckpoints = patrolConfig.checkpoints.filter((checkpoint) => checkpoint.required !== false);
+  // EVERY patrol point counts. `required` used to be a per-point toggle; a point a
+  // guard is allowed to skip is not a patrol point, so the toggle is gone and the
+  // column is always written true. Legacy rows saved with required=false are
+  // deliberately NOT filtered out here — excluding them would quietly shrink the
+  // night's target and report a full round for a walk that missed points.
+  const requiredCheckpoints = patrolConfig.checkpoints;
   const requiredCheckpointCount = requiredCheckpoints.length;
   const requiredCheckpointIds = new Set(requiredCheckpoints.map((checkpoint) => String(checkpoint.id)));
   // Lock the target to what the site required when this patrol started — a config sync arriving

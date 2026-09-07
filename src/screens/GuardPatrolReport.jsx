@@ -21,6 +21,7 @@ import {
 import { REPORT_COLORS, reportPageStyle } from '../lib/reportTheme';
 import { NIGHTGUARD_CONNECTIVITY_RECHECK_EVENT } from '../lib/connectivity';
 import { buildDatedReportFileName, exportPdfDocument, getSiteDisplayName } from '../lib/reportUtils';
+import { derivePatrolWindow, describePatrolWindow, matchPatrolsToSchedule } from '../lib/patrolWindow';
 import { logApiError, logApiAttempt, logOfflineUsage } from '../lib/apiErrorLogger';
 
 // ============================================================================
@@ -191,21 +192,65 @@ export default function GuardPatrolDashboard() {
     ? Math.round((patrolsCompleted / filteredPatrols.length) * 100)
     : null;
 
-  // Adherence needs a real denominator: the site's schedule × days covered. Without
-  // a schedule there is nothing to be adherent to, so it says so rather than inventing one.
-  const scheduleAdherence = useMemo(() => {
-    const perDay = (patrolConfig.patrolTimes || []).length;
-    if (!perDay || !filteredPatrols.length) return null;
-    const stamps = filteredPatrols.map((patrol) => new Date(patrol.actual_start || patrol.created_at).getTime());
-    const spanDays = Math.max(1, Math.ceil((Math.max(...stamps) - Math.min(...stamps)) / 86400000) || 1);
-    const expected = perDay * spanDays;
-    return {
-      expected,
-      perDay,
-      spanDays,
-      percent: Math.min(100, Math.round((filteredPatrols.length / expected) * 100)),
-    };
-  }, [patrolConfig.patrolTimes, filteredPatrols]);
+  const patrolWindow = useMemo(() => derivePatrolWindow(patrolConfig.patrolTimes), [patrolConfig.patrolTimes]);
+
+  // Adherence needs a real denominator: the rounds the schedule actually put on
+  // the clock during the period. Without a schedule there is nothing to be
+  // adherent to, so it says so rather than inventing one.
+  //
+  // What this replaced divided patrols-walked by times-per-day × days-spanned. It
+  // could not name the round that was missed, and it read 100% for a night where
+  // every patrol was walked back-to-back in one hour. Matching each patrol to the
+  // slot it answered makes "the 02:00 round was skipped" something the report can
+  // actually say.
+  const schedulePlan = useMemo(() => {
+    const times = Array.isArray(patrolConfig.patrolTimes) ? patrolConfig.patrolTimes : [];
+    if (!times.length || patrolConfig.patrolScheduleEnabled === false) return null;
+
+    const stamps = filteredPatrols
+      .map((patrol) => new Date(patrol.actual_start || patrol.created_at || 0).getTime())
+      .filter((ms) => Number.isFinite(ms) && ms > 0);
+    if (!stamps.length && !(dateFrom && dateTo)) return null;
+
+    // A range typed into the filter is the period the reader asked about. Without
+    // one, the only defensible period is the stretch the data itself covers --
+    // counting rounds due on nights before this device recorded its first patrol
+    // would invent a backlog nobody was ever asked to walk.
+    const from = dateFrom ? new Date(`${dateFrom}T00:00:00`) : new Date(Math.min(...stamps));
+    if (!dateFrom) from.setHours(0, 0, 0, 0);
+    const to = dateTo ? new Date(`${dateTo}T23:59:59`) : new Date(Math.max(...stamps));
+    if (!dateTo) to.setHours(23, 59, 59, 999);
+
+    // Never past the moment this data was pulled. A round due at 04:00 tomorrow
+    // has not been missed, and a report opened at 22:00 that writes off the rest
+    // of the night is the kind of number a guard gets shouted at over.
+    // `loadedAt` rather than Date.now(): it is what the page already shows as the
+    // as-of time, and it keeps this memo honest about when it was computed.
+    const asOf = loadedAt ? new Date(loadedAt).getTime() : to.getTime();
+    const end = new Date(Math.min(to.getTime(), asOf));
+    if (end <= from) return null;
+
+    return matchPatrolsToSchedule(
+      times,
+      filteredPatrols.map((patrol) => patrol.actual_start || patrol.created_at),
+      from,
+      end,
+    );
+  }, [patrolConfig.patrolTimes, patrolConfig.patrolScheduleEnabled, filteredPatrols, dateFrom, dateTo, loadedAt]);
+
+  // The rounds that were due and never walked, newest first, with the ones that
+  // go missing most often at the top -- a slot missed on eight nights out of ten
+  // is a rota problem, and a slot missed once is a bad night.
+  const missedByTime = useMemo(() => {
+    if (!schedulePlan) return [];
+    const tally = new Map();
+    schedulePlan.missed.forEach((slot) => tally.set(slot.time, (tally.get(slot.time) || 0) + 1));
+    const dueByTime = new Map();
+    schedulePlan.slots.forEach((slot) => dueByTime.set(slot.time, (dueByTime.get(slot.time) || 0) + 1));
+    return [...tally.entries()]
+      .map(([time, missed]) => ({ time, missed, due: dueByTime.get(time) || missed }))
+      .sort((a, b) => b.missed - a.missed || a.time.localeCompare(b.time));
+  }, [schedulePlan]);
 
   // One row per guard, keyed on the NAME so patrols and scans land on the same person.
   const guardStats = useMemo(() => {
@@ -254,12 +299,30 @@ export default function GuardPatrolDashboard() {
     doc.setTextColor(100);
     doc.text(`Period: ${periodLabel}   |   Exported: ${new Date().toLocaleString()}   |   By: ${user?.name || user?.username || 'Unknown'}`, 14, 22);
     doc.text([
+      // The schedule leads, because it is the only line here that says what was
+      // supposed to happen. Everything under it says what did.
+      schedulePlan
+        ? `Schedule: ${describePatrolWindow(patrolWindow, patrolWindow.count)}   ·   ${schedulePlan.covered} of ${schedulePlan.expected} rounds walked (${schedulePlan.percent}%)`
+        : 'Schedule: none set for this site, so there is nothing to measure adherence against.',
       `Checkpoint coverage: ${coveragePercent === null ? 'no points configured' : `${coveragePercent}% (${pointsReached.length} of ${configuredPoints.length} points reached)`}`,
       `Patrols: ${patrolsCompleted} completed of ${filteredPatrols.length} started   ·   Check-ins recorded: ${filteredScans.length}`,
       pointsMissed.length
         ? `Points never reached in this period: ${pointsMissed.map((point) => point.name).join(', ')}`
         : 'Every configured checkpoint was reached at least once.',
     ], 14, 28);
+
+    // Named rounds, not just a percentage. A client asking "which patrol was
+    // skipped on Tuesday" has to be answerable from the PDF alone.
+    if (schedulePlan && missedByTime.length) {
+      doc.autoTable({
+        head: [['Round due', 'Times due', 'Walked', 'Missed']],
+        body: missedByTime.map((row) => [row.time, row.due, row.due - row.missed, row.missed]),
+        startY: 50,
+        styles: { fontSize: 9, cellPadding: 3 },
+        headStyles: { fillColor: [180, 83, 9], textColor: 255, fontStyle: 'bold' },
+        alternateRowStyles: { fillColor: [245, 245, 245] },
+      });
+    }
 
     doc.autoTable({
       head: [['Checkpoint', 'Zone', 'Visits', 'Last reached']],
@@ -269,7 +332,7 @@ export default function GuardPatrolDashboard() {
         point.visits,
         point.lastHit ? new Date(point.lastHit).toLocaleString() : 'Never in this period',
       ]),
-      startY: 46,
+      startY: schedulePlan && missedByTime.length ? doc.lastAutoTable.finalY + 10 : 52,
       styles: { fontSize: 9, cellPadding: 3 },
       headStyles: { fillColor: [59, 130, 246], textColor: 255, fontStyle: 'bold' },
       alternateRowStyles: { fillColor: [245, 245, 245] },
@@ -364,10 +427,25 @@ export default function GuardPatrolDashboard() {
                 ? `${patrolsCompleted} of ${filteredPatrols.length} started patrols were finished.`
                 : 'No patrols were started in this period.'}
             />
+            <Meter
+              percent={schedulePlan ? schedulePlan.percent : null}
+              label="Schedule kept"
+              caption={schedulePlan
+                ? `${schedulePlan.covered} of ${schedulePlan.expected} scheduled rounds were walked. ${describePatrolWindow(patrolWindow, patrolWindow.count)}.`
+                : 'No patrol schedule is set for this site, so there is nothing to measure against. Set one under Config → Guard Patrol.'}
+            />
           </div>
 
           <KpiRow min={140}>
             <StatTile label="Patrols walked" value={filteredPatrols.length} hint={periodLabel} />
+            <StatTile
+              label="Rounds missed"
+              value={schedulePlan ? schedulePlan.missed.length : '—'}
+              tone={schedulePlan && schedulePlan.missed.length ? 'warning' : 'good'}
+              hint={schedulePlan
+                ? `Of ${schedulePlan.expected} due in this period`
+                : 'No schedule set for this site'}
+            />
             <StatTile label="Check-ins" value={filteredScans.length} hint={`${nfcScanCount} by NFC tag, ${filteredScans.length - nfcScanCount} by GPS`} />
             <StatTile
               label="Points never reached"
@@ -428,22 +506,44 @@ export default function GuardPatrolDashboard() {
                 )}
               </Panel>
 
-              {scheduleAdherence && (
+              {schedulePlan && (
                 <Panel
                   title="Against the schedule"
-                  subtitle={`This site is set to ${scheduleAdherence.perDay} patrol${scheduleAdherence.perDay === 1 ? '' : 's'} a day. Over the ${scheduleAdherence.spanDays} day${scheduleAdherence.spanDays === 1 ? '' : 's'} covered here that is ${scheduleAdherence.expected} expected.`}
+                  subtitle={`${describePatrolWindow(patrolWindow, patrolWindow.count)}. ${schedulePlan.expected} round${schedulePlan.expected === 1 ? '' : 's'} came due in this period.`}
                   right={(
-                    <StatusPill tone={scheduleAdherence.percent >= 80 ? 'good' : scheduleAdherence.percent >= 50 ? 'warning' : 'critical'}>
-                      {`${scheduleAdherence.percent}% of schedule`}
+                    <StatusPill tone={schedulePlan.percent >= 80 ? 'good' : schedulePlan.percent >= 50 ? 'warning' : 'critical'}>
+                      {`${schedulePlan.percent}% of schedule`}
                     </StatusPill>
                   )}
                 >
                   <BarList
                     rows={[
-                      { key: 'walked', label: 'Walked', value: filteredPatrols.length },
-                      { key: 'expected', label: 'Expected', value: scheduleAdherence.expected, color: REPORT_COLORS.series2 },
+                      { key: 'covered', label: 'Rounds walked', value: schedulePlan.covered },
+                      { key: 'missed', label: 'Rounds missed', value: schedulePlan.missed.length, color: REPORT_COLORS.series2 },
                     ]}
                   />
+                  {/* Which round, not just how many -- a time that goes missing
+                      night after night is the thing worth acting on. */}
+                  {missedByTime.length > 0 && (
+                    <div style={{ marginTop: 12 }}>
+                      <div style={{ color: REPORT_COLORS.textMuted, fontSize: 12, marginBottom: 6 }}>
+                        Rounds that were due and not walked
+                      </div>
+                      <BarList
+                        rows={missedByTime.slice(0, 8).map((row) => ({
+                          key: row.time,
+                          label: `${row.time} — missed ${row.missed} of ${row.due}`,
+                          value: row.missed,
+                        }))}
+                      />
+                    </div>
+                  )}
+                  {schedulePlan.unscheduled > 0 && (
+                    <div style={{ marginTop: 10, color: REPORT_COLORS.textMuted, fontSize: 12 }}>
+                      {schedulePlan.unscheduled} patrol{schedulePlan.unscheduled === 1 ? ' was' : 's were'} walked
+                      outside any scheduled round. Those count as extra cover, not against the schedule.
+                    </div>
+                  )}
                 </Panel>
               )}
 
