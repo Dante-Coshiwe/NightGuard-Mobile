@@ -39,7 +39,7 @@ function withWriteTimeout(promise, url) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-// ✅ FIXED: Never makes a network call — reads cached session only
+//  FIXED: Never makes a network call — reads cached session only
 // supabase.auth.getSession() hits the network when offline and hangs for 10-30s
 function hasAuthenticatedSession() {
   try {
