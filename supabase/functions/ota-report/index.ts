@@ -10,7 +10,7 @@
 //      "bundleId":     "<uuid>",           // from the ota-check response (optional)
 //      "fromVersion":  "1.3.0",
 //      "toVersion":    "1.4.0",
-//      "status":       "applied",          // 'download_started'|'downloaded'|'applied'|'failed'
+//      "status":       "applied",          // 'download_started'|'downloaded'|'applied'|'failed'|'timeout'
 //      "errorMessage": "…",                // when status = 'failed'
 //      "nativeVersion":"1.0.0",
 //      "platform":     "android"
@@ -37,11 +37,16 @@ function json(body: unknown, status = 200) {
   });
 }
 
+// 'timeout' is deliberately NOT 'failed'. The client aborts its own request after a hard
+// deadline on a slow link; the update itself was never offered, refused or broken. Reporting
+// both as 'failed' is what made a network blip at Fountainbrook on 2026-09-07 look like a
+// broken mandatory rollout, and cost a morning and an unnecessary bundle rollback.
 const VALID_STATUSES = new Set([
   "download_started",
   "downloaded",
   "applied",
   "failed",
+  "timeout",
 ]);
 
 Deno.serve(async (req) => {

@@ -24,7 +24,7 @@ import { getSiteBinding } from '../lib/siteResolver';
 // Web bundle version currently shipped. Bump this on every release you publish
 // (it must match the `version` you pass to `ota:publish`). It is what the
 // server compares against to decide if a newer bundle exists.
-export const OTA_CURRENT_VERSION = '1.1.37';
+export const OTA_CURRENT_VERSION = '1.1.38';
 
 const OTA_CHECK_FN = 'ota-check';
 const OTA_REPORT_FN = 'ota-report';
@@ -48,9 +48,15 @@ function withTimeout(promise, ms, label) {
 // a token refresh suspended by the WebView holds that lock forever, and every
 // OTA call then hangs with no error. OTA is plumbing; it must never depend on
 // auth/session state.
-async function invokeFn(name, body, timeoutMs = 15000) {
+// The deadline was 15s, which an emulator on wifi never noticed and a WP5 on mobile data at a
+// site did: the Edge Function cold-starts, the response misses the window, and this aborts a
+// request the server had already handled. 30s is still bounded but stops calling a slow link a
+// failure. `isTimeout` is what lets the caller report it as one — an AbortError's message is
+// the literal string "The user aborted a request.", which names neither a user nor the cause.
+async function invokeFn(name, body, timeoutMs = 30000) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
   try {
     const res = await fetch(`${SUPABASE_URL}/functions/v1/${name}`, {
       method: 'POST',
@@ -64,6 +70,13 @@ async function invokeFn(name, body, timeoutMs = 15000) {
     });
     if (!res.ok) throw new Error(`${name} HTTP ${res.status}`);
     return await res.json();
+  } catch (err) {
+    if (timedOut) {
+      const timeout = new Error(`${name} timed out after ${timeoutMs}ms (no response from server)`);
+      timeout.isTimeout = true;
+      throw timeout;
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -197,7 +210,10 @@ export async function checkForUpdate() {
     reportOta({
       deviceId, orgId, nativeVersion, platform,
       fromVersion: currentVersion, toVersion: null,
-      status: 'failed', errorMessage: `check: ${err?.message || err}`,
+      // A timeout is a network event, not a broken update. Reported apart so the fleet view
+      // stops flagging a slow link as a device that needs attention.
+      status: err?.isTimeout ? 'timeout' : 'failed',
+      errorMessage: `check: ${err?.message || err}`,
     });
     return null;
   }
