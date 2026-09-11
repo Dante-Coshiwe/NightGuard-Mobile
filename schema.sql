@@ -619,5 +619,6 @@ CREATE TABLE public.report_settings (
   daily_entry_exit_enabled boolean NOT NULL DEFAULT true,
   immediate_incident_enabled boolean NOT NULL DEFAULT true,
   updated_at timestamp with time zone NOT NULL DEFAULT now(),
+  ops_alert_emails ARRAY NOT NULL DEFAULT '{}'::text[],
   CONSTRAINT report_settings_pkey PRIMARY KEY (id)
 );
