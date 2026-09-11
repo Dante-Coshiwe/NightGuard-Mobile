@@ -22,8 +22,6 @@ import { logApiError, logApiAttempt, logApiSuccess } from '../lib/apiErrorLogger
 import {
   buildDailyCoverage,
   buildShiftReport,
-  formatDuration,
-  formatHours,
   rollUpByGuard,
   summariseShiftRows,
 } from '../lib/shiftAnalytics';
@@ -129,21 +127,20 @@ export default function ShiftSummaryReport() {
     doc.setFontSize(9);
     doc.setTextColor(60);
     doc.text([
-      `Shifts worked: ${totals.shifts}   ·   Hours on site: ${formatHours(totals.totalMs)}   ·   Average shift: ${formatDuration(totals.averageMs)}`,
-      `Patrols: ${totals.patrolsCompleted} completed of ${totals.patrols} started   ·   Checkpoint coverage: ${totals.coveragePercent === null ? 'not measurable (no patrol points configured)' : `${totals.coveragePercent}%`}`,
+      `Shifts recorded: ${totals.shifts}   ·   Patrols: ${totals.patrolsCompleted} completed of ${totals.patrols} started`,
+      `Checkpoint coverage: ${totals.coveragePercent === null ? 'not measurable (no patrol points configured)' : `${totals.coveragePercent}%`}   ·   Checkpoints hit: ${totals.pointsVisited}`,
       `Incidents reported: ${totals.incidents}   ·   Vehicles logged: ${totals.vehicles}   ·   Visitors logged: ${totals.pedestrians}   ·   OB entries: ${totals.obEntries}`,
       `Days in period with no shift recorded: ${daysWithoutCover}`,
       totals.flaggedShifts
-        ? `Note: ${totals.flaggedShifts} shift(s) were never signed off on the device and are excluded from the hours above.`
+        ? `Note: ${totals.flaggedShifts} shift(s) were ended by an admin unlock, left open, or ran over length.`
         : 'All shifts in this period were signed off on the device.',
     ], 14, 38);
 
     doc.autoTable({
-      head: [['Guard', 'Shifts', 'Hours', 'Sundays', 'Nights', 'Patrols done', 'Points hit', 'Incidents', 'Vehicles', 'Visitors']],
+      head: [['Guard', 'Shifts', 'Sundays', 'Nights', 'Patrols done', 'Points hit', 'Incidents', 'Vehicles', 'Visitors']],
       body: guards.map((guard) => [
         guard.guardName,
         guard.shifts,
-        formatHours(guard.totalMs),
         guard.sundayShifts,
         guard.nightShifts,
         `${guard.patrolsCompleted}/${guard.patrols}`,
@@ -201,10 +198,15 @@ export default function ShiftSummaryReport() {
         />
       ) : (
         <>
+          {/* This is the page a client sees, so it leads with work done rather than time
+              billed. "Hours on site" and "Average shift" were removed because they were
+              wrong in the client's favour AND against it at the same time: most shift
+              rows end with a manager unlocking the handset rather than a guard signing
+              off, so the total collapsed to minutes for sites that had walked every
+              patrol, every night. Patrols and checkpoint coverage below are evidenced by
+              scans and are the honest answer to "what did we deliver". */}
           <KpiRow>
-            <StatTile label="Hours on site" value={formatHours(totals.totalMs)} hint={`Across ${totals.countedShifts} signed-off shifts`} />
-            <StatTile label="Shifts worked" value={totals.shifts} hint={periodLabel} />
-            <StatTile label="Average shift" value={formatDuration(totals.averageMs)} hint="Signed-off shifts only" />
+            <StatTile label="Patrols walked" value={`${totals.patrolsCompleted}/${totals.patrols}`} hint={periodLabel} />
             <StatTile
               label="Incidents"
               value={totals.incidents}
@@ -239,27 +241,32 @@ export default function ShiftSummaryReport() {
               : 'Every day in this period had at least one shift recorded.'}
             right={daysWithoutCover ? <StatusPill tone="warning">{`${daysWithoutCover} day gap`}</StatusPill> : <StatusPill tone="good">No gaps</StatusPill>}
           >
+            {/* Bars are PATROLS per day, not hours. Hours here were billable hours, so a
+                night ended by an admin unlock drew an empty bar for a night that had been
+                walked in full — the chart said "no cover" about its best evidenced days.
+                Patrols come from scans and cannot be zeroed by how the shift was closed.
+                A genuinely empty day still shows red via day.shifts === 0. */}
             <BarList
               rows={days.map((day) => ({
                 key: day.date.toISOString(),
                 label: day.date.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }),
-                value: Number((day.ms / 3600000).toFixed(1)),
+                value: day.patrols,
                 color: day.shifts === 0 ? REPORT_COLORS.critical : REPORT_COLORS.rampFill,
               }))}
-              formatValue={(value) => (value ? `${value}h` : '0')}
+              formatValue={(value) => (value ? `${value} patrol${value === 1 ? '' : 's'}` : '0')}
               emptyText="No days to show"
             />
           </Panel>
 
           <Panel
             title="Per guard"
-            subtitle="Same shifts, grouped by who worked them. Hours exclude shifts that were never signed off."
+            subtitle="Same shifts, grouped by who worked them. Shifts flagged as not signed off are called out beside the name."
           >
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, minWidth: 620 }}>
                 <thead>
                   <tr style={{ borderBottom: `1px solid ${REPORT_COLORS.borderStrong}` }}>
-                    {['Guard', 'Shifts', 'Hours', 'Sun', 'Night', 'Patrols', 'Points', 'Incidents'].map((heading, index) => (
+                    {['Guard', 'Shifts', 'Sun', 'Night', 'Patrols', 'Points', 'Incidents'].map((heading, index) => (
                       <th
                         key={heading}
                         style={{
@@ -289,7 +296,6 @@ export default function ShiftSummaryReport() {
                         )}
                       </td>
                       <Cell>{guard.shifts}</Cell>
-                      <Cell>{formatHours(guard.totalMs)}</Cell>
                       <Cell>{guard.sundayShifts}</Cell>
                       <Cell>{guard.nightShifts}</Cell>
                       <Cell>{`${guard.patrolsCompleted}/${guard.patrols}`}</Cell>

@@ -22,6 +22,24 @@ export const UNATTRIBUTED_GUARD = 'Unassigned guard';
 // artefact. It is reported separately so site hours are not inflated by it.
 const ARTEFACT_END_REASONS = new Set(['superseded_by_new_shift', 'abandoned_backfill']);
 
+// A shift that ended because somebody typed an admin or universal PIN into the exit
+// dialog is not a guard signing off — it is a MANAGER TAKING THE HANDSET. Both values
+// are written by the same branch of EndShiftModal, the one that exits kiosk mode, and
+// the notification posted alongside them says "Kiosk exited" rather than anything about
+// a shift ending.
+//
+// They were counted as worked time, which is how a device unlock became cover on an
+// invoice. Live data on 10 September 2026: 44 of the 83 shifts on record ended this way
+// — 33 universal_pin, 11 admin_pin_verified — so it was the majority of the table, not
+// an edge case. At Fountainbrook it was all ten rows, four of them 0-minute PIN taps
+// inside four minutes, and together they made up the "23 minutes of cover" the site
+// reported for nights it had in fact walked in full.
+//
+// Still LISTED, and deliberately so: an admin unlock also closes any running patrol as
+// `incomplete`, so these rows are the evidence that a manager picked up the device and
+// left a patrol unfinished. That is worth seeing. It is just not worth billing.
+const ADMIN_UNLOCK_END_REASONS = new Set(['universal_pin', 'admin_pin_verified']);
+
 // Nobody works 16 hours on a gate. Anything longer is a shift that was never ended
 // and got closed later by something else; counting it as time on site would put
 // hundreds of phantom hours in front of the client.
@@ -78,8 +96,15 @@ function endStatusOf(shift, durationMs) {
       counts: false,
     };
   }
-  if (reason === 'universal_pin') {
-    return { key: 'ended', label: 'Ended (universal PIN)', detail: 'Unlocked with the manager fallback PIN', counts: true };
+  if (ADMIN_UNLOCK_END_REASONS.has(reason)) {
+    return {
+      key: 'admin_unlock',
+      label: 'Admin unlock',
+      detail: reason === 'universal_pin'
+        ? 'Kiosk exited with the universal PIN — a manager took the device, not a guard signing off'
+        : 'Kiosk exited after admin PIN verification — a manager took the device, not a guard signing off',
+      counts: false,
+    };
   }
   return { key: 'ended', label: 'Ended normally', detail: 'Guard signed off on the device', counts: true };
 }

@@ -20,7 +20,6 @@ import {
   buildShiftReport,
   formatDateTime,
   formatDuration,
-  formatHours,
   summariseShiftRows,
 } from '../lib/shiftAnalytics';
 
@@ -38,6 +37,10 @@ const END_STATUS_TONE = {
   ended: 'good',
   auto_closed: 'warning',
   over_length: 'warning',
+  // A manager took the handset. Flagged rather than neutral on purpose: paired with the
+  // Patrols chip on the same row it is the record of an admin starting a patrol and
+  // leaving it unfinished, which is the one thing these rows are genuinely good for.
+  admin_unlock: 'warning',
   open: 'critical',
 };
 
@@ -120,9 +123,11 @@ export default function CompletedShiftsReport() {
     doc.setTextColor(100);
     const period = dateFrom || dateTo ? `${dateFrom || 'start'} to ${dateTo || 'today'}` : 'All time';
     doc.text(`Period: ${period}   |   Exported: ${new Date().toLocaleString()}`, 14, 22);
+    // The exported PDF is the copy that leaves the building, so it carries the same
+    // figures the screen does and no "hours on site" total — see the KpiRow below.
     doc.text(
-      `${totals.shifts} shifts · ${formatHours(totals.totalMs)} on site · ${totals.patrols} patrols · ${totals.incidents} incidents`
-      + (totals.flaggedShifts ? `   |   ${totals.flaggedShifts} shift(s) excluded from hours (never signed off)` : ''),
+      `${totals.shifts} shifts · ${totals.patrolsCompleted}/${totals.patrols} patrols · ${totals.pointsVisited} checkpoints · ${totals.incidents} incidents`
+      + (totals.flaggedShifts ? `   |   ${totals.flaggedShifts} need attention (admin unlock, never signed off, or over-length)` : ''),
       14,
       28,
     );
@@ -204,22 +209,18 @@ export default function CompletedShiftsReport() {
               value={totals.shifts}
               hint={dateFrom || dateTo ? 'In the selected period' : 'All recorded shifts'}
             />
-            <StatTile
-              label="Hours on site"
-              value={formatHours(totals.totalMs)}
-              hint={`From ${totals.countedShifts} properly signed-off shift${totals.countedShifts === 1 ? '' : 's'}`}
-            />
-            <StatTile
-              label="Average shift"
-              value={formatDuration(totals.averageMs)}
-              hint="Signed-off shifts only"
-            />
+            {/* "Hours on site" and "Average shift" used to sit here. They were the two
+                numbers on this page that could not be trusted: most rows end with an
+                admin unlock or were never signed off, so the average was minutes and the
+                total was a fraction of a night the site had actually walked. The log
+                below still carries each shift's own duration, which is the honest place
+                for it — one row at a time, next to what was done during it. */}
             <StatTile
               label="Needs attention"
               value={totals.flaggedShifts}
               tone={totals.flaggedShifts ? 'warning' : 'good'}
               hint={totals.flaggedShifts
-                ? 'Never signed off — excluded from hours'
+                ? 'Admin unlocks, never signed off, or over-length'
                 : 'Every shift was signed off on the device'}
             />
           </KpiRow>
