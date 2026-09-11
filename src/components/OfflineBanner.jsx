@@ -99,6 +99,27 @@ export default function OfflineBanner() {
     return null;
   }
 
+  // Offline is NOT a failure and must not be painted like one.
+  //
+  // This banner said "your work is saved on this device" in the same alarm red used for storage
+  // being full, and the colour is what a guard reads first. On a site with thin signal that is
+  // the normal state for hours at a time, so the app spent the night showing a red alert about
+  // nothing being wrong -- which teaches a guard that red means "ignore me", exactly when the one
+  // red banner that matters (storage full, above) needs to land.
+  //
+  // Slate, not red. The words already say the work is safe; the colour now agrees with them.
+  const offlineTone = {
+    background: 'rgba(30, 41, 59, 0.94)',
+    color: '#e2e8f0',
+    border: '1px solid rgba(148, 163, 184, 0.35)',
+  };
+  const onlineTone = {
+    background: 'rgba(22, 101, 52, 0.94)',
+    color: '#dcfce7',
+    border: '1px solid rgba(34, 197, 94, 0.4)',
+  };
+  const tone = isOnline ? onlineTone : offlineTone;
+
   return (
     <div
       className="offline-banner"
@@ -108,8 +129,8 @@ export default function OfflineBanner() {
         bottom: 86,
         zIndex: 90,
         maxWidth: 'min(88vw, 340px)',
-        background: isOnline ? 'rgba(22, 101, 52, 0.94)' : 'rgba(127, 29, 29, 0.94)',
-        color: isOnline ? '#dcfce7' : '#fee2e2',
+        background: tone.background,
+        color: tone.color,
         padding: '8px 10px',
         display: 'flex',
         justifyContent: 'space-between',
@@ -119,7 +140,7 @@ export default function OfflineBanner() {
         fontSize: 11,
         fontWeight: 600,
         borderRadius: 12,
-        border: isOnline ? '1px solid rgba(34, 197, 94, 0.4)' : '1px solid rgba(248, 113, 113, 0.35)',
+        border: tone.border,
         boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
         backdropFilter: 'blur(8px)',
         transition: 'opacity 0.2s ease, transform 0.2s ease',
