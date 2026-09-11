@@ -205,6 +205,41 @@ half at `MAX_ROUTE_POINTS = 5000`, so a patrol left running lost its first hour 
 preserving the shape of the whole walk — the same thinning the JS side in
 [src/lib/patrolSession.js](src/lib/patrolSession.js) already did.
 
+### Still open, as of 2026-09-08
+
+The eight above were closed. These were found while diagnosing the Fountainbrook outage and are not:
+
+- **Dead-lettered records are invisible to everyone.** `deadLetter()` writes to `localStorage` and
+  nothing else — nothing uploads the items or even a count. The guard-facing banner was removed in
+  bundle **1.1.32** on the reasoning that the dashboard would report it; the dashboard has no such
+  view, because nothing is sent. `classifySyncFailure` and `OfflineBanner` each correctly reasoned
+  that the *other* would raise the alarm. A refused record now dies quietly on a handset, and past
+  `DEAD_LETTER_LIMIT = 200` the oldest are destroyed outright.
+- **There is no heartbeat.** The device writes only when something happens, so "running, nothing to
+  report" and "dead" are indistinguishable from the server. This is the single reason the outage of
+  2026-09-07 was unreadable for fourteen hours.
+- **Risk 2 is closed only on APK 1.24 and newer.** `peek`/`acknowledge` are feature-detected, so an
+  older shell still runs the destructive single-step `drain()`. Check `select device_id, app_version
+  from devices` before assuming it is closed — one handset was still on APK 1.23.
+- **A staged bundle never auto-applies on a device left running.** `applyStagedUpdateIfSafe()` returns
+  `deferred: shift_running` first, and under the device-session model that session never clears.
+
+One change closes the first two: a periodic heartbeat carrying a dead-letter count.
+
+### Diagnosing a missing record
+
+Start from the symptom, not the code. **CLAUDE.md → "Triage index"** maps what you can actually
+observe onto the cause and the file. The full catalogue, with severity and which failures produce no
+symptom at all, is the **Sync Failure Atlas**:
+https://claude.ai/code/artifact/87175442-6406-4307-9d06-d8e032af0301
+
+The two most commonly misread, both of which are *not* faults:
+
+- A patrol at `in_progress` with **zero GPS points** is not lost data. Routes upload in one batch at
+  completion; the walk is intact on the handset until someone opens the app.
+- A night arriving as **one** `Incomplete patrol` against a schedule of twenty-one is one session
+  nobody ended, not twenty missed rounds.
+
 ### Rules for changing any of this
 
 - **A record must be durable before the guard is told it is saved.** Optimistic UI is fine; a success

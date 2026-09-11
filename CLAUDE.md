@@ -84,6 +84,33 @@ Test rows were written to the LIVE database and deleted afterwards — verify cl
 
 Hard-won gotchas. Read before touching the Android shell or the keyboard/layout code.
 
+## Triage index — start here when a record is missing
+
+Symptom first, because that is what you actually have at 08:00. Full catalogue with severities:
+**Sync Failure Atlas** — https://claude.ai/code/artifact/87175442-6406-4307-9d06-d8e032af0301
+
+| What you see | Most likely cause | Where |
+|---|---|---|
+| Patrol `in_progress`, `actual_end` null, **0 GPS points** | Route uploads in ONE batch at completion. Nothing is lost — the walk is on the handset. `closeAbandonedPatrolSession()` (16 h) recovers it, but runs at **app launch**, not on regaining signal | `patrolSession.js`, `completePatrolRecord()` |
+| One `Incomplete patrol` where the schedule expected 21 | Single `ACTIVE_SESSION_KEY`. Nobody tapped End, so the whole night appended to one session. Not 20 missed patrols | `patrolSession.js` |
+| Trail detailed at the end, coarse at the start | `MAX_ROUTE_POINTS = 700`; past that every other older point is dropped, last 100 kept intact | `patrolSession.js` |
+| Sparse trail while standing still | Thinning: a fix is dropped if `< 6 m` **and** `< 20 s` since the last one | `appendRoutePoint()` |
+| Patrol recorded nothing at all, app otherwise fine | Fine-location permission not held, so the `location` foreground service never started (Android 14+) | `ensureLocationPermission()` |
+| Record vanished, nothing anywhere, device on **APK < 1.24** | Old single-step `drain()` — at-most-once. Needs a new APK, not a bundle | "The patrol drain is two-phase now" |
+| Guard reports a red "Storage is full" banner | Outbox write failed. A record shown as saved is **not on disk** and nothing retries it | `saveQueue()`, `QUEUE_WRITE_FAILED_EVENT` |
+| Records missing right before an app kill | `flushPersistNow()` is not awaited, including on `pagehide` | `nativeStorage.js` |
+| App slower the longer it stays offline | Outbox uncapped, and every write reserialises the whole store | "The outbox is uncapped" |
+| Server never got it, no error anywhere | **Dead-lettered.** Refusals (400/403/422) retry `8 x 3` then park in `localStorage`. Invisible to guard AND dashboard — nothing uploads them | `useOfflineQueue.js` `deadLetter()` |
+| Records silently destroyed | `DEAD_LETTER_LIMIT = 200`; past that the oldest are dropped for good | `useOfflineQueue.js` |
+| `ota_update_logs` row says `failed` | Usually a slow link, not a broken update. Check `devices.app_version` actually moved before blaming a bundle | "A `failed` row in `ota_update_logs`" |
+| Device stuck on an old version after `downloaded` | `applyStagedUpdateIfSafe()` returns `deferred: shift_running` first, and the device session never clears. Backgrounding or restarting applies it | `liveUpdate.js` |
+| Fleet running different code than the server serves | A publish without bumping `OTA_CURRENT_VERSION` overwrote the bundle in place; devices already on that version never re-download | `scripts/ota-publish.mjs` |
+| Total silence from a site | There is **no heartbeat**. "Running, nothing to report" and "dead" are identical from the server | — |
+
+Two of these are worth internalising because they are not faults: an unfinished patrol showing zero
+points is recoverable data sitting on the handset, and a night arriving as one patrol is one open
+session, not twenty missed rounds.
+
 ## Read this first: what this app is actually for
 
 Everything below is detail. The thing that matters is that **this app captures evidence on a handset
@@ -620,19 +647,24 @@ so `guards` has always had 0 rows and always will. That is the design, not a gap
 **Device registration** instead of "Guards provisioned" — the old check warned an admin to go and
 fix something that was working as intended. Anything that joins on `guard_id` will match nothing.
 
-## The patrol drain hands over the walk and forgets it in the same breath
+## The patrol drain is two-phase now — but only on APK 1.24 and newer
 
-`PatrolBuffer.drain()` (native) returns `route` and `captures` **and clears them inside the same
-`synchronized` block**, then `drainBackgroundPatrol()` persists them JS-side. Between those two the
-walk exists only in a JS variable. A process kill there, or a throw from `persistPatrolScan`, loses
-it — it is already gone from the buffer and was never handed to the outbox. The catch at
-[backgroundPatrol.js:176](src/lib/backgroundPatrol.js#L176) only warns, because by then there is
-nothing left to put back.
+`drainBackgroundPatrol()` reads the native buffer with `PatrolBuffer.peek()`, which consumes
+nothing, persists JS-side, and only then calls `acknowledge(routeCount, captureCount)` so the native
+side drops exactly what was stored. That makes the handover at-least-once: a kill mid-way re-delivers
+the same points on the next drain, which the dedupe absorbs. `markCheckpointReached` runs *after* a
+successful persist, never before — marking first would make a failed scan look "already reached" on
+the retry and acknowledge it away.
 
-This is at-most-once delivery on the one path specifically designed for a phone in a pocket with the
-screen off — the case where a kill is *expected*, not exceptional. Fixing it means a two-phase drain:
-hand the data over, let JS persist, then acknowledge and clear. Don't "fix" it by removing the clear;
-without one, every drain re-delivers the whole walk and the trail duplicates.
+**The old single-step `drain()` is still live on older shells.** `peek`/`acknowledge` arrived in APK
+**1.24**, so [backgroundPatrol.js](src/lib/backgroundPatrol.js) feature-detects them and falls back to
+`drain()` — which returns the walk and clears it in the same locked step. On those devices a process
+kill between the drain and `persistPatrolScan` still loses the walk permanently, silently, on the one
+path built for a phone in a pocket where a kill is expected.
+
+Check the fleet before assuming this is closed: `select device_id, app_version from devices`. As of
+2026-09-08 one handset was still on APK 1.23 and therefore still at-most-once. The fix for that device
+is a new APK, not a bundle — see "This fix cannot ship over the air".
 
 Related asymmetry worth knowing: `PatrolBuffer.read()` returns `empty()` on unparseable JSON and has
 **no `.bak`**, while the JS [atomicFile.js](src/lib/atomicFile.js) keeps a backup and a staged temp
@@ -659,6 +691,69 @@ flight when the process dies.
 And `saveQueue()`'s only failure handling is a `console.error`: a failed write loses the outbox delta
 with no user-visible signal and no retry. That is the reason queued photo bytes must live in exactly
 one storage key, never two.
+
+## A `failed` row in `ota_update_logs` usually means a slow network, not a broken update
+
+`invokeFn` in [src/services/liveUpdate.js](src/services/liveUpdate.js) wraps every Edge Function call
+in a **15-second `AbortController`**. When it fires, `checkForUpdate()` catches the `AbortError` and
+reports `status: 'failed'`, `errorMessage: "check: The user aborted a request."` That string is not a
+user, and it is not the update system rejecting anything — it is our own timeout on a slow link.
+
+The check often reaches the server anyway. The `ota-check` function logs its own `check` row with a
+`bundle_id` before responding, so the audit trail shows a *successful* check immediately followed by
+a *failed* one, ~15-18 seconds apart. That pattern means "the response did not come back in time",
+nothing more.
+
+**A failed check is harmless and cannot cause an outage.** `checkForUpdate()` returns `null`, and
+`doRunOtaUpdate()` falls straight through to `{ status: 'up_to_date' }` — no download, no reload, no
+retry storm. Nor can a mandatory bundle reload the app mid-shift: `canApplyInline` requires
+`!shiftRunning && deviceIsIdle() && !updatesHeld()`.
+
+Verified the hard way on 2026-09-08. Fountainbrook went dark for a 19:00-05:00 night and these two
+rows were the last thing the handset ever said, so the mandatory 1.1.37 bundle was deactivated
+server-side and most of a morning went into an update that had done nothing wrong. **Before blaming
+the OTA for an outage, check whether the app version actually moved.** If it did not, and the only
+evidence is `check: The user aborted a request.`, you are looking at a network hiccup with an
+alarming name.
+
+Worth fixing, and not yet done: label a timeout as a timeout instead of writing an
+indistinguishable `failed`.
+
+## An unfinished patrol has no route on the server, and that is not data loss
+
+Route points do **not** stream. `appendRoutePoint()` accumulates them in `localStorage` under
+`nightguard_active_patrol_session`, and the whole trail uploads in one batch when the patrol ends —
+`completePatrolRecord()` in [src/services/api.js](src/services/api.js), which has exactly one caller,
+at completion.
+
+So a patrol sitting at `status: in_progress` with `actual_end` null shows **zero GPS points on the
+manager dashboard no matter how far the guard walked**. That is the design, not a broken recorder.
+Do not go hunting the GPS watch when you see it.
+
+Recovery is `closeAbandonedPatrolSession()` (default 16 hours), and the thing to know is *when it
+runs*: a `useEffect` on `PatrolRecorder` mount — **app launch**. A phone that regains signal while
+the app is not running recovers nothing. Somebody has to open the app. `endPatrolSession()` then
+parks the completion in the outbox *before* clearing the session, `flushPendingPatrolCompletions()`
+hands it to the offline queue, and `/patrols/complete` upserts with the route written in 400-row
+batches resuming from `alreadyStored`.
+
+The corollary is the useful one: a walk that looks lost is usually sitting on the handset intact,
+one app launch away.
+
+## A whole night of patrols comes back as ONE incomplete patrol
+
+There is a single `ACTIVE_SESSION_KEY`. One session, ever.
+
+If nobody taps End, every GPS fix for the rest of the night appends to whichever session was open —
+so a site scheduled for twenty-one patrols between 19:00 and 05:00, walked by a guard who never
+ended the first one, uploads as a single `Incomplete patrol <start time>` carrying the entire night's
+trail. The dashboard shows one patrol against a schedule expecting twenty-one, and it looks like
+twenty of them never happened.
+
+Expect it, and read it correctly: that is one unfinished session, not twenty missed patrols. The
+route also thins as it grows — `MAX_ROUTE_POINTS` is 700, and past that every other older point is
+dropped while the last 100 are kept intact — so the early hours lose detail while keeping their
+shape.
 
 ## Rollout order: APK before any bundle that needs it
 
