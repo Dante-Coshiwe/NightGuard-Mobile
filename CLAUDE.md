@@ -103,7 +103,8 @@ Symptom first, because that is what you actually have at 08:00. Full catalogue w
 | Server never got it, no error anywhere | **Dead-lettered.** Refusals (400/403/422) retry `8 x 3` then park in `localStorage`. Invisible to guard AND dashboard — nothing uploads them | `useOfflineQueue.js` `deadLetter()` |
 | Records silently destroyed | `DEAD_LETTER_LIMIT = 200`; past that the oldest are dropped for good | `useOfflineQueue.js` |
 | `ota_update_logs` row says `failed` | Usually a slow link, not a broken update. Check `devices.app_version` actually moved before blaming a bundle | "A `failed` row in `ota_update_logs`" |
-| Device stuck on an old version after `downloaded` | `applyStagedUpdateIfSafe()` returns `deferred: shift_running` first, and the device session never clears. Backgrounding or restarting applies it | `liveUpdate.js` |
+| Device stuck on an old version after `downloaded` | `applyStagedUpdateIfSafe()` returns `deferred: shift_running` first. **Backgrounding and restarting do NOT apply it** — only an End Shift does. See "A staged bundle can sit for weeks" | `liveUpdate.js` |
+| Device logs `check` every 30 min and nothing else, for days | `OTA_STAGED_KEY` already equals the offered version, so `doRunOtaUpdate` returns before it logs anything. Publish a HIGHER version to break it | `liveUpdate.js`, "A staged bundle can sit for weeks" |
 | Fleet running different code than the server serves | A publish without bumping `OTA_CURRENT_VERSION` overwrote the bundle in place; devices already on that version never re-download | `scripts/ota-publish.mjs` |
 | Trail is a fan of straight lines; steps 10-20x too high | Replayed buffer, a second location provider with no accuracy filter, or the previous patrol bleeding in. Fixed in bundle 1.1.38 | `appendRoutePoint()`, `PatrolTrackingService` |
 | Total silence from a site | There is **no heartbeat**. "Running, nothing to report" and "dead" are identical from the server | — |
@@ -842,13 +843,65 @@ and under the device-session model `ensureDeviceSession()` opens a session on bo
 `applyNow` at [liveUpdate.js:291](src/services/liveUpdate.js#L291) — the rationale recorded above
 ("a kiosk between shifts is idle") stopped holding when shifts stopped ending.
 
-Staged bundles still install, because `next()` hands the decision to the plugin, which activates the
-new bundle **natively on the next background event**. Screen off is enough. Two things that are not:
-`am force-stop` + relaunch (the process dies before the lifecycle event), and the Settings override —
-the guard sidebar has no Settings entry, so on a kiosk handset there is no manual route at all.
+⚠ **Corrected 2026-09-15 — a staged bundle does NOT install itself on a background event.** An
+earlier version of this note said `next()` activates natively on the next background event and that
+"screen off is enough". Measured on `NG-CA0664876884BE5D` (Fountainbrook): bundle 1.1.37 was
+`downloaded` on 9 September, the app's JS context rebooted at 03:03 on 15 September, and six days
+later the handset was still running 1.1.36. Backgrounding it does nothing either — reproduced on the
+emulator, which stayed on the old bundle across HOME + relaunch and then applied **within 60 seconds**
+the moment the shift session was cleared.
+
+So the ONLY mechanism that actually delivers a bundle is `applyStagedUpdateIfSafe()` → `updater.set()`,
+and Rule 1 of that function is `if (getShiftSession()) return deferred: shift_running`. **An End Shift
+is what installs an update.** The Settings override (`immediate: true`) is the only other route and the
+guard sidebar has no Settings entry, so on a kiosk handset there is no manual route at all.
 
 Verify a rollout by watching `ota_update_logs` go `check` → `download_started` → `downloaded` →
 (background event) → the device reporting the new version as its `from_version`.
+
+### A staged bundle can sit for weeks, and the device goes silent about it
+
+Two separate traps, and together they hid a six-day outage in plain sight.
+
+**1. `mandatory` cannot beat the shift gate.** Both apply paths AND against the same condition:
+
+```js
+canApplyInline = immediate || (check.mandatory === true && !shiftRunning && deviceIsIdle() && !updatesHeld());
+applyStagedUpdateIfSafe: if (getShiftSession()) return { status: 'deferred', reason: 'shift_running' };
+```
+
+So flipping `is_mandatory` on a handset with an open shift achieves **nothing**, while exposing every
+*other* site to an inline reload. Fountainbrook had a shift `active` since 2026-09-07 — eight days —
+and nothing was ever going to install there. Check `shifts` for an open row on that device *before*
+reaching for the mandatory flag; that is the thing to fix, not the bundle.
+
+**And there is no remote lever.** `clearShiftSession()` is only ever called from local UI — End Shift,
+`logout()`, an on-device unbind — nothing polls the server for it, and the bundle holds **no realtime
+subscription of any kind**. A handset in this state cannot be rescued from the dashboard, the database
+or the Edge Functions. Somebody has to end a shift on the phone. Worth closing in a future bundle (a
+server-readable apply-now flag, or auto-closing a shift left open for days) — but that fix can only
+arrive by OTA, which is the trap closing on itself.
+
+**2. A wedged device logs `check` and NOTHING else.** `doRunOtaUpdate` short-circuits before it
+reports anything:
+
+```js
+const stagedAlready = localStorage.getItem(OTA_STAGED_KEY) === check.version;
+if (!immediate && stagedAlready && !canApplyInline) return { status: 'staged', version: check.version };
+```
+
+`OTA_STAGED_KEY` survives restarts, so once a bundle is staged and cannot apply, every later check
+returns here. The only row that lands is the `check` the Edge Function writes for itself — 30 rows a
+day, no `failed`, no error, nothing to alarm anyone. Fountainbrook looked healthy and was frozen.
+
+**Both are broken by publishing a HIGHER version.** `check.version` then differs from the staged
+marker, the short-circuit stops firing, and the device downloads again — 1.1.38 landed on that
+handset in **two seconds**, so the link had never been the problem. Republishing the *same* version
+does nothing at all.
+
+**Reading the logs:** `check` → `download_started` → `downloaded` and then silence means staged and
+blocked, not failed. Confirm against `devices.app_version`, which is the only field that says what a
+handset is actually running.
 
 ### `--mandatory` reloads the app WHEREVER the guard is standing
 
