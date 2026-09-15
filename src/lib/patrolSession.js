@@ -1,4 +1,9 @@
-import { distanceMeters, estimateStepsFromDistance, routeDistanceMeters } from './geo';
+import {
+  distanceMeters,
+  estimateStepsFromDistance,
+  MAX_ACCEPTABLE_ACCURACY_METERS,
+  routeDistanceMeters,
+} from './geo';
 import { enqueueOfflineItem } from '../hooks/useOfflineQueue';
 import { upsertCachedPatrol } from './deviceStore';
 
@@ -84,18 +89,68 @@ export function startPatrolSession({ siteId = null, shiftId = null, guardId = nu
 }
 
 // Append a GPS fix to the active session's breadcrumb trail (thinned). Returns the session.
+//
+// Three things are rejected before the thinning rule ever runs, because each one draws a straight
+// line across the map between two places the guard never walked between, and adds that phantom
+// line to the distance the step estimate is derived from. Measured on Fountainbrook's night of
+// 2026-09-14: 681 stored points came from 174 real fixes, and a 21-minute walk was reported as
+// 31,225 steps (23.4 km, ~21 km/h).
+//
+// 1. AN UNTRUSTWORTHY FIX. PatrolTrackingService subscribes to GPS_PROVIDER *and* a second
+//    provider (FUSED/NETWORK) and feeds both into one listener, so the trail interleaves ~2 m GPS
+//    fixes with 50-150 m network fixes that sit hundreds of metres away. Every one of them drew an
+//    out-and-back spike: 348 m out at acc 150, then 346 m back to acc 2, 0.7 s apart — 1,698 km/h.
+//    The same MAX_ACCEPTABLE_ACCURACY_METERS that already decides a fix is too vague to credit a
+//    checkpoint decides it is too vague to be evidence of a path. Fleet-wide that keeps 92.6% of
+//    route points, and the worst patrol on record keeps 76% — it thins the trail, never empties it.
+//
+// 2. A REPLAY. The native handover hands back points it has already given us (see the comment in
+//    drainBackgroundPatrol and PatrolTrackingService's stale in-memory state), and a replayed point
+//    is far from the tail, so the distance/time thinning below waves it through. It arrives byte
+//    for byte identical, which is what makes this safe: across every patrol checked, no timestamp
+//    ever carried two different coordinates, so this can only ever drop a duplicate.
+//
+// 3. A FIX FROM BEFORE THIS PATROL. The native buffer is not always empty when a patrol starts, so
+//    the previous walk can bleed into this one — seen twice on 2026-09-14, carrying fixes from up
+//    to 6 minutes before the patrol began.
+//
+// All three are dropped, never merged: a breadcrumb we cannot vouch for is worth less than the
+// gap it leaves. The checkpoint captures are untouched by this — they come through
+// persistPatrolScan, not the trail.
 export function appendRoutePoint(fix) {
   const session = getActivePatrolSession();
   if (!session || !Number.isFinite(Number(fix?.latitude)) || !Number.isFinite(Number(fix?.longitude))) {
     return session;
   }
 
+  // (1) Too vague to be evidence of a path. An absent accuracy is NOT treated as bad: older shells
+  // and some providers report none, and refusing those would record nothing at all on them.
+  const reported = Number(fix?.accuracy);
+  if (Number.isFinite(reported) && reported > MAX_ACCEPTABLE_ACCURACY_METERS) {
+    return session;
+  }
+
   const point = {
     latitude: Number(fix.latitude),
     longitude: Number(fix.longitude),
-    accuracy: Number.isFinite(Number(fix.accuracy)) ? Math.round(Number(fix.accuracy)) : null,
+    accuracy: Number.isFinite(reported) ? Math.round(reported) : null,
     at: new Date(fix.timestamp || Date.now()).toISOString(),
   };
+
+  // (3) Recorded before this patrol began: it belongs to the previous walk, not this one.
+  const startedAt = new Date(session.startedAt).getTime();
+  const pointAt = new Date(point.at).getTime();
+  if (Number.isFinite(startedAt) && Number.isFinite(pointAt) && pointAt < startedAt - 1000) {
+    return session;
+  }
+
+  // (2) Already on the trail. Same instant AND same place — a genuine new fix is never either.
+  const duplicate = session.route.some((existing) => (
+    existing.at === point.at
+    && existing.latitude === point.latitude
+    && existing.longitude === point.longitude
+  ));
+  if (duplicate) return session;
 
   const last = session.route[session.route.length - 1];
   if (last) {

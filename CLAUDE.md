@@ -105,6 +105,7 @@ Symptom first, because that is what you actually have at 08:00. Full catalogue w
 | `ota_update_logs` row says `failed` | Usually a slow link, not a broken update. Check `devices.app_version` actually moved before blaming a bundle | "A `failed` row in `ota_update_logs`" |
 | Device stuck on an old version after `downloaded` | `applyStagedUpdateIfSafe()` returns `deferred: shift_running` first, and the device session never clears. Backgrounding or restarting applies it | `liveUpdate.js` |
 | Fleet running different code than the server serves | A publish without bumping `OTA_CURRENT_VERSION` overwrote the bundle in place; devices already on that version never re-download | `scripts/ota-publish.mjs` |
+| Trail is a fan of straight lines; steps 10-20x too high | Replayed buffer, a second location provider with no accuracy filter, or the previous patrol bleeding in. Fixed in bundle 1.1.38 | `appendRoutePoint()`, `PatrolTrackingService` |
 | Total silence from a site | There is **no heartbeat**. "Running, nothing to report" and "dead" are identical from the server | — |
 
 Two of these are worth internalising because they are not faults: an unfinished patrol showing zero
@@ -670,6 +671,57 @@ Related asymmetry worth knowing: `PatrolBuffer.read()` returns `empty()` on unpa
 **no `.bak`**, while the JS [atomicFile.js](src/lib/atomicFile.js) keeps a backup and a staged temp
 and recovers from either. The half of the system most likely to be killed mid-write has the weaker
 recovery.
+
+## A patrol trail full of straight lines nobody walked — and 10x the steps
+
+**Symptom (2026-09-15):** every Fountainbrook patrol drew a fan of long straight lines between
+places the guard never walked between, and reported 17,000-31,000 steps for a 20-minute round.
+Reproducible on the emulator at Johannesburg by moving the location around.
+
+Three separate causes, all of which end up as the same thing — a point on the trail that the guard
+was never at, and a straight line to it that gets counted as distance. `steps_taken` is derived
+from that distance (`routeDistanceMeters` / 0.75), so every phantom line is also phantom steps.
+
+Measured on one real patrol (`68c6adcf`, 21 minutes): **681 stored route points came from 174 real
+fixes**, 23.4 km, 31,225 steps, ~21 km/h.
+
+1. **The buffer replayed the same walk over and over.** `PatrolTrackingService` holds `state` in a
+   long-lived field and writes it back on *every* fix, while `PatrolBuffer.acknowledge()` — phase
+   two of the two-phase handover — trims the **file**. So the next fix (≤4 s later) rewrote the
+   whole stale buffer and resurrected everything the JS side had just confirmed it stored. The
+   drain runs every 15 s, so the walk was handed over again, and again. On the map each replay is a
+   line from wherever the guard is back to the start of the walk. Fixed natively by re-reading the
+   buffer at the top of `onLocationChanged` (**APK only — no bundle can carry it**), and absorbed
+   in the bundle by the dedupe below.
+2. **Two location providers, one listener.** `startTracking()` subscribes to `GPS_PROVIDER` *and*
+   `FUSED_PROVIDER`/`NETWORK_PROVIDER`, and nothing filtered the route by accuracy. The trail
+   therefore interleaved ~2 m GPS fixes with 50-150 m network fixes sitting hundreds of metres
+   away, each drawing an out-and-back spike: 348 m out at `acc 150`, 346 m back to `acc 2`, **0.7 s
+   apart — 1,698 km/h**. The comment claiming "duplicate fixes are harmless: thinning and the
+   geofence handle them" was wrong: the thinning rule only drops points that are *close*, and the
+   geofence never looks at the trail at all.
+3. **The previous patrol bled into the next one.** The native buffer is not emptied when a patrol
+   starts, so a walk could open with fixes from up to 6 minutes before it began (seen twice on
+   2026-09-14).
+
+**The fix that ships over the air** is all in `appendRoutePoint()` ([patrolSession.js](src/lib/patrolSession.js)),
+because it is the one place every recorder funnels through — the in-app watch and the native drain
+both call it. It refuses a fix worse than `MAX_ACCEPTABLE_ACCURACY_METERS` (the same 25 m that
+already decides a fix is too vague to credit a checkpoint), a fix identical to one already on the
+trail, and a fix timestamped before the session started.
+
+Bundle **1.1.38**: 31,225 steps -> 3,213 on that patrol, median implied pace across 18 patrols
+**21 km/h -> 7.0 km/h**. Verified by replaying the real recorded fixes through the actual module
+with every fix delivered twice, so the replay path is exercised.
+
+**Don't tighten this into a trail that can vanish.** Fleet-wide only 7.4% of route points are worse
+than 25 m and the worst patrol on record keeps 76% of its points, so the filter thins a trail and
+never empties one — but a stricter threshold would, on the handsets with the weakest GPS, which are
+exactly the ones whose evidence matters. A missing accuracy reading is deliberately *kept*.
+
+The residual ~7 km/h is ordinary GPS jitter on a 4-second cadence inflating a measured path; it is
+not a fourth bug. `routeDistanceMeters` is documented as a floor and is really a ceiling — if that
+ever needs to be honest, smooth the trail, don't tighten the gate.
 
 ## The outbox is uncapped, and every write to it rewrites the whole store
 

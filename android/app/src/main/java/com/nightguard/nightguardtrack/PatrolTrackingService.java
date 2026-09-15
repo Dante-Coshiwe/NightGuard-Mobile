@@ -223,6 +223,31 @@ public class PatrolTrackingService extends Service implements LocationListener {
     public void onLocationChanged(Location location) {
         if (state == null || location == null) return;
 
+        // Re-read from disk before touching it. `state` is a long-lived field, and PatrolBuffer's
+        // acknowledge() (phase two of the handover) trims the FILE — so holding a stale copy here
+        // and writing it back at the end of this method resurrected every point the JS side had
+        // just confirmed it had stored. The next peek() then handed the whole walk over again, and
+        // the one after that again: 174 real fixes on Fountainbrook's 2026-09-14 night were stored
+        // as 681 route points, each replay drawing a straight line back to the start of the walk
+        // and inflating the step estimate roughly tenfold.
+        //
+        // The JS side (appendRoutePoint) now drops an exact replay as well, and must keep doing so
+        // — every handset in the field runs a shell without this fix until it is reflashed, and
+        // this read is not atomic with the write below, so a fix landing in the same instant as an
+        // acknowledge can still re-deliver a point. Cheap: the buffer is small and this method
+        // already writes it on every fix.
+        //
+        // Adopted only if it still describes this patrol. read() answers empty() for an unreadable
+        // file (deliberately — a corrupt buffer must not block every future write), and taking
+        // that at face value here would drop the checkpoint list on the floor and record the rest
+        // of the walk against nothing. Keeping the in-memory copy in that case is the same trade
+        // the rest of this class makes: carry on recording, never stop silently.
+        JSONObject stored = PatrolBuffer.read(this);
+        if (stored != null && stored.optJSONArray("checkpoints") != null
+            && stored.optJSONArray("checkpoints").length() > 0) {
+            state = stored;
+        }
+
         double lat = location.getLatitude();
         double lng = location.getLongitude();
         if (!PatrolGeo.isValidCoordinate(lat, lng)) return;
