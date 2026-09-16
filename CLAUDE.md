@@ -1,4 +1,66 @@
 # Working notes for this repo
+## Release / OTA note - 2026-09-16 (APK 1.33 / bundle 1.1.38) — SHIPPED, EMULATOR-VERIFIED
+
+* **APK `1.33` / `versionCode 34`** — on the GitHub `Version1` release, clobbering 1.32 at the same
+  fixed asset URL. SHA-256 `037fc2df0848bcb023b14fcac5feede3dbb2353d1aaeb81546368726bc93221b`,
+  signed `CN=NightGuard Track`. Carries built-in bundle **1.1.38**.
+* **No OTA bundle was published for this release, deliberately.** The fix is native and cannot ride
+  a bundle; the fleet stays on 1.1.38, which is what it already runs. `OTA_CURRENT_VERSION` is
+  untouched. Built-in == newest published, so a fresh enrolment runs 1.1.38 and logs `up_to_date`
+  without downloading anything.
+
+**Cert continuity verified against the published binary, not against this file.** Downloaded the
+live 1.32 and diffed: both are `d816c241ffbfaeede388f3b8a13a9950af62e98c5e7265e50f521b8c7c480789`,
+so 1.33 installs over 1.32 in place. Do this every release; it is two minutes.
+
+### What changed: the secondary location provider may no longer draw the trail
+
+`PatrolTrackingService` subscribes GPS **and** a secondary provider (NETWORK below Android 12,
+FUSED from 12) into one listener. Bundle 1.1.38 rejected fixes worse than 25 m, which killed the
+gross case — but the secondary provider's whole population sits at **11-25 m, underneath that
+gate**, so it kept drawing whiskers: a 100-200 m hop off the route and an immediate hop back.
+
+Measured on Fountainbrook's 2026-09-15 night, 8 consecutive patrols on 1.1.38:
+
+| | |
+|---|---|
+| Real loop, from `<=10 m` fixes only | **917-1001 m**, eight times running |
+| Recorded | 1571-3542 m → **2.4x inflation** |
+| `steps_taken` reported | 2379-5102, against a truth near 1250 |
+
+Two independent proofs it is two sources and not GPS degrading:
+
+* **Accuracy is bimodal with a hole.** 934 points `<=5 m`, **5 points at 6-10 m**, 61 at 11-25 m.
+* **They arrive on different clocks.** All 867 fixes landing on the 4 s GPS cadence measured
+  `<=10 m`; all 64 fixes worse than 10 m arrived off-cadence.
+
+`onLocationChanged` now appends to the route only when the fix is from `GPS_PROVIDER`, or when GPS
+has been silent for `GPS_TRUSTED_WINDOW_MS` (30 s) — a coarse trail beats no trail. **Checkpoint
+capture is untouched**: every fix from both providers still feeds it, exactly as before. The
+secondary subscription stays, because keeping fixes coming where GPS is weak is why it was added.
+
+Expect new sites to report roughly **2.5x fewer steps** than Fountainbrook shows today. That is the
+correction, not a regression — but it will look like one if two sites are compared.
+
+### Verified on the emulator, and what was NOT
+
+Driven over CDP (`adb forward` + `Runtime.evaluate`) on a debug build of the identical source:
+app launches on 1.33, `notifyAppReady()` fires, built-in bundle loads, no crash and no JS exception.
+Injected a 15-point walk with `adb emu geo fix`: **18 route points / 907 m** landed in
+`nightguard_active_patrol_session`, so the native → `PatrolBuffer` → JS drain still works end to end.
+
+**The exclusion itself is NOT emulator-proven.** `adb emu geo fix` feeds one provider and every fix
+came back at accuracy 5, so there was no coarse fix to reject. The gate rests on code review plus
+the field data above. Confirm it on the first real WP5: walk one patrol, then check that patrol's
+accuracy histogram has nothing in the 11-25 m band and the distance lands near the true loop length.
+
+⚠ **Reinstalling with a different signing key rotates `ANDROID_ID`, and so the device id.** The
+emulator came back as `NG-149B562B9D9A9987` instead of `NG-7523DD353A4FD82A`. Nothing registered,
+because `ensureDeviceRecord()` only runs after a queue drain and the queue was empty — but a drain
+would have minted a second fleet row. `getDeviceId()` reads `nightguard_device_id` from
+localStorage, so writing the old id back is the fix. Back up `files/*.json` with `adb exec-out`
+(**not** `adb shell`, which inserts CRLF and corrupts the JSON) before any uninstall.
+
 ## Release / OTA note - 2026-08-18 (APK 1.32 / bundle 1.1.36) — SHIPPED, EMULATOR-VERIFIED
 
 * **APK `1.32` / `versionCode 33`** — on the GitHub `Version1` release, replacing 1.31 at the

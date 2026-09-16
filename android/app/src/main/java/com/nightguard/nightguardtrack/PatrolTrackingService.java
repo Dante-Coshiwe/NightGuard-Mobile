@@ -17,6 +17,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.core.app.ActivityCompat;
@@ -63,9 +64,19 @@ public class PatrolTrackingService extends Service implements LocationListener {
 
     private static final long UPDATE_INTERVAL_MS = 4000;
 
+    /**
+     * How long a GPS fix keeps the secondary provider out of the TRAIL.
+     *
+     * GPS_PROVIDER ticks every UPDATE_INTERVAL_MS and occasionally gaps to ~20 s, so this sits well
+     * clear of a normal gap: only a genuine GPS outage lets a coarse fix draw the path.
+     */
+    private static final long GPS_TRUSTED_WINDOW_MS = 30000;
+
     private LocationManager locationManager;
     private JSONObject state;
     private Location previousFix;
+    /** elapsedRealtime of the last GPS fix; monotonic, so a handset clock change cannot skew it. */
+    private long lastGpsFixRealtimeMs = Long.MIN_VALUE;
     private int pointNotificationOffset = 0;
     private boolean tracking = false;
 
@@ -175,8 +186,10 @@ public class PatrolTrackingService extends Service implements LocationListener {
         try {
             locationManager.requestLocationUpdates(
                 LocationManager.GPS_PROVIDER, UPDATE_INTERVAL_MS, 0f, this, Looper.getMainLooper());
-            // A second provider keeps the trail alive where GPS is weak (indoors, under cover).
-            // Duplicate fixes are harmless: thinning and the geofence handle them.
+            // A second provider keeps fixes coming where GPS is weak (indoors, under cover).
+            // Its fixes are NOT harmless to the trail — onLocationChanged keeps them out of the
+            // route while GPS is live. Thinning does not help: it only drops points that are
+            // CLOSE together, and these land 100-200 m away.
             String secondary = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                 ? LocationManager.FUSED_PROVIDER
                 : LocationManager.NETWORK_PROVIDER;
@@ -255,8 +268,34 @@ public class PatrolTrackingService extends Service implements LocationListener {
         double accuracy = location.hasAccuracy() ? location.getAccuracy() : Double.NaN;
         long at = location.getTime() > 0 ? location.getTime() : System.currentTimeMillis();
 
+        // Only GPS may draw the trail while GPS is actually working.
+        //
+        // Both providers report into this one listener, and the secondary one (NETWORK below
+        // Android 12, FUSED from 12) answers from cell/wifi triangulation at 11-25 m while GPS is
+        // reading 2 m. Interleaved into the path, each such fix drew a whisker: a 100-200 m hop off
+        // the route and an immediate hop back, one to three seconds later. Measured on
+        // Fountainbrook's 2026-09-15 night — a real ~950 m loop recorded as 1571-3542 m, so every
+        // step estimate came out roughly 2.5x too high.
+        //
+        // The accuracy gate in src/lib/geo.js cannot catch these: MAX_ACCEPTABLE_ACCURACY_METERS is
+        // 25 m and the entire secondary population sits underneath it. Proof it is two sources and
+        // not GPS degrading: every fix arriving on the 4 s GPS cadence measured <= 10 m, and every
+        // fix worse than 10 m arrived off-cadence.
+        //
+        // The secondary provider stays subscribed and still feeds checkpoint capture — that is why
+        // it was added, and checkpoints are not affected by this. It is barred from the ROUTE only,
+        // and only while a GPS fix is recent: after GPS_TRUSTED_WINDOW_MS of silence a coarse trail
+        // beats no trail, so it is allowed to draw again.
+        boolean fromGps = LocationManager.GPS_PROVIDER.equals(location.getProvider());
+        long nowRealtimeMs = SystemClock.elapsedRealtime();
+        if (fromGps) lastGpsFixRealtimeMs = nowRealtimeMs;
+        boolean gpsIsFresh = lastGpsFixRealtimeMs != Long.MIN_VALUE
+            && nowRealtimeMs - lastGpsFixRealtimeMs <= GPS_TRUSTED_WINDOW_MS;
+
         try {
-            appendThinnedRoutePoint(lat, lng, accuracy, at);
+            if (fromGps || !gpsIsFresh) {
+                appendThinnedRoutePoint(lat, lng, accuracy, at);
+            }
             captureCheckpoints(lat, lng, accuracy, at);
             PatrolBuffer.write(this, state);
         } catch (JSONException e) {
