@@ -103,7 +103,7 @@ export default function PedestrianReport() {
 
   const filtered = hourly.filter((row) => {
     const date = new Date(row.hour);
-    const fromMatch = dateFrom ? date >= new Date(dateFrom) : true;
+    const fromMatch = dateFrom ? date >= new Date(`${dateFrom}T00:00:00`) : true;
     const toMatch = dateTo ? date <= new Date(`${dateTo}T23:59:59`) : true;
     return fromMatch && toMatch;
   });

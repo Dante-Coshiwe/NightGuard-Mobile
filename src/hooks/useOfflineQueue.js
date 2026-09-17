@@ -30,6 +30,22 @@ import {
 
 const QUEUE_KEY = 'nightguard_offline_queue';
 const DEAD_LETTER_KEY = 'nightguard_offline_queue_dead';
+// Local temp id -> the id the server minted for it. This MUST outlive a single drain.
+//
+// A vehicle registered offline is queued as POST /vehicles/entry with a `veh_<ts>` temp id, and the
+// exit the guard taps afterwards is queued as PATCH /vehicles/veh_<ts>/exit. When both drain
+// together the in-memory map resolves the second from the first and all is well — which is why this
+// looked fine. It is the split case that bites: the entry syncs, the exit fails transiently (a 20s
+// timeout, or connectivity dying mid-drain, which defers every remaining item by design), and the
+// next drain starts with an EMPTY map and no entry left in the queue to rebuild it from. The exit
+// then goes to the server still carrying `veh_<ts>`, PostgREST answers `invalid input syntax for
+// type uuid` (22P02), that code is terminal, and the exit is dead-lettered for good. The guard's
+// handset shows the visitor signed out; the dashboard shows them on site forever, with no error
+// anywhere. Verified against this module, not reasoned about: see the note in CLAUDE.md.
+const ID_MAP_KEY = 'nightguard_offline_id_map';
+// One drain's worth of entries is a handful; a night's is tens. This is only ever consulted for
+// items still IN the queue, so anything older than the queue itself is dead weight.
+const ID_MAP_LIMIT = 300;
 // Raised when the outbox itself could not be written — see saveQueue(). This is the one failure
 // in the capture chain that the guard has to be told about, because it means a record they were
 // shown as saved is not actually anywhere.
@@ -326,6 +342,71 @@ function normaliseQueueUrl(item) {
     return '/shifts/guards/add';
   }
   return item.url;
+}
+
+function readIdMap() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(ID_MAP_KEY) || '[]');
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Every temp id the server has ever answered for, newest first. */
+function getPersistedIdMap() {
+  return new Map(readIdMap().map(({ tempId, serverId }) => [tempId, serverId]));
+}
+
+// Best effort on purpose: failing to record a mapping costs one retry the next drain rebuilds,
+// whereas throwing here would abort a drain that has already written to the server.
+function rememberCreatedId(tempId, serverId) {
+  if (!tempId || !serverId || String(tempId) === String(serverId)) return;
+  try {
+    const existing = readIdMap().filter((entry) => entry.tempId !== String(tempId));
+    const next = [{ tempId: String(tempId), serverId: String(serverId) }, ...existing].slice(0, ID_MAP_LIMIT);
+    localStorage.setItem(ID_MAP_KEY, JSON.stringify(next));
+  } catch (err) {
+    console.warn('[OfflineQueue] rememberCreatedId() failed:', err?.message || err);
+  }
+}
+
+// Ids the live queue no longer mentions cannot be needed again. Called after a drain so the map
+// cannot creep up on the same storage the outbox lives in.
+function pruneIdMap(queue) {
+  try {
+    const stored = readIdMap();
+    if (!stored.length) return;
+    const wanted = new Set();
+    queue.forEach((item) => {
+      String(item.url || '').split('/').forEach((segment) => wanted.add(segment));
+      Object.values(item.data || {}).forEach((value) => {
+        if (typeof value === 'string') wanted.add(value);
+      });
+      if (item.clientTempId) wanted.add(String(item.clientTempId));
+    });
+    const kept = stored.filter((entry) => wanted.has(entry.tempId));
+    if (kept.length !== stored.length) localStorage.setItem(ID_MAP_KEY, JSON.stringify(kept));
+  } catch { /* a map that will not prune is not worth failing a drain over */ }
+}
+
+// Rewrite a local id sitting in a URL path into the id the server actually minted.
+//
+// Deliberately generic rather than one hand-written branch per endpoint: the two that existed
+// covered `/vehicles/<id>/exit` and `/pedestrians/<id>/exit` and silently missed
+// `/users/guards/<id>/pin` and `/users/guards/<id>/toggle`, which fail exactly the same way.
+function resolveQueuedUrl(url, idMap) {
+  if (!url || !idMap.size) return url;
+  const parts = String(url).split('/');
+  let changed = false;
+  const resolved = parts.map((segment) => {
+    if (segment && idMap.has(segment)) {
+      changed = true;
+      return idMap.get(segment);
+    }
+    return segment;
+  });
+  return changed ? resolved.join('/') : url;
 }
 
 function extractGuardPayload(payload) {
@@ -640,7 +721,9 @@ export async function syncOfflineQueueNow() {
 
     const failed = [];
     let syncedCount = 0;
-    const createdIdMap = new Map();
+    // Seeded from disk, so an item held over from an earlier drain can still find the server id
+    // that was minted for it then. A fresh Map here is what dead-lettered held-over gate exits.
+    const createdIdMap = getPersistedIdMap();
 
     for (const item of queue) {
       try {
@@ -653,20 +736,10 @@ export async function syncOfflineQueueNow() {
         console.log(`[OfflineQueue] SYNC ITEM - ${item.method.toUpperCase()} ${item.url}`, item.data);
         let resolvedUrl = normaliseQueueUrl(item);
 
-        if (item.url.includes('/pedestrians/') && item.url.endsWith('/exit')) {
-          const pedId = item.url.split('/pedestrians/')[1]?.split('/')[0];
-          if (createdIdMap.has(pedId)) {
-            resolvedUrl = `/pedestrians/${createdIdMap.get(pedId)}/exit`;
-            console.log(`[OfflineQueue] SYNC ITEM - remapped pedestrian exit URL: ${resolvedUrl}`);
-          }
-        }
-
-        if (item.url.includes('/vehicles/') && item.url.endsWith('/exit')) {
-          const vehicleId = item.url.split('/vehicles/')[1]?.split('/')[0];
-          if (createdIdMap.has(vehicleId)) {
-            resolvedUrl = `/vehicles/${createdIdMap.get(vehicleId)}/exit`;
-            console.log(`[OfflineQueue] SYNC ITEM - remapped vehicle exit URL: ${resolvedUrl}`);
-          }
+        const beforeRemap = resolvedUrl;
+        resolvedUrl = resolveQueuedUrl(resolvedUrl, createdIdMap);
+        if (resolvedUrl !== beforeRemap) {
+          console.log(`[OfflineQueue] SYNC ITEM - remapped local id in URL: ${beforeRemap} -> ${resolvedUrl}`);
         }
 
         let remappedData = remapPayloadReferences(item.data, createdIdMap);
@@ -766,6 +839,9 @@ export async function syncOfflineQueueNow() {
         
         if (item.method === 'post' && item.clientTempId && responseEntityId) {
           createdIdMap.set(item.clientTempId, responseEntityId);
+          // To disk as well as in memory: anything still queued behind this needs it on a LATER
+          // drain too, not just this one.
+          rememberCreatedId(item.clientTempId, responseEntityId);
           console.log(`[OfflineQueue] SYNC - Mapped tempId "${item.clientTempId}" -> "${responseEntityId}"`);
         }
         await applySuccessfulSync(item, response);
@@ -813,6 +889,9 @@ export async function syncOfflineQueueNow() {
     }
 
     saveQueue(failed);
+    // Dead letters are included because reviveDeadLetteredItems() puts them back on the queue, and
+    // one revived without its mapping is the same 22P02 failure again.
+    pruneIdMap([...failed, ...getDeadLetterQueue()]);
     console.log(`[OfflineQueue] SYNC - Queue updated: ${syncedCount} synced, ${failed.length} failed/pending`);
 
     if (syncedCount > 0) {

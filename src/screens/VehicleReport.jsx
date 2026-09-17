@@ -118,7 +118,7 @@ export default function VehicleReport() {
   }, []);
 
   const inPeriod = useMemo(() => {
-    const fromTime = dateFrom ? new Date(dateFrom).getTime() : null;
+    const fromTime = dateFrom ? new Date(`${dateFrom}T00:00:00`).getTime() : null;
     const toTime = dateTo ? new Date(`${dateTo}T23:59:59`).getTime() : null;
     return vehicles.filter((vehicle) => {
       const entered = new Date(vehicle.entered_at || 0).getTime();

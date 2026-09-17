@@ -100,7 +100,7 @@ export default function CompletedShiftsReport() {
 
   const rows = useMemo(() => allRows.filter((row) => {
     const nameMatch = row.guardName.toLowerCase().includes(filterName.trim().toLowerCase());
-    const fromMatch = dateFrom ? row.startTime >= new Date(dateFrom).getTime() : true;
+    const fromMatch = dateFrom ? row.startTime >= new Date(`${dateFrom}T00:00:00`).getTime() : true;
     const toMatch = dateTo ? row.startTime <= new Date(`${dateTo}T23:59:59`).getTime() : true;
     const flagMatch = showFlaggedOnly ? !row.endStatus.counts : true;
     return nameMatch && fromMatch && toMatch && flagMatch;

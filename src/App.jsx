@@ -3,7 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation, useNavigat
 import { App as CapacitorApp } from '@capacitor/app';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import LoginScreen from './screens/LoginScreen';
-import ErrorBoundary from './components/ErrorBoundary';
+import ErrorBoundary, { clearCrashReloadCount } from './components/ErrorBoundary';
 import HomeScreen from './screens/HomeScreen';
 import OBScreen from './screens/OBScreen';
 import IncidentScreen from './screens/IncidentScreen';
@@ -194,6 +194,14 @@ const AppRuntimeBridge = () => {
 };
 
 function App() {
+  // The app got far enough to run an effect, so whatever crashed last time is behind us. Held off
+  // for a moment because a crash during the first render must still count toward the auto-reload
+  // budget — clearing it immediately would let a deterministic crash reload for ever.
+  useEffect(() => {
+    const timer = setTimeout(clearCrashReloadCount, 20000);
+    return () => clearTimeout(timer);
+  }, []);
+
   return (
     <ErrorBoundary>
       <BootSplash />
@@ -206,7 +214,18 @@ function App() {
             <Route path="/login" element={<LoginScreen />} />
             <Route path="/setup/site" element={<ProtectedRoute><SelectSiteScreen /></ProtectedRoute>} />
             <Route path="/setup/kiosk-pin" element={<ProtectedRoute><SetKioskPinScreen /></ProtectedRoute>} />
-            <Route element={<ProtectedRoute><Layout><Outlet /></Layout></ProtectedRoute>}>
+            {/* The screen-level boundary sits INSIDE Layout and around the outlet only. A crash
+                while rendering a report or the occurrence book now costs that screen and nothing
+                else — the sidebar still works, and <PatrolRecorder /> above keeps draining the
+                native buffer, which is what actually credits checkpoints. Before this, any render
+                error anywhere unmounted the recorder and the night stopped being recorded. */}
+            <Route element={(
+              <ProtectedRoute>
+                <Layout>
+                  <ErrorBoundary scope="screen"><Outlet /></ErrorBoundary>
+                </Layout>
+              </ProtectedRoute>
+            )}>
               <Route path="/" element={<HomeScreen />} />
               <Route path="shift" element={<ShiftManagementScreen />} />
               <Route path="guardshift" element={<ShiftScreen />} />

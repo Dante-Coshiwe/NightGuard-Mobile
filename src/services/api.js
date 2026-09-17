@@ -696,8 +696,12 @@ async function createPedestrian(payload) {
   return data;
 }
 
-async function markPedestrianExited(id) {
-  const exitTime = new Date().toISOString();
+// `when` is the moment the guard tapped Exit, carried on the payload. Falling back to now() is only
+// correct when the write happens immediately — an exit tapped offline at 21:00 and drained at 05:00
+// was being recorded as an 05:00 departure, so the gate register said a visitor was on site for the
+// eight hours after they left. Same fix, and the same reason, as endShiftRecord's payload.ended_at.
+async function markPedestrianExited(id, when) {
+  const exitTime = when || new Date().toISOString();
   const { data, error } = await supabase
     .from('pedestrians')
     .update({ exit_time: exitTime, exited_at: exitTime })
@@ -834,8 +838,9 @@ async function createVehicle(payload) {
   return data;
 }
 
-async function markVehicleExited(id) {
-  const exitTime = new Date().toISOString();
+// See markPedestrianExited: the exit time is the guard's, not the queue drain's.
+async function markVehicleExited(id, when) {
+  const exitTime = when || new Date().toISOString();
   const { data, error } = await supabase
     .from('vehicles')
     .update({ exited_at: exitTime })
@@ -1585,11 +1590,11 @@ async function handlePost(url, payload = {}) {
 async function handlePatch(url, payload = {}) {
   if (url.startsWith('/pedestrians/') && url.endsWith('/exit')) {
     const id = url.split('/pedestrians/')[1].split('/')[0];
-    return markPedestrianExited(id);
+    return markPedestrianExited(id, payload?.exit_time || payload?.exited_at);
   }
   if (url.startsWith('/vehicles/') && url.endsWith('/exit')) {
     const id = url.split('/vehicles/')[1].split('/')[0];
-    return markVehicleExited(id);
+    return markVehicleExited(id, payload?.exited_at || payload?.exit_time);
   }
   if (url.startsWith('/users/guards/') && url.endsWith('/pin')) {
     const id = url.split('/users/guards/')[1].split('/')[0];

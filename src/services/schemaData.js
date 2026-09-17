@@ -5,7 +5,9 @@ import {
   DEFAULT_PATROL_CONFIG,
   clearPendingSchemaSync,
   GENERAL_GUARD,
+  getCachedPedestrians,
   getCachedSiteSettings,
+  getCachedVehicles,
   getDeviceId,
   setDeviceId,
   getDeviceSettings,
@@ -24,7 +26,7 @@ import {
   savePatrolConfig,
   saveQuickSwitchEnabled,
 } from '../lib/deviceStore';
-import { setCachedIncidents, setCachedObEntries } from '../lib/reportCache';
+import { getCachedIncidents, getCachedObEntries, setCachedIncidents, setCachedObEntries } from '../lib/reportCache';
 import { isValidCoordinate } from '../lib/geo';
 
 function getSupabaseErrorMessage(error) {
@@ -128,6 +130,27 @@ export function getCurrentDeviceRecord(siteSettings = getCachedSiteSettings()) {
 
 function withNonEmptyArray(value, fallback) {
   return Array.isArray(value) && value.length ? value : fallback;
+}
+
+/**
+ * A server snapshot, with anything local that the server has not seen yet kept in front of it.
+ *
+ * The server list is authoritative for every row it contains — it is the reason this refresh runs.
+ * What it is NOT is a complete picture of what the handset holds: a record still in the outbox has
+ * no server row at all, so a straight overwrite deletes the guard's only visible copy of work that
+ * is queued and perfectly safe. Rows are matched on id; a local row whose temp id was already
+ * swapped for the server's (applySuccessfulSync does that) matches and the server copy wins.
+ *
+ * `capCache` in deviceStore then keeps unsynced rows ahead of synced ones if the cap is hit, so a
+ * queued entry cannot be aged out by a busy night either.
+ */
+function mergeServerRows(serverRows, localRows) {
+  const server = Array.isArray(serverRows) ? serverRows : [];
+  const local = Array.isArray(localRows) ? localRows : [];
+  if (!local.length) return server;
+  const serverIds = new Set(server.map((row) => String(row?.id)));
+  const unsynced = local.filter((row) => row?.id && !serverIds.has(String(row.id)));
+  return unsynced.length ? [...unsynced, ...server] : server;
 }
 
 function mapLookupRowToLocal(row = {}) {
@@ -874,10 +897,25 @@ export async function refreshOperationalCachesFromDatabase(siteSettings = getCac
     throw new Error(failed.error.message);
   }
 
-  await writeCache('cached_pedestrians', mapPedestrianCacheRows(pedestriansResult.data || []));
-  await writeCache('cached_vehicles', mapVehicleCacheRows(vehiclesResult.data || []));
-  await writeCache('cached_incidents', incidentsResult.data || []);
-  await writeCache('cached_ob_entries', obEntriesResult.data || []);
+  // Merge, don't clobber — the same rule the scan cache below already follows, and for the same
+  // reason. This runs after ANY drain that synced at least one item, including a partial one, so a
+  // gate entry still sitting in the outbox behind a failing item (a photo upload retrying, an FK to
+  // a shift that has not landed) is simply absent from this server snapshot. Overwriting with it
+  // took that entry off the guard's screen while it was still queued — they then re-enter it, and
+  // the site gets two rows for one visitor. The outbox still had the record, so nothing was lost;
+  // what was lost was the guard's ability to see it.
+  await writeCache('cached_pedestrians', mergeServerRows(
+    mapPedestrianCacheRows(pedestriansResult.data || []), getCachedPedestrians(),
+  ));
+  await writeCache('cached_vehicles', mergeServerRows(
+    mapVehicleCacheRows(vehiclesResult.data || []), getCachedVehicles(),
+  ));
+  await writeCache('cached_incidents', mergeServerRows(
+    incidentsResult.data || [], await getCachedIncidents(),
+  ));
+  await writeCache('cached_ob_entries', mergeServerRows(
+    obEntriesResult.data || [], await getCachedObEntries(),
+  ));
   // Merge, don't clobber. The server snapshot is filtered by site_id and only
   // contains rows the server actually persisted, so a blind overwrite would drop
   // any local scan that is still queued (offline / no Supabase session) or that

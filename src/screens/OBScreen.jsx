@@ -187,7 +187,11 @@ export default function OBScreen() {
     );
 
     doc.autoTable({
-      head: [['Serial No.', 'Date / Time', 'Nature of Occurrence', 'Guard', 'Location']],
+      // Three columns, because three is what the body rows carry. 'Guard' and 'Location' were in
+      // this header with nothing under them: `guards` is empty by design (every entry is attributed
+      // by device, see CLAUDE.md) and ob_entries has no location column. Two blank columns on a
+      // report a client reads look like data that went missing.
+      head: [['Serial No.', 'Date / Time', 'Nature of Occurrence']],
       body: visibleEntries.map((entry) => [
         entry.serial_number || '-',
         formatDateTime(entry.captured_timestamp),

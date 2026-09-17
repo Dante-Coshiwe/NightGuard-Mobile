@@ -229,7 +229,9 @@ export default function PedestrianTab() {
     );
 
     try {
-      const result = await patch(`/pedestrians/${id}/exit`, {}, {
+      // See VehicleTab.handleMarkExit: an empty body let the server stamp the drain's time instead
+      // of the moment the visitor actually walked out.
+      const result = await patch(`/pedestrians/${id}/exit`, { exit_time: exitTime }, {
         clientTempId: `ped_exit_${id}`,
         offlineResponse: { exit_time: exitTime, _offline: true },
         forceQueue: isTempId,

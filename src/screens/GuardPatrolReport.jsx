@@ -145,10 +145,17 @@ export default function GuardPatrolDashboard() {
     (patrolConfig.checkpoints || []).filter((point) => String(point?.name || '').trim())
   ), [patrolConfig]);
 
+  // ⚠ Both bounds must be spelled `T00:00:00` / `T23:59:59`, and for a reason that is invisible
+  // until it costs you a night. `new Date('2026-09-16')` is a DATE-ONLY string, which the language
+  // parses as UTC midnight; `new Date('2026-09-16T23:59:59')` has a time, which it parses as LOCAL.
+  // So the bare form put the start of every range two hours late in SAST, and a night shift's
+  // 00:00-02:00 patrols fell outside it — while schedulePlan below built its slot list from LOCAL
+  // midnight. The rounds due at 00:00, 00:30, 01:00 and 01:30 were therefore counted as due and
+  // their scans filtered away, and reported missed every single night.
   const withinPeriod = useCallback((value) => {
     const time = new Date(value || 0).getTime();
     if (!Number.isFinite(time) || !time) return false;
-    if (dateFrom && time < new Date(dateFrom).getTime()) return false;
+    if (dateFrom && time < new Date(`${dateFrom}T00:00:00`).getTime()) return false;
     if (dateTo && time > new Date(`${dateTo}T23:59:59`).getTime()) return false;
     return true;
   }, [dateFrom, dateTo]);

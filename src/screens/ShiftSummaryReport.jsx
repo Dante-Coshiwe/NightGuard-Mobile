@@ -94,7 +94,7 @@ export default function ShiftSummaryReport() {
   const rows = useMemo(() => {
     if (!data) return [];
     return buildShiftReport(data).rows.filter((row) => {
-      const fromMatch = dateFrom ? row.startTime >= new Date(dateFrom).getTime() : true;
+      const fromMatch = dateFrom ? row.startTime >= new Date(`${dateFrom}T00:00:00`).getTime() : true;
       const toMatch = dateTo ? row.startTime <= new Date(`${dateTo}T23:59:59`).getTime() : true;
       return fromMatch && toMatch;
     });

@@ -236,7 +236,9 @@ export default function VehicleTab() {
     );
 
     try {
-      const result = await patch(`/vehicles/${id}/exit`, {}, {
+      // The body was empty, so markVehicleExited() fell back to now() — which is the drain's clock,
+      // not the guard's. An exit tapped offline at 21:00 landed as 05:00 the next morning.
+      const result = await patch(`/vehicles/${id}/exit`, { exited_at: exitTime }, {
         clientTempId: `veh_exit_${id}`,
         offlineResponse: { exited_at: exitTime, _offline: true },
         forceQueue: isTempId,
