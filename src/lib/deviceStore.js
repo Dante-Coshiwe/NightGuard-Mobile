@@ -265,7 +265,14 @@ export function getPatrolConfig() {
     ...DEFAULT_PATROL_CONFIG,
     ...stored,
     patrolTimes: patrolTimes.length ? patrolTimes : DEFAULT_PATROL_CONFIG.patrolTimes,
-    checkpoints: stored.checkpoints?.length ? stored.checkpoints : DEFAULT_PATROL_CONFIG.checkpoints,
+    // Array.isArray, not `?.length` — a string has a length too, so a malformed stored value
+    // used to pass straight through as the checkpoint list. It then reached `configured.find()`
+    // in the background drain, which throws inside a setInterval with no catch: checkpoint
+    // crediting stops silently for the rest of the night while route points keep accumulating,
+    // so the trail looks perfect and the points never land. Exactly the 16 Sept signature.
+    checkpoints: Array.isArray(stored.checkpoints) && stored.checkpoints.length
+      ? stored.checkpoints
+      : DEFAULT_PATROL_CONFIG.checkpoints,
   };
 }
 

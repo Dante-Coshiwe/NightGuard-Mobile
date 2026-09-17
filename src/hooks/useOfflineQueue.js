@@ -43,9 +43,12 @@ const DEAD_LETTER_KEY = 'nightguard_offline_queue_dead';
 // handset shows the visitor signed out; the dashboard shows them on site forever, with no error
 // anywhere. Verified against this module, not reasoned about: see the note in CLAUDE.md.
 const ID_MAP_KEY = 'nightguard_offline_id_map';
-// One drain's worth of entries is a handful; a night's is tens. This is only ever consulted for
-// items still IN the queue, so anything older than the queue itself is dead weight.
+// One drain's worth of entries is a handful; a night's is tens.
 const ID_MAP_LIMIT = 300;
+// How long a mapping stays useful. It has to outlive the gap between a visitor arriving and
+// leaving — a vehicle can sit on site for a whole shift and longer — so this is generous. The
+// entries are tiny (two short strings and a number) and capped at ID_MAP_LIMIT regardless.
+const ID_MAP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // Raised when the outbox itself could not be written — see saveQueue(). This is the one failure
 // in the capture chain that the guard has to be told about, because it means a record they were
 // shown as saved is not actually anywhere.
@@ -353,9 +356,14 @@ function readIdMap() {
   }
 }
 
-/** Every temp id the server has ever answered for, newest first. */
+/** Every temp id the server has answered for inside the retention window, newest first. */
 function getPersistedIdMap() {
-  return new Map(readIdMap().map(({ tempId, serverId }) => [tempId, serverId]));
+  const cutoff = Date.now() - ID_MAP_TTL_MS;
+  return new Map(
+    readIdMap()
+      .filter((entry) => !entry.at || entry.at >= cutoff)
+      .map(({ tempId, serverId }) => [tempId, serverId]),
+  );
 }
 
 // Best effort on purpose: failing to record a mapping costs one retry the next drain rebuilds,
@@ -363,32 +371,33 @@ function getPersistedIdMap() {
 function rememberCreatedId(tempId, serverId) {
   if (!tempId || !serverId || String(tempId) === String(serverId)) return;
   try {
-    const existing = readIdMap().filter((entry) => entry.tempId !== String(tempId));
-    const next = [{ tempId: String(tempId), serverId: String(serverId) }, ...existing].slice(0, ID_MAP_LIMIT);
+    const cutoff = Date.now() - ID_MAP_TTL_MS;
+    const existing = readIdMap()
+      .filter((entry) => entry.tempId !== String(tempId))
+      .filter((entry) => !entry.at || entry.at >= cutoff);
+    const next = [{ tempId: String(tempId), serverId: String(serverId), at: Date.now() }, ...existing]
+      .slice(0, ID_MAP_LIMIT);
     localStorage.setItem(ID_MAP_KEY, JSON.stringify(next));
   } catch (err) {
     console.warn('[OfflineQueue] rememberCreatedId() failed:', err?.message || err);
   }
 }
 
-// Ids the live queue no longer mentions cannot be needed again. Called after a drain so the map
-// cannot creep up on the same storage the outbox lives in.
-function pruneIdMap(queue) {
-  try {
-    const stored = readIdMap();
-    if (!stored.length) return;
-    const wanted = new Set();
-    queue.forEach((item) => {
-      String(item.url || '').split('/').forEach((segment) => wanted.add(segment));
-      Object.values(item.data || {}).forEach((value) => {
-        if (typeof value === 'string') wanted.add(value);
-      });
-      if (item.clientTempId) wanted.add(String(item.clientTempId));
-    });
-    const kept = stored.filter((entry) => wanted.has(entry.tempId));
-    if (kept.length !== stored.length) localStorage.setItem(ID_MAP_KEY, JSON.stringify(kept));
-  } catch { /* a map that will not prune is not worth failing a drain over */ }
-}
+// ⚠ There is deliberately NO prune-against-the-live-queue here, and it must not be added back.
+//
+// The first version of this fix pruned every mapping the current queue did not still mention,
+// reasoning that an id nothing references cannot be needed again. That is wrong, and wrong in
+// exactly the case the mapping exists for: a vehicle's entry drains successfully and leaves the
+// queue EMPTY, the guard taps Exit twenty minutes later, and that exit is queued against the temp
+// id with no entry left behind it. Pruning on an empty queue had just wiped the only record of
+// what that temp id became, so the exit went up as `veh_<ts>` and was dead-lettered on 22P02 —
+// the original bug, restored by its own fix.
+//
+// It survived a unit test because the test queued the entry and the exit together, so the exit was
+// still in the queue holding the mapping alive. It was caught end to end against a real Supabase.
+//
+// The map is bounded by ID_MAP_LIMIT and ID_MAP_TTL_MS instead: both are applied on every write
+// and on every read, so it cannot grow without limit and cannot outlive its usefulness.
 
 // Rewrite a local id sitting in a URL path into the id the server actually minted.
 //
@@ -889,9 +898,6 @@ export async function syncOfflineQueueNow() {
     }
 
     saveQueue(failed);
-    // Dead letters are included because reviveDeadLetteredItems() puts them back on the queue, and
-    // one revived without its mapping is the same 22P02 failure again.
-    pruneIdMap([...failed, ...getDeadLetterQueue()]);
     console.log(`[OfflineQueue] SYNC - Queue updated: ${syncedCount} synced, ${failed.length} failed/pending`);
 
     if (syncedCount > 0) {

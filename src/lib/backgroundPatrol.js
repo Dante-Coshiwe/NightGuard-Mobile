@@ -211,7 +211,11 @@ async function runDrain({ post, context, result, failed }) {
     console.warn(`[BackgroundPatrol] no active session — discarding ${route.length} orphaned route point(s)`);
   }
 
-  const configured = getPatrolConfig().checkpoints;
+  // Belt and braces alongside the Array.isArray guard in getPatrolConfig(): this runs on a 15s
+  // interval with no catch, so anything that throws here takes checkpoint crediting down for the
+  // whole patrol without a word on screen. A drain that credits nothing must still drain.
+  const storedCheckpoints = getPatrolConfig().checkpoints;
+  const configured = Array.isArray(storedCheckpoints) ? storedCheckpoints : [];
   // The session is the single source of truth for what this patrol has already credited. Belt and
   // braces against the in-app watch having logged the same point: a checkpoint reaches the report
   // once, however many recorders saw the guard standing on it.
