@@ -39,7 +39,24 @@ export default function PatrolRecorder() {
   const { post } = useOfflineApi();
   const geo = useGeolocation();
 
-  const [patrolActive, setPatrolActive] = useState(() => Boolean(getActivePatrolSession()));
+  // Tracked as the session ID, not a boolean.
+  //
+  // ⚠ This used to be `useState(Boolean(getActivePatrolSession()))`, and the effect that hands the
+  // patrol to the native service keyed off it. Starting a patrol while one was still active
+  // therefore never re-ran that effect — true stayed true — so startBackgroundPatrol() was never
+  // called for the new patrol and the service kept the PREVIOUS patrol's id.
+  //
+  // That matters because applyStartPayload() clears the native `reached` set only when the patrol
+  // id it is handed differs from the one it holds. Left stale, a checkpoint credited in one patrol
+  // is suppressed for every later patrol of the night, and the only thing that ever cleared it was
+  // a patrol actually being ended (true -> false -> true) or this component remounting.
+  //
+  // Fountainbrook, 2026-09-16: 14 patrols started, 2 ended, 19 checkpoints credited all night. The
+  // nine nights before it ended essentially every patrol and averaged 9.0 per patrol on identical
+  // code. Keying on the id makes a new patrol re-arm the service whether or not the last one was
+  // ended.
+  const [patrolSessionId, setPatrolSessionId] = useState(() => getActivePatrolSession()?.id || null);
+  const patrolActive = Boolean(patrolSessionId);
   // Whether this shell has the native tracking service at all — known synchronously, which is what
   // lets the in-app watch stay off from the very first render on a capable device.
   const backgroundCapable = isBackgroundPatrolAvailable();
@@ -62,7 +79,7 @@ export default function PatrolRecorder() {
   const inFlightRef = useRef(new Set());
 
   useEffect(() => {
-    const sync = () => setPatrolActive(Boolean(getActivePatrolSession()));
+    const sync = () => setPatrolSessionId(getActivePatrolSession()?.id || null);
     sync();
     window.addEventListener(PATROL_SESSION_EVENT, sync);
     window.addEventListener('nightguard_patrol_history_updated', sync);
@@ -80,7 +97,7 @@ export default function PatrolRecorder() {
     if (flushPendingPatrolCompletions() > 0) {
       syncOfflineQueueNow().catch(() => null);
     }
-    setPatrolActive(Boolean(getActivePatrolSession()));
+    setPatrolSessionId(getActivePatrolSession()?.id || null);
   }, []);
 
   const logCheckpoint = useCallback(async (checkpoint, fix) => {
@@ -206,14 +223,16 @@ export default function PatrolRecorder() {
     }
 
     let cancelled = false;
-    startBackgroundPatrol(getActivePatrolSession()?.id).then((started) => {
+    startBackgroundPatrol(patrolSessionId).then((started) => {
       if (!cancelled) setNativeStarted(started);
     });
 
     return () => {
       cancelled = true;
     };
-  }, [patrolActive]);
+    // Keyed on the session id, not merely on "a patrol is running": a new patrol started over an
+    // unfinished one must re-arm the service, or it keeps recording against the old patrol id.
+  }, [patrolActive, patrolSessionId]);
 
   // Drain while the app is alive so the live map and progress keep up, and the moment it comes back
   // to the foreground so a walk done with the screen off lands as soon as the guard looks at it.

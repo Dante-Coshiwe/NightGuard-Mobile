@@ -71,6 +71,27 @@ export function saveActivePatrolSession(session) {
 }
 
 export function startPatrolSession({ siteId = null, shiftId = null, guardId = null, guardName = 'Unknown guard', requiredCount = 0 } = {}) {
+  // ⚠ There is ONE active-session key, so writing a new session over an unfinished one destroys
+  // its route outright — the trail lives only under ACTIVE_SESSION_KEY until completion uploads it
+  // in a single batch. Close it as incomplete instead: endPatrolSession() parks a ready-to-send
+  // completion in the outbox before clearing the key, so the walk that was already recorded is
+  // still delivered and still shows in "My Patrols".
+  //
+  // Not a hypothetical. Fountainbrook, 2026-09-16: 14 patrols were started and 2 were ended, and
+  // the routes of the other 12 were each overwritten by the next Start Patrol. Only the two ended
+  // walks have a trail on the server; the rest are unrecoverable. closeAbandonedPatrolSession()
+  // does not cover this — it only fires at app launch, and only past 16 hours.
+  const unfinished = getActivePatrolSession();
+  if (unfinished) {
+    console.warn('[PatrolSession] starting a new patrol over an unfinished one; closing', unfinished.id, 'as incomplete');
+    endPatrolSession('incomplete', { siteId, shiftId, guardId, guardName });
+    // endPatrolSession() only parks the completion in OUTBOX_KEY, which is flushed to the offline
+    // queue at app launch or End Shift — neither of which a kiosk handset mid-shift is about to do.
+    // Hand it over now so the closed walk is owned by the queue (which retries and survives a kill)
+    // rather than sitting in a 50-entry local outbox that the next 50 patrols would age it out of.
+    flushPendingPatrolCompletions();
+  }
+
   const session = {
     id: generatePatrolId(),
     patrolName: `Patrol ${new Date().toLocaleString()}`,

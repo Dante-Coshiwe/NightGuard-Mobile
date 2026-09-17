@@ -2,8 +2,9 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 import { Geolocation } from '@capacitor/geolocation';
 import { hasCoordinates } from './geo';
 import { getPatrolConfig } from './deviceStore';
-import { buildPatrolScanEntry } from './patrolCheckin';
+import { buildPatrolScanEntry, evaluateGpsProgress } from './patrolCheckin';
 import { persistPatrolScan } from './patrolScanStore';
+import { QUEUE_WRITE_FAILED_EVENT } from '../hooks/useOfflineQueue';
 import { appendRoutePoint, getActivePatrolSession, markCheckpointReached } from './patrolSession';
 
 // Background patrol recording — the native half lives in PatrolTrackingService.java.
@@ -20,6 +21,20 @@ import { appendRoutePoint, getActivePatrolSession, markCheckpointReached } from 
 // nothing in the patrol flow may depend on this succeeding.
 
 const PatrolTracker = registerPlugin('PatrolTracker');
+
+// Last fix handed over by a drain, so the segment test spans drain boundaries: a guard who steps
+// over a checkpoint between two 15 s drains is still credited. Cleared whenever a patrol starts or
+// stops, because a previous walk's last position must never be treated as this walk's previous fix
+// — that would draw a segment across everything in between and credit points nobody passed.
+let lastDrainedFix = null;
+
+// Only one drain at a time. The drain is fired from a 15 s interval AND from visibilitychange AND
+// from End Patrol, and every one of those can land while an earlier drain is still awaiting a
+// persist — which posts the same checkpoint twice and, worse, lets two drains interleave on
+// lastDrainedFix and alreadyReached. Skipping is free: peek() consumes nothing, so whatever this
+// call would have handled is still in the native buffer for the drain that is already running, or
+// for the next one.
+let draining = false;
 
 export function isBackgroundPatrolAvailable() {
   try {
@@ -75,6 +90,7 @@ export async function startBackgroundPatrol(patrolId) {
   }
 
   try {
+    lastDrainedFix = null;
     await PatrolTracker.start({ patrolId: patrolId ? String(patrolId) : null, checkpoints });
     console.info(`[BackgroundPatrol] tracking started for ${checkpoints.length} checkpoint(s)`);
     return true;
@@ -85,6 +101,7 @@ export async function startBackgroundPatrol(patrolId) {
 }
 
 export async function stopBackgroundPatrol() {
+  lastDrainedFix = null;
   if (!isBackgroundPatrolAvailable()) return;
   try {
     await PatrolTracker.stop();
@@ -116,6 +133,29 @@ export async function backgroundPatrolStatus() {
 export async function drainBackgroundPatrol({ post, context = {} } = {}) {
   const result = { routePoints: 0, captures: 0 };
   if (!isBackgroundPatrolAvailable() || typeof post !== 'function') return result;
+  if (draining) return result;
+  draining = true;
+
+  // ⚠ A FAILED OUTBOX WRITE IS SILENT. persistPatrolScan() resolves normally when the queue could
+  // not be saved — saveQueue() catches the quota error, raises the "Storage is full" banner and
+  // returns false; it does not throw. Crediting on that resolve marks a checkpoint reached that is
+  // on no disk anywhere, and for a native capture acknowledges it out of the buffer as well: the
+  // guard is told the point was gathered and nothing is holding it.
+  //
+  // Verified by test rather than assumed — with storage refusing every write, persistPatrolScan()
+  // returned an ordinary offline response. This event is the only signal that it did not land.
+  let queueWriteFailed = false;
+  const onQueueWriteFailed = () => { queueWriteFailed = true; };
+  window.addEventListener(QUEUE_WRITE_FAILED_EVENT, onQueueWriteFailed);
+  try {
+    return await runDrain({ post, context, result, failed: () => queueWriteFailed });
+  } finally {
+    window.removeEventListener(QUEUE_WRITE_FAILED_EVENT, onQueueWriteFailed);
+    draining = false;
+  }
+}
+
+async function runDrain({ post, context, result, failed }) {
 
   // ⚠ CRUCIAL DATA PATH — this is how a walk done with the screen off reaches the server, and it
   // is the ONLY copy while it is in flight.
@@ -184,6 +224,49 @@ export async function drainBackgroundPatrol({ post, context = {} } = {}) {
   // the native buffer and comes back on the next drain, which is the whole point of two-phase.
   let handledCaptures = 0;
 
+  // ⚠ DO NOT rely on `captures` alone to credit a checkpoint.
+  //
+  // The native recorder matches checkpoints itself and hands them over in `captures`. When that
+  // works it is the better signal — it carries the exact fix that satisfied the fence, including
+  // fixes the thinning rule keeps out of the route. But it is the half of the system this bundle
+  // cannot fix: it runs in the APK, and on any shell older than 1.33 the service holds its buffer
+  // in a long-lived field and rewrites it on every fix, so what acknowledge() trims comes back and
+  // the capture list does not behave.
+  //
+  // Measured on Fountainbrook's 2026-09-16 night (APK 1.32, bundle 1.1.38): the guard walked
+  // within 3.6 m of Point 8 for four consecutive fixes and it was never credited. Replaying that
+  // patrol's OWN recorded route through evaluateGpsProgress() credits 7 of 9 checkpoints; the
+  // native capture list produced 1. The nine nights before it, on identical code, averaged 9.0.
+  //
+  // So the route is matched here as well. The trail is already proof of where the guard walked —
+  // it is the same evidence, through the same rules the in-app watch uses (geo.js), and a
+  // checkpoint credited by either route reaches the report exactly once because both paths
+  // dedupe through `alreadyReached` and the session's reachedCheckpointIds.
+  //
+  // This is deliberately ADDITIVE. Native captures are still processed first and still
+  // acknowledged normally — nothing here changes the two-phase handover or what the native side
+  // is allowed to drop.
+  const routeMatches = [];
+  if (hasSession && route.length) {
+    const seen = new Set(alreadyReached);
+    for (const point of route) {
+      const fix = {
+        latitude: point.latitude,
+        longitude: point.longitude,
+        accuracy: point.accuracy,
+        timestamp: point.at,
+      };
+      // Continuity across drains: the last fix of the previous batch is the `previousFix` of this
+      // one, so a checkpoint stepped over between two drains is still caught by the segment test.
+      const newly = evaluateGpsProgress(configured, lastDrainedFix, fix, [...seen]);
+      for (const checkpoint of newly) {
+        seen.add(String(checkpoint.id));
+        routeMatches.push({ checkpoint, fix });
+      }
+      lastDrainedFix = fix;
+    }
+  }
+
   for (const capture of captures) {
     if (alreadyReached.has(String(capture.checkpointId))) {
       handledCaptures += 1;
@@ -211,6 +294,12 @@ export async function drainBackgroundPatrol({ post, context = {} } = {}) {
 
     try {
       await persistPatrolScan(entry, post);
+      // The outbox write itself failed. Leave it buffered AND uncredited so the native side
+      // re-delivers it: acknowledging here would delete the only copy.
+      if (failed()) {
+        console.warn('[BackgroundPatrol] outbox write failed; leaving capture buffered and uncredited');
+        break;
+      }
       // Credited only AFTER it is stored. Marking first (as this used to) meant a failed persist
       // was skipped as "already reached" on the retry, so the two-phase handover would have
       // acknowledged and deleted a scan that was never saved anywhere.
@@ -232,6 +321,38 @@ export async function drainBackgroundPatrol({ post, context = {} } = {}) {
       await PatrolTracker.acknowledge({ routeCount: route.length, captureCount: handledCaptures });
     } catch (err) {
       console.warn('[BackgroundPatrol] acknowledge failed; buffer will be re-drained:', err?.message || err);
+    }
+  }
+
+  // Route-derived checkpoints. Deliberately AFTER acknowledge(): these are reconstructed from the
+  // trail, which is already stored on the session, so nothing here is the last copy of anything and
+  // a failure must not hold up the native buffer. Re-checked against `alreadyReached` because the
+  // capture loop above has been adding to it — a point the native side credited is not credited
+  // twice.
+  for (const { checkpoint, fix } of routeMatches) {
+    if (alreadyReached.has(String(checkpoint.id))) continue;
+
+    const entry = buildPatrolScanEntry({
+      method: 'gps',
+      position: { latitude: fix.latitude, longitude: fix.longitude, accuracy: fix.accuracy },
+      matchedCheckpoint: checkpoint,
+      scannedAt: new Date(fix.timestamp).toISOString(),
+      ...context,
+    });
+
+    try {
+      await persistPatrolScan(entry, post);
+      if (failed()) {
+        console.warn('[BackgroundPatrol] outbox write failed; leaving route-matched checkpoint uncredited');
+        break;
+      }
+      markCheckpointReached(checkpoint.id);
+      alreadyReached.add(String(checkpoint.id));
+      result.captures += 1;
+    } catch (err) {
+      // Left uncredited rather than marked: markCheckpointReached() runs only after a successful
+      // persist, so the next drain re-derives this same checkpoint from the trail and tries again.
+      console.warn('[BackgroundPatrol] route-matched checkpoint not persisted:', err?.message || err);
     }
   }
 

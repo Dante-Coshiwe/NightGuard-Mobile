@@ -1,4 +1,84 @@
 # Working notes for this repo
+## Release / OTA note - 2026-09-17 (bundle 1.1.39) — SHIPPED MANDATORY, DEVICE-VERIFIED
+
+**Bundle `1.1.39`** — `production`, **`is_mandatory: true`**, SHA-256
+`c9a481011d6a4a862b85af61c4a057be3f0aac3781d397e5af651fc55b0c1077`. No APK; the whole fix is JS.
+Mandatory was the operator's explicit call after the trade was put to them: on Fountainbrook it
+changes nothing (open shift blocks both apply paths), and the 2026-08-14 inline-reload hazard is
+now gated by `deviceIsIdle()` + `updatesHeld()`, so the risk is a single reload on an idle,
+off-shift handset. To undo: `update ota_bundles set is_mandatory = false where version = '1.1.39';`
+
+### Why: Fountainbrook lost a night of checkpoint evidence with a perfect GPS trail
+
+2026-09-16, 14 patrols, **19 checkpoints credited all night** against 8.0-9.5 per patrol on the
+nine nights before it — **on identical code**. The guard walked within **3.6 m of Point 8 for four
+consecutive fixes** and it was never credited. Replaying that night's own recorded fixes through
+`evaluateGpsProgress` credits 7 of 9. The trail was never the problem.
+
+Three JS causes, all now fixed:
+
+1. **`PatrolRecorder` tracked the patrol as a BOOLEAN.** The effect handing the patrol to the
+   native service keyed off it, so starting a patrol while one was active was `true -> true` and
+   `startBackgroundPatrol()` was never called — the service kept the *previous* patrol's id, and
+   `applyStartPayload()` clears the native `reached` set only when the id differs. A checkpoint
+   credited once was then suppressed for the rest of the night. **Now keyed on the session id.**
+2. **Background crediting had no cross-check against the trail.** Only the native capture list
+   could credit a point. `drainBackgroundPatrol()` now also runs `evaluateGpsProgress()` over the
+   drained route points — additive, both paths dedupe through the session's `reachedCheckpointIds`.
+3. **`startPatrolSession()` overwrote an unfinished session**, destroying its route (the trail
+   lives only under `ACTIVE_SESSION_KEY` until completion uploads it). 12 of 14 walks were lost
+   that way on the 16th. It now closes the old one as `incomplete` and flushes the completion
+   straight to the offline queue — `closeAbandonedPatrolSession()` does NOT cover this (app launch
+   only, 16 h only).
+
+Also added: a re-entrancy guard on the drain, and — found while reviewing the patch — **a failed
+outbox write no longer credits the checkpoint.** `persistPatrolScan()` RESOLVES when storage is
+full (`saveQueue()` catches the quota error and returns false; it does not throw), so the old code
+marked a point gathered that was on no disk anywhere. The drain now watches
+`QUEUE_WRITE_FAILED_EVENT` and leaves it uncredited and buffered.
+
+### Verified on a real device, not just replayed
+
+15/15 on an integration harness driving the **real** `drainBackgroundPatrol()` against a fake
+native buffer replaying the 16th's 178 fixes (native-empty, native+trail, concurrent drains,
+storage full, no session, unfinished-patrol handover). Then on an emulator (API 37, WebView 151):
+25 injected GPS fixes past 4 checkpoints credited **all 4, exactly one scan each, zero duplicates**;
+a **second patrol immediately after credited all 4 again**, which is the direct test of cause 1.
+
+⚠ Test rows reached the LIVE db before networking was disabled — one patrol + one scan on
+**Johannesburg**, deleted afterwards and verified gone. Disable networking BEFORE launching the app
+on an emulator, not after.
+
+### ⚠ The 180 s download cap is a `setTimeout`, and Android throttles it
+
+`withTimeout(updater.download(...), 180000)` in `liveUpdate.js` races a `setTimeout`. **Android
+suspends WebView JS timers when the display sleeps** — the same fact the native patrol service
+exists for. So the cap only bites while the app is awake:
+
+* Awake: today's attempts failed at **181, 182, 181 s** — an unthrottled timer, to the second.
+* Screen off: 1.1.37 downloaded in **one 1599 s span with no `failed` row** (0.3 KB/s measured).
+
+**A download timeout leaves NOTHING staged** — the throw skips `updater.next()`, so even a native
+download that completes afterwards is never activated. That is why 1.1.37 downloaded on 9 Sept and
+still had not applied six days later. Worth raising the cap, or staging whatever completed.
+
+**Capgo downloads ARE resumable** (`DownloadService.java`: `Range: bytes=<n>-`, append mode, and the
+generic `catch` does *not* delete the partial — only an HTTP error or success deletes `infoFile`).
+So repeated timeouts accumulate rather than restart. Do not "fix" the retry loop on the assumption
+that it starts from zero.
+
+### Reading the data: bare-named `Patrol` rows are stubs, not patrol starts
+
+`ensurePatrolRowForScan()` inserts a stub named exactly `Patrol` with `actual_start` set to **the
+scan's own timestamp** when a scan outruns its `/patrols/start`. 9 of 13 rows on the 16th were
+stubs; zero on every prior night. A credit then *always* appears to land at the exact second the
+patrol began — an artefact, and an easy way to build a completely wrong diagnosis. A real row reads
+`Patrol 9/16/2026, 10:30:08 PM`.
+
+Two other traps re-learned the hard way: **`devices.latest_sync_update` is not proof of life** (it
+moves only on a queue drain — `ota_update_logs` is the real signal), and **PostgREST caps at 1000
+rows** regardless of `limit`, which silently turned three good nights into an apparent outage.
+
 ## Release / OTA note - 2026-09-16 (APK 1.33 / bundle 1.1.38) — SHIPPED, EMULATOR-VERIFIED
 
 * **APK `1.33` / `versionCode 34`** — on the GitHub `Version1` release, clobbering 1.32 at the same
@@ -87,9 +167,14 @@ cache-busting query string (`?cb=$(date +%s)`) to check what was really stored.
 **Why 1.1.36 is NOT mandatory.** `--mandatory` triggers the inline apply that cost a guard an
 incident report and its photo on 2026-08-14. The `deviceIsIdle()` gate that makes it safe only
 exists in bundles **≥ 1.1.25**, and `ota_update_logs` still carries three ids on 1.1.5 / 1.1.6 /
-1.1.8 (last seen 3-4 August, probably retired but not confirmed). Non-mandatory costs nothing:
-Capgo swaps natively on the next background event, and screen-off is enough. To force it later,
+1.1.8 (last seen 3-4 August, probably retired but not confirmed). To force it later,
 `update ota_bundles set is_mandatory = true where version = '1.1.36';` — no republish needed.
+
+⚠ This paragraph used to end "Non-mandatory costs nothing: Capgo swaps natively on the next
+background event, and screen-off is enough." **Both halves are wrong.** A background event does not
+swap anything; it takes a native cold start (or an End Shift), which a kiosk handset left running
+may not do for weeks — so non-mandatory costs an unbounded delay. See "What installs a staged
+bundle" below before planning a rollout around this.
 
 **Fleet counting trap:** `NG-898D898E11E775F0` is the **Pixel_2_XL_API30 emulator**, not a field
 handset, and `NG-B4D60C7CB96F8727` is the dev phone. Ten ids look "real" by the `NG-<16 hex>`
@@ -165,7 +250,7 @@ Symptom first, because that is what you actually have at 08:00. Full catalogue w
 | Server never got it, no error anywhere | **Dead-lettered.** Refusals (400/403/422) retry `8 x 3` then park in `localStorage`. Invisible to guard AND dashboard — nothing uploads them | `useOfflineQueue.js` `deadLetter()` |
 | Records silently destroyed | `DEAD_LETTER_LIMIT = 200`; past that the oldest are dropped for good | `useOfflineQueue.js` |
 | `ota_update_logs` row says `failed` | Usually a slow link, not a broken update. Check `devices.app_version` actually moved before blaming a bundle | "A `failed` row in `ota_update_logs`" |
-| Device stuck on an old version after `downloaded` | `applyStagedUpdateIfSafe()` returns `deferred: shift_running` first. **Backgrounding and restarting do NOT apply it** — only an End Shift does. See "A staged bundle can sit for weeks" | `liveUpdate.js` |
+| Device stuck on an old version after `downloaded` | Staged by `next()` and waiting. Backgrounding and a JS reload do NOT apply it; a **native cold start** does, and so does an End Shift. A kiosk left running for weeks never cold-starts — force-stop and relaunch it | `liveUpdate.js`, "What installs a staged bundle" |
 | Device logs `check` every 30 min and nothing else, for days | `OTA_STAGED_KEY` already equals the offered version, so `doRunOtaUpdate` returns before it logs anything. Publish a HIGHER version to break it | `liveUpdate.js`, "A staged bundle can sit for weeks" |
 | Fleet running different code than the server serves | A publish without bumping `OTA_CURRENT_VERSION` overwrote the bundle in place; devices already on that version never re-download | `scripts/ota-publish.mjs` |
 | Trail is a fan of straight lines; steps 10-20x too high | Replayed buffer, a second location provider with no accuracy filter, or the previous patrol bleeding in. Fixed in bundle 1.1.38 | `appendRoutePoint()`, `PatrolTrackingService` |
@@ -897,29 +982,53 @@ and `resetWhenUpdate` makes a fresh install run that one. APK 1.21 carries bundl
 production's newest published bundle (1.1.21) was correctly refused as a *downgrade* and every
 device on that APK logged `up_to_date` forever. Always publish above the built-in version.
 
-### The JS auto-apply never fires any more — Capgo's native swap is what delivers
+### What installs a staged bundle: a cold start. NOT an End Shift
 
 `applyStagedUpdateIfSafe()` returns `deferred: shift_running` while `getShiftSession()` is truthy,
 and under the device-session model `ensureDeviceSession()` opens a session on boot that only
 `logout()` or an admin unbind ever clears. That gate therefore never opens, and neither does
-`applyNow` at [liveUpdate.js:291](src/services/liveUpdate.js#L291) — the rationale recorded above
-("a kiosk between shifts is idle") stopped holding when shifts stopped ending.
+`applyNow` at [liveUpdate.js:321](src/services/liveUpdate.js#L321), which is just `canApplyInline`
+from [line 279](src/services/liveUpdate.js#L279) and AND-s against `!shiftRunning` too. So on a
+handset with a session open, the only apply line that ever runs is
+`await updater.next({ id: bundle.id })` ([liveUpdate.js:331](src/services/liveUpdate.js#L331)) —
+Capgo stages the bundle natively and the JS side is finished with it.
 
-⚠ **Corrected 2026-09-15 — a staged bundle does NOT install itself on a background event.** An
-earlier version of this note said `next()` activates natively on the next background event and that
-"screen off is enough". Measured on `NG-CA0664876884BE5D` (Fountainbrook): bundle 1.1.37 was
-`downloaded` on 9 September, the app's JS context rebooted at 03:03 on 15 September, and six days
-later the handset was still running 1.1.36. Backgrounding it does nothing either — reproduced on the
-emulator, which stayed on the old bundle across HOME + relaunch and then applied **within 60 seconds**
-the moment the shift session was cleared.
+⚠ **Corrected 2026-09-16 — `next()` DOES install itself, on a native process start.** The previous
+correction here (dated 2026-09-15) said a staged bundle never activates on its own and that
+"**An End Shift is what installs an update**". That is wrong, and wrong in the expensive direction:
+it sends you looking for somebody to walk to the handset.
 
-So the ONLY mechanism that actually delivers a bundle is `applyStagedUpdateIfSafe()` → `updater.set()`,
-and Rule 1 of that function is `if (getShiftSession()) return deferred: shift_running`. **An End Shift
-is what installs an update.** The Settings override (`immediate: true`) is the only other route and the
-guard sidebar has no Settings entry, so on a kiosk handset there is no manual route at all.
+Measured on `NG-CA0664876884BE5D` (Fountainbrook), from `ota_update_logs`, `shifts` and `patrols`:
+
+* 1.1.38 went `downloaded` at 12:08 on 2026-09-15, then logged a bare `check` every 30 minutes —
+  the wedged-and-silent pattern described below.
+* At **15:55** it reported `up_to_date` with `from_version: 1.1.38`. It had installed itself.
+* **No shift was ended.** The `shifts` row opened 2026-09-07T15:14 is *still* `active`, no newer
+  shift row exists for the site, and every patrol after the apply (17:01 onward that night) still
+  carries that same `shift_id`. The local session was never cleared, so `shiftRunning` was true
+  throughout and **neither JS apply path could have fired** — both AND against `!shiftRunning`.
+* The 15:55 check sits off the 30-minute cadence (15:38 + 17 min) and the cadence then restarts
+  from 15:55 — the signature of a fresh JS context, i.e. an app start.
+
+The mechanism is therefore Capgo activating what `next()` staged, on a **native process start**.
+(That last step is inferred from the timing — no log row names it — but it is the only path left
+once both JS gates are ruled out by the shift evidence.)
+
+What the 2026-09-15 observation actually established is narrower than it claimed: `next()` does not
+apply on a background/foreground event, and does not apply on a JS-context reload. The emulator test
+recorded in that note — HOME, then relaunch — *resumes the existing task* and never restarts the
+process, so it never exercised the one event that does work. A kiosk handset launched once and left
+running for weeks does not cold-start either, which is exactly why "never" and "not for six days"
+looked identical from the logs.
+
+**So there are three routes in, not one:** a cold start (force-stop and relaunch is the cheapest way
+to land one deliberately), an End Shift (which opens the `applyStagedUpdateIfSafe()` gate and applies
+within 60 s), and the Settings override (`immediate: true`, no entry in the guard sidebar). Only the
+first needs nobody to understand the app.
 
 Verify a rollout by watching `ota_update_logs` go `check` → `download_started` → `downloaded` →
-(background event) → the device reporting the new version as its `from_version`.
+(cold start) → the device reporting the new version as its `from_version`. `devices.app_version` is
+the only field that says what a handset is really running.
 
 ### A staged bundle can sit for weeks, and the device goes silent about it
 
@@ -934,15 +1043,22 @@ applyStagedUpdateIfSafe: if (getShiftSession()) return { status: 'deferred', rea
 
 So flipping `is_mandatory` on a handset with an open shift achieves **nothing**, while exposing every
 *other* site to an inline reload. Fountainbrook had a shift `active` since 2026-09-07 — eight days —
-and nothing was ever going to install there. Check `shifts` for an open row on that device *before*
-reaching for the mandatory flag; that is the thing to fix, not the bundle.
+so neither JS path could apply anything there. Check `shifts` for an open row on that device *before*
+reaching for the mandatory flag.
+
+⚠ But an open shift is **not** a permanent block, and an earlier version of this paragraph said it
+was. `next()` had already staged the bundle natively, and a cold start installed it on 2026-09-15
+with that shift still open — see "What installs a staged bundle" above. The shift gate stops the two
+*JS* apply paths, nothing more.
 
 **And there is no remote lever.** `clearShiftSession()` is only ever called from local UI — End Shift,
 `logout()`, an on-device unbind — nothing polls the server for it, and the bundle holds **no realtime
 subscription of any kind**. A handset in this state cannot be rescued from the dashboard, the database
-or the Edge Functions. Somebody has to end a shift on the phone. Worth closing in a future bundle (a
-server-readable apply-now flag, or auto-closing a shift left open for days) — but that fix can only
-arrive by OTA, which is the trap closing on itself.
+or the Edge Functions — somebody has to touch the phone. What they have to do is smaller than this
+note used to say: a force-stop and relaunch is enough, because the bundle is already staged natively.
+Ending the shift also works. Worth closing in a future bundle (a server-readable apply-now flag, or
+auto-closing a shift left open for days) — but that fix can only arrive by OTA, which is the trap
+closing on itself.
 
 **2. A wedged device logs `check` and NOTHING else.** `doRunOtaUpdate` short-circuits before it
 reports anything:
